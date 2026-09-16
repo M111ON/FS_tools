@@ -1,0 +1,12 @@
+# chat-pool: runtime data never committed
+log.jsonl
+.flush_state.json
+towers/
+outbox/
+__pycache__/
+*.bin
+*.exe
+*.lib
+*.exp
+*.obj
+*.spv
