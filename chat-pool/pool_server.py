@@ -362,31 +362,19 @@ class PoolHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        if not self._authorized():
-            if parsed.path in ("/", "/qr", "/index.html"):
-                # first LAN visit: show the QR/token page instead of JSON error
-                html = ("<html><head><meta charset='utf-8'><title>chat-pool — connect</title></head>"
-                        "<body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;"
-                        "display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px'>"
-                        "<h2 style='margin:0'>📱 สแกน/เปิดลิงก์นี้จากอุปกรณ์ที่เชื่อม token แล้ว</h2>"
-                        + _qr_panel() +
-                        "<div style='font:11px var(--mono);color:var(--dim);max-width:420px;text-align:center'>"
-                        "หรือเปิดจากเครื่องหลัก (localhost) แล้วกดแชร์ token — token อยู่ที่ "
-                        "I:/tools/chat-pool/.pool_token</div></body></html>").encode("utf-8")
-                self.send_response(401)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
-                self.end_headers()
-                self.wfile.write(html)
-                return
-            self._json(401, {"error": "token required — see .pool_token on the server",
+        # the HTML shell carries no secrets — serve it to everyone so the
+        # client JS can read #token= and authenticate its API calls;
+        # only data endpoints below are token-gated
+        public = parsed.path in ("/", "/index.html", "/qr")
+        if not public and not self._authorized():
+            self._json(401, {"error": "token required — open /qr from the server screen",
                              "howto": {"header": "Authorization: Bearer <token>"}})
             return
 
         if parsed.path == "/" or parsed.path == "/index.html":
             body = DASHBOARD.encode("utf-8")
-            # LAN clients open the page without token in URL? their fetches
-            # will 401 and prompt; the QR panel below carries the token link.
+            # LAN visitors who scanned a token-less link: the JS fetches
+            # will 401 → user opens /qr (server screen) to get a token.
             if self.client_address[0] not in ("127.0.0.1", "::1"):
                 body = body.replace(b"</body>",
                                     (_qr_panel() + "</body>").encode("utf-8"))
