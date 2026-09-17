@@ -175,6 +175,9 @@ button.send:hover{filter:brightness(1.1)}
 #plane-bar{display:flex;align-items:center;gap:12px;padding:8px 15px;border-bottom:1px solid var(--line);font:10px var(--mono);color:var(--dim);flex-wrap:wrap}
 #pv-seq{flex:1;min-width:150px;accent-color:var(--acc)}
 #pv-when{min-width:220px}
+#plane-pop{position:absolute;display:none;z-index:6;background:var(--panel2);border:1px solid var(--acc);border-radius:10px;padding:9px 11px;font:11px var(--mono);color:var(--fg);max-width:330px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#plane-pop .pp{color:var(--dim);white-space:pre-wrap;margin-top:4px}
+#plane-pop .prow{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 #plane-body{flex:1;display:flex;min-height:0}
 #plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:auto}
 #plane-cv{background:var(--bg);border:1px solid var(--line);border-radius:8px;cursor:crosshair;image-rendering:pixelated}
@@ -266,11 +269,19 @@ button.send:hover{filter:brightness(1.1)}
       <input type="range" id="pv-seq" min="0" max="0" value="0">
       <button class="pbtn" id="pv-play">▶ replay</button>
       <button class="pbtn" id="pv-last">ล่าสุด</button>
+      <span style="display:flex;gap:4px;align-items:center;margin-left:auto">
+        <span style="color:var(--dim)">รัศมี</span>
+        <button class="pbtn on" id="pv-f0" title="เห็นทั้งระนาบ">ปิด</button>
+        <button class="pbtn" id="pv-f1" title="บังทุกอย่างที่ไม่เกี่ยวข้อง — เหลือเฉพาะที่ต่อจากจุดที่เลือก 1 ช่วง">1 hop</button>
+        <button class="pbtn" id="pv-f2">2 hop</button>
+        <button class="pbtn" id="pv-f3">3 hop</button>
+      </span>
     </div>
     <div id="plane-body">
       <div id="plane-canvaswrap">
         <canvas id="plane-cv"></canvas>
         <div id="plane-tip"></div>
+        <div id="plane-pop"></div>
       </div>
       <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นส้ม = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span></div></div>
     </div>
@@ -422,7 +433,7 @@ listen();
    later reads at a coarser point — nothing here is cached state. */
 const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
-          bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null};
+          bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0};
 const pcv=$('#plane-cv');
 const pstep=()=>PV.n===144?3:36;
 
@@ -439,6 +450,25 @@ function pvCellsUpTo(S){
 function pvLiveBonds(){
   if(PV.seq===null)return PV.bonds;
   return PV.bonds.filter(b=>b.seq==null||b.seq<=PV.seq);   // an edge exists only after its line
+}
+// Radius mask: bonds join LINES but the plane only sees CELLS, so a walk
+// happens at cell level and a bond inside one cell is a self-loop.
+// Returns null when the mask is off (= show everything).
+function pvKeep(){
+  if(!PV.focus||PV.sel==null)return null;
+  const adj={};
+  pvLiveBonds().forEach(b=>{
+    if(b.src_rkey==null||b.dst_rkey==null)return;
+    (adj[b.src_rkey]=adj[b.src_rkey]||[]).push(b.dst_rkey);
+    (adj[b.dst_rkey]=adj[b.dst_rkey]||[]).push(b.src_rkey);
+  });
+  const seen=new Set([PV.sel]);let frontier=[PV.sel];
+  for(let h=0;h<PV.focus&&frontier.length;h++){
+    const next=[];
+    frontier.forEach(r=>(adj[r]||[]).forEach(x=>{if(!seen.has(x)){seen.add(x);next.push(x)}}));
+    frontier=next;
+  }
+  return seen;
 }
 function pvDerive(){
   const full=PV.seq===null||PV.seq>=PV.seqMax-1;
@@ -483,13 +513,20 @@ function pvDraw(){
   const c=pcv.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);
   c.fillStyle='#0d1117';c.fillRect(0,0,px,px);
   const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
+  const keep=pvKeep();
   for(const k in PV.cells){
     const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
-    c.fillStyle='rgba(126,231,135,'+(0.22+0.78*(PV.cells[k]/max)).toFixed(2)+')';
+    const near=!keep||keep.has(+k);
+    const a=(0.22+0.78*(PV.cells[k]/max))*(near?1:0.10);   // masked = barely there
+    c.fillStyle='rgba(126,231,135,'+a.toFixed(2)+')';
     // at plane scale one cell is ~3px, so a single line is nearly invisible;
     // every occupied cell gets a floor of 2px so the map is actually readable
     const w=Math.max(step,2),o=(w-step)/2;
     c.fillRect(x*step-o,y*step-o,w,w);
+    if(keep&&near&&+k!==PV.sel){                        // in radius: mark it
+      c.strokeStyle='rgba(126,231,135,.75)';c.lineWidth=1;
+      c.strokeRect(x*step-o-.5,y*step-o-.5,w+1,w+1);
+    }
   }
   PV.sights.forEach(s=>{                    // declared reads (data, not state)
     const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
@@ -502,7 +539,19 @@ function pvDraw(){
       const a=pvCenter(b.src_rkey),z=pvCenter(b.dst_rkey);
       if(!a||!z)return;                       // only edges fully inside this view
       const hot=PV.sel!=null&&(b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
-      c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,.5)';
+      // mask: an edge is dropped when neither end is in the radius; an edge
+      // half-way out stays as a faint hint that the graph continues
+      let alpha=0.5;
+      if(keep){
+        const s=keep.has(b.src_rkey),d=keep.has(b.dst_rkey);
+        if(!s&&!d)return;
+        if(!s||!d)alpha=0.16;
+      }
+      if(a[0]===z[0]&&a[1]===z[1]){           // self-loop: same cell, ring it
+        c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,'+alpha+')';c.lineWidth=hot?2:1;
+        c.beginPath();c.arc(a[0],a[1],step*1.6+2,0,7);c.stroke();return;
+      }
+      c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,'+alpha+')';
       c.lineWidth=hot?2:1;
       c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(z[0],z[1]);c.stroke();
       if(step>6||hot)[a,z].forEach(p=>{c.fillStyle=hot?'#ffa657':'#79c0ff';c.beginPath();c.arc(p[0],p[1],hot?2.5:1.8,0,7);c.fill()});
@@ -519,18 +568,53 @@ function pvCellAt(ev){
   if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
   return[x,y,pvRkeyAt(x,y)];
 }
+function pvPop(){
+  const pop=$('#plane-pop'),d=PV.lines;
+  if(PV.sel==null||!d){pop.style.display='none';return}
+  const keep=pvKeep();
+  const mine=PV.bonds.filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
+  let h='<div style="color:var(--warn)">point '+d.point+' · '+d.count+' line(s)</div>';
+  (d.lines||[]).slice(0,2).forEach(m=>{
+    h+='<div class="pp">'+esc(m.app||'?')+' '+(m.kind&&m.kind!=='chat'?esc(m.kind)+' ':'')+esc((m.text||'').slice(0,90))+'</div>';
+  });
+  mine.slice(0,4).forEach(b=>{
+    const out=b.src_rkey===PV.sel;
+    h+='<div class="pp" style="color:var(--acc2)">'+esc(b.rel)+' '+(out?'→ ':'← ')+(out?b.dst8:b.src8)+'</div>';
+  });
+  if(keep)h+='<div class="pp">รัศมี '+PV.focus+' hop → '+keep.size+' เซลล์</div>';
+  h+='<div class="prow"><button class="pbtn" id="pop-focus">'+(PV.focus?'ปิดรัศมี':'โฟกัส 1 hop')+'</button>'
+    +'<button class="pbtn" id="pop-zoom">ซูมบล็อก</button>'
+    +'<button class="pbtn" id="pop-close">ปิด</button></div>';
+  pop.innerHTML=h;pop.style.display='block';
+  const cr=pcv.getBoundingClientRect(),wr=$('#plane-canvaswrap').getBoundingClientRect();
+  const ctr=pvCenter(PV.sel)||[0,0];
+  const x=Math.max(4,Math.min((cr.left-wr.left)+ctr[0]+14,wr.width-pop.offsetWidth-10));
+  const y=Math.max(4,Math.min((cr.top-wr.top)+ctr[1]+14,wr.height-pop.offsetHeight-10));
+  pop.style.left=x+'px';pop.style.top=y+'px';
+  $('#pop-focus').onclick=()=>setFocus(PV.focus?0:1);
+  $('#pop-zoom').onclick=()=>pvZoomBlock(PV.sel);
+  $('#pop-close').onclick=()=>pop.style.display='none';
+}
+function setFocus(h){
+  PV.focus=h;pvFocusBtns();pvDraw();pvInfo();pvPop();
+  if(h&&PV.sel==null)toast('เลือวจุดบนระนาบก่อน แล้วรัศมีจะบังส่วนที่ไม่เกี่ยวข้องให้');
+}
+function pvFocusBtns(){
+  for(let i=0;i<4;i++)$('#pv-f'+i).classList.toggle('on',PV.focus===i);
+}
 function pvInfo(){
   const src=(PV.seq===null||PV.seq>=PV.seqMax-1)?PV.plane:pvCellsUpTo(PV.seq);
   const tot=Object.values(src).reduce((a,b)=>a+b,0);
   $('#plane-info').textContent='• เซลล์ '+Object.keys(src).length+'/'+20736+' · '+tot+' lines'
     +' · budget '+PV.budget+(PV.over.length?' · ต้องแตกชั้น '+PV.over.length+' เซลล์':'')
-    +' · edges '+pvLiveBonds().length+' · sightings '+PV.sights.length;
+    +' · edges '+pvLiveBonds().length+' · sightings '+PV.sights.length
+    +(()=>{const k=pvKeep();return k?(' · รัศมี '+PV.focus+' hop = '+k.size+' เซลล์ (บังที่เหลือ)'):''})();
 }
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
   $('#pv-blocks').classList.toggle('on',PV.mode==='blocks');
   $('#pv-block').classList.toggle('on',PV.mode==='block');
-  pvDerive();pvDraw();pvInfo();
+  pvDerive();pvDraw();pvInfo();pvPop();   // popup rides along as the view changes
 }
 async function loadPlane(){
   try{
@@ -570,7 +654,7 @@ async function openPoint(rk,path){
   const q='/neighbors?rkey='+rk+'&level=0'+(PV.path.length?'&path='+PV.path.join(','):'');
   const d=await fetch(q,{headers:H}).then(r=>r.json());
   PV.lines=d;PV.stacked=d.stacked||null;
-  pvDetail();pvDraw();
+  pvDetail();pvDraw();pvPop();
 }
 function pvDetail(){
   const d=PV.lines,el=$('#plane-detail');
@@ -642,6 +726,7 @@ $('#open-plane').onclick=()=>{
 };
 function pvClose(){
   $('#plane-modal').classList.remove('open');
+  $('#plane-pop').style.display='none';
   if(PV.timer){clearInterval(PV.timer);PV.timer=null}
 }
 $('#plane-close').onclick=pvClose;
@@ -654,6 +739,10 @@ $('#pv-block').onclick=()=>{
   pvZoomBlock(PV.sel);
 };
 $('#pv-bonds').onchange=e=>{PV.showBonds=e.target.checked;pvDraw()};
+$('#pv-f0').onclick=()=>setFocus(0);
+$('#pv-f1').onclick=()=>setFocus(1);
+$('#pv-f2').onclick=()=>setFocus(2);
+$('#pv-f3').onclick=()=>setFocus(3);
 $('#pv-seq').oninput=e=>{
   clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';
   PV.seq=+e.target.value;
