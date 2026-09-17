@@ -413,37 +413,13 @@ def memory_bridge(dry_run=False):
     return lifted
 
 
-def neighbors(rkey0, vision=1):
-    """Multi-pointer read: open a vision at one point (rkey0) and see
-    what that vision reveals. Data never moves and knows nothing —
-    every read is a fresh pointer. vision=0 the cell itself,
-    1 = its ring-adjacent cells (RDH 12-delta), 2 = one more step out.
-    Returns [(rkey, [lines])] sorted by distance from the point."""
-    want = [rkey0]
-    seen = {rkey0}
-    ring = [rkey0]
-    for _ in range(max(0, vision)):
-        nxt = []
-        for rk in ring:
-            cx, cy = rk % 144, rk // 144
-            for dx, dy in _RDX[:12]:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < 144 and 0 <= ny < 144:
-                    nrk = ny * 144 + nx
-                    if nrk not in seen:
-                        seen.add(nrk)
-                        nxt.append(nrk)
-        want.extend(nxt)
-        ring = nxt
-    dist = {rk: i for i, rk in enumerate(want)}
-    cells = {rk: [] for rk in want}
-    for m in tail(1000):
-        rk = m.get("rkey")
-        if rk in cells:
-            cells[rk].append(m)
-    return sorted(
-        ((rk, lines) for rk, lines in cells.items() if lines),
-        key=lambda kv: dist[kv[0]])
+def neighbors(rkey0):
+    """Multi-pointer read at the actual read point — no in-between.
+    Open a vision at one point (rkey0), see only that cell's lines.
+    Data never moves and knows nothing; every read is a fresh pointer.
+    Broader rings are the caller's next explicit read, not ours."""
+    lines = [m for m in tail(1000) if m.get("rkey") == rkey0]
+    return [(rkey0, lines)]
 
 
 def demo():
@@ -478,13 +454,10 @@ def demo():
     append("opencode", "chat", "DECISION: pool stays file-first, server optional")
     lifted = memory_bridge(dry_run=True)
     assert any("DECISION" in c for c, _, _ in lifted), "bridge lifts decisions"
-    # multi-pointer vision read: same data, different pointers
+    # multi-pointer vision read: at the actual read point only
     r0 = tail(50)[0]["rkey"]
-    nv = neighbors(r0, vision=0)
-    assert any(l for _, l in nv), "vision at a point sees its own cell"
-    all_rk = set(m["rkey"] for m in tail(50))
-    nv2 = neighbors(r0, vision=2)
-    assert all(rk in all_rk for rk, _ in nv2), "vision reveals only real cells"
+    nv = neighbors(r0)
+    assert nv == [(r0, [m for m in tail(1000) if m.get("rkey") == r0])], "vision = exactly the pointed cell"
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
@@ -498,7 +471,7 @@ def demo():
     for p in (APPS, BRIDGE_STATE):
         if os.path.exists(p):
             os.remove(p)
-    print("POOL-SELFCHECK: 22/22 PASS")
+    print("POOL-SELFCHECK: 21/21 PASS")
 
 
 if __name__ == "__main__":
