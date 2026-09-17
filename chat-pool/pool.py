@@ -52,9 +52,11 @@ def _prev():
     return json.loads(last)["hash"]
 
 
-def append(app, kind, text):
+def append(app, kind, text, to="all"):
     """Append one message. Thread-safe via threading.Lock;
-    process-safe via msvcrt.lock on a .lock file (Windows) or fcntl (Unix)."""
+    process-safe via msvcrt.lock on a .lock file (Windows) or fcntl (Unix).
+    to="all" = broadcast; to="hermes" = only hermes (or an admin view)
+    sees it. `to` is part of the hashed payload — immutable."""
     # Atomic: compute prev + body + write under process lock
     lock_path = LOG + ".lock"
     if sys.platform == 'win32':
@@ -65,12 +67,12 @@ def append(app, kind, text):
             msvcrt.locking(lfd, msvcrt.LK_LOCK, 1)
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
-            body = {"v": 2, "t": time.time(), "app": app, "kind": kind,
-                    "text": text, "prev": prev,
+            body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
+                    "text": text, "to": to, "prev": prev,
                     "rkey": rkey(raw_bytes),
                     "enc": rkey(raw_bytes) % 1440}
             body["hash"] = hashlib.sha256(
-                (prev + app + kind + text).encode("utf-8")).hexdigest()
+                (prev + app + kind + to + text).encode("utf-8")).hexdigest()
             line = json.dumps(body, ensure_ascii=False)
             raw = (line + "\n").encode("utf-8")
             fd = os.open(LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY)
@@ -91,12 +93,12 @@ def append(app, kind, text):
             fcntl.flock(fd_lock, fcntl.LOCK_EX)
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
-            body = {"v": 2, "t": time.time(), "app": app, "kind": kind,
-                    "text": text, "prev": prev,
+            body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
+                    "text": text, "to": to, "prev": prev,
                     "rkey": rkey(raw_bytes),
                     "enc": rkey(raw_bytes) % 1440}
             body["hash"] = hashlib.sha256(
-                (prev + app + kind + text).encode("utf-8")).hexdigest()
+                (prev + app + kind + to + text).encode("utf-8")).hexdigest()
             line = json.dumps(body, ensure_ascii=False)
             raw = (line + "\n").encode("utf-8")
             fd = os.open(LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY)
@@ -146,12 +148,29 @@ def push_outbox(session=SESSION):
     return pushed, failed
 
 
-def tail(n=10):
+def _visible(m, as_app=None):
+    """v3 visibility: to="all" = everyone; to=X = only X itself
+    (plus the sender). as_app=None (human/admin view) sees all —
+    the dashboard uses that; readers pass their own identity."""
+    to = m.get("to", "all")
+    if to == "all" or as_app is None:
+        return True
+    return as_app == to or as_app == m.get("app")
+
+
+def tail(n=10, as_app=None):
     if not os.path.exists(LOG):
         return []
     with open(LOG, encoding="utf-8") as f:
         lines = f.read().strip().split("\n")
-    return [json.loads(x) for x in lines[-n:] if x]
+    out = []
+    for x in lines:
+        if not x:
+            continue
+        m = json.loads(x)
+        if _visible(m, as_app):
+            out.append(m)
+    return out[-n:]
 
 
 CLOUD_DB = r"I:\tools\cloud-workspace\pool.db"
@@ -159,12 +178,15 @@ CLOUD_DB = r"I:\tools\cloud-workspace\pool.db"
 
 def pretty(m):
     """One-line minimal chat-log view of a pool line.
-    kind 'chat' is the default and stays implicit in the label."""
+    kind 'chat' is the default and stays implicit in the label;
+    directed messages show →recipient."""
     ts = time.strftime("%m-%d %H:%M", time.localtime(m.get("t", time.time())))
     kind = m.get("kind", "chat")
     label = m.get("app", "?") if kind == "chat" else "%s/%s" % (m.get("app", "?"), kind)
+    to = m.get("to", "all")
+    arrow = " → %s" % to if to not in ("all", None) else ""
     text = m.get("text", "").replace("\n", "\n    ")
-    return "[%s] %s: %s" % (ts, label, text)
+    return "[%s] %s%s: %s" % (ts, label, arrow, text)
 
 
 def _chunk_msgs(text):
@@ -186,12 +208,12 @@ def _chunk_msgs(text):
     return None
 
 
-def view(n=20, cloud=False):
+def view(n=20, cloud=False, as_app=None):
     """Minimal human-readable view. Local log tail by default;
     --cloud renders recent session-pool chunks (pool.db, read-only).
     Storage stays raw everywhere — this is display-only."""
     if not cloud:
-        return [pretty(m) for m in tail(n)]
+        return [pretty(m) for m in tail(n, as_app)]
     import sqlite3
     db = sqlite3.connect("file:" + CLOUD_DB.replace("\\", "/") + "?mode=ro", uri=True)
     rows = db.execute(
@@ -203,7 +225,8 @@ def view(n=20, cloud=False):
         out.append("== chunk seq=%d ==" % seq)
         msgs = _chunk_msgs(text)
         if msgs:
-            out.extend("  " + pretty(m) for m in msgs if isinstance(m, dict))
+            out.extend("  " + pretty(m) for m in msgs if isinstance(m, dict)
+                       if _visible(m, as_app))
         else:
             out.append("  " + text[:200])
     return out
@@ -250,20 +273,27 @@ def demo():
     assert len(tail(5)) == 2, "tail must see both apps"
     assert tail(5)[0]["prev"] == "GENESIS", "chain starts at GENESIS"
     assert tail(5)[1]["prev"] == tail(5)[0]["hash"], "chain linked"
-    assert tail(5)[0]["v"] == 2, "v:2 lines"
+    assert tail(5)[0]["v"] == 3, "v:3 lines"
     assert tail(5)[0]["enc"] == tail(5)[0]["rkey"] % 1440, "enc free view"
     assert 0 <= tail(5)[1]["rkey"] < 20736, "rkey in RDH space"
+    # v3 directed visibility
+    append("dashboard", "chat", "secret for hermes", to="hermes")
+    vis_all = tail(10)
+    assert len(vis_all) == 3, "admin view sees all"
+    assert all(m["text"] != "secret for hermes" for m in tail(10, as_app="codex")), "codex must not see hermes DM"
+    assert tail(10, as_app="hermes")[-1]["text"] == "secret for hermes", "hermes sees own DM"
+    assert tail(10, as_app="dashboard")[-1]["text"] == "secret for hermes", "sender sees own DM"
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
-    assert len(json.load(open(ep1, encoding="utf-8"))) == 2, "emit 2 lines"
+    assert len(json.load(open(ep1, encoding="utf-8"))) == 3, "emit 3 lines (2 chat + 1 DM)"
     assert flush_emit() is None, "emit skips when unchanged"
     append("codex", "chat", "third msg")
     ep3 = flush_emit()
     assert ep3 is not None, "emit fires on new line"
     assert len(json.load(open(ep3, encoding="utf-8"))) == 1, "emit only new"
     shutil.rmtree(os.path.join(DIR, "outbox"), ignore_errors=True)
-    print("POOL-SELFCHECK: 12/12 PASS")
+    print("POOL-SELFCHECK: 15/15 PASS")
 
 
 if __name__ == "__main__":

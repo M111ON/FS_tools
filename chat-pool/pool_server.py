@@ -104,6 +104,10 @@ button.send:hover{filter:brightness(1.1)}
       <div class="apps" id="apps"></div>
     </section>
     <section>
+      <h2>View as</h2>
+      <div class="apps" id="identities"></div>
+    </section>
+    <section>
       <h2>Status</h2>
       <div class="stat"><span>lines</span><b id="st-lines">–</b></div>
       <div class="stat"><span>last append</span><b id="st-last">–</b></div>
@@ -116,6 +120,9 @@ button.send:hover{filter:brightness(1.1)}
     <div id="composer">
       <textarea id="msg-in" placeholder="พิมพ์ข้อความ… (Enter ส่ง)"></textarea>
       <button class="send" id="send">ส่ง</button>
+      <select id="to-sel" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 8px">
+        <option value="all">→ all</option>
+      </select>
     </div>
     <div id="flushtip">hourly flush อัตโนมัติอยู่แล้ว · <a href="#" id="flushnow" style="color:var(--acc2)">flush เดี๋ยวนี้</a></div>
   </aside>
@@ -123,7 +130,7 @@ button.send:hover{filter:brightness(1.1)}
 <div class="toast" id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);
-let msgs=[], filterQ='', filterApps=new Set();
+let msgs=[], filterQ='', filterApps=new Set(), identity='admin';
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
@@ -138,15 +145,23 @@ function render(){
   feed.innerHTML=list.map(m=>{
     const kind=m.kind||'chat';
     const kbadge=kind==='chat'?'':`<span class="badge kind">${esc(kind)}</span>`;
-    return `<div class="msg"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}<span class="time">${fmt(m.t)}</span><span class="hash" title="คลิกเพื่อ copy" onclick="navigator.clipboard.writeText('${m.hash||''}');toast('copied '+ '${hash8(m.hash)}')">${hash8(m.hash)}</span></div><div class="text">${esc(m.text||'')}</div></div>`;
+    const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
+    return `<div class="msg"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}${arrow}<span class="time">${fmt(m.t)}</span><span class="hash" title="คลิกเพื่อ copy" onclick="navigator.clipboard.writeText('${m.hash||''}');toast('copied '+ '${hash8(m.hash)}')">${hash8(m.hash)}</span></div><div class="text">${esc(m.text||'')}</div></div>`;
   }).join('')||'<div style="color:var(--dim);text-align:center;padding:40px">ไม่มีข้อความ</div>';
-  // app chips
+  // app chips + identity switch + to-select
   const apps={};msgs.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
   $('#apps').innerHTML=Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>
     `<span class="appbtn ${filterApps.has(a)?'on':''}" onclick="toggleApp('${esc(a)}')">${esc(a)} ${n}</span>`).join('');
+  const known=[...new Set([...Object.keys(apps),'hermes','codex','dashboard'])];
+  $('#identities').innerHTML=['admin',...known.sort()].map(a=>
+    `<span class="appbtn ${identity===a?'on':''}" onclick="setIdentity('${esc(a)}')">${esc(a)}</span>`).join('');
+  const sel=$('#to-sel');const cur=sel.value;
+  sel.innerHTML='<option value="all">→ all</option>'+known.filter(a=>a!=='dashboard').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
+  if([...sel.options].some(o=>o.value===cur))sel.value=cur;
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
 }
+window.setIdentity=a=>{identity=a;refresh()};
 window.toggleApp=a=>{filterApps.has(a)?filterApps.delete(a):filterApps.add(a);render()};
 window.toast=t=>{const el=$('#toast');el.textContent=t;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
 
@@ -159,7 +174,7 @@ $('#cloudck').onchange=async e=>{
 async function send(){
   const el=$('#msg-in');const text=el.value.trim();if(!text)return;
   el.value='';el.style.height='38px';
-  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'dashboard',kind:'chat',text})}).then(r=>r.json());
+  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'dashboard',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
   if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
 }
 $('#send').onclick=send;
@@ -168,9 +183,10 @@ $('#msg-in').oninput=e=>{e.target.style.height='38px';e.target.style.height=Math
 $('#flushnow').onclick=async e=>{e.preventDefault();const r=await fetch('/flush',{method:'POST'}).then(r=>r.json());toast(r.pushed?`flush ok: ${r.pushed.length} pushed`:(r.emitted?'flush ok':'nothing to flush'));refresh()};
 
 async function refresh(){
+  const as=identity==='admin'?'':'&as='+identity;
   const [tail,h]=await Promise.all([
-    fetch('/tail?n=200').then(r=>r.json()),
-    fetch('/view?n=500').then(r=>r.json())
+    fetch('/tail?n=200'+as).then(r=>r.json()),
+    fetch('/view?n=500'+as).then(r=>r.json())
   ]);
   msgs=tail;
   render();
@@ -183,7 +199,8 @@ setInterval(()=>$('#clock').textContent=new Date().toLocaleTimeString('th-TH'),1
 refresh();
 // SSE live
 function listen(){
-  const es=new EventSource('/stream?n=200');
+  const as=identity==='admin'?'':'&as='+identity;
+  const es=new EventSource('/stream?n=200'+as);
   es.onopen=()=>$('#dot').classList.add('on');
   es.onerror=()=>{$('#dot').classList.remove('on');es.close();setTimeout(listen,3000)};
   es.onmessage=ev=>{const m=JSON.parse(ev.data);
@@ -226,15 +243,19 @@ class PoolHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/tail":
             n = min(int(qs.get("n", ["10"])[0]), 500)
+            as_app = qs.get("as", [None])[0]
             with _lock:
-                msgs = pool.tail(n)
+                msgs = pool.tail(n, as_app=as_app)
             self._json(200, msgs)
 
         elif parsed.path == "/view":
             n = min(int(qs.get("n", ["20"])[0]), 1000)
             cloud = qs.get("cloud", ["0"])[0] == "1"
+            as_app = qs.get("as", [None])[0]
+            if as_app == "admin":
+                as_app = None
             try:
-                lines = pool.view(n, cloud=cloud)
+                lines = pool.view(n, cloud=cloud, as_app=as_app)
                 # chain audit for the dashboard header
                 ok, hashes = _chain_audit()
                 self._json(200, {"lines": lines, "chain_ok": ok, "hashes": hashes})
@@ -243,6 +264,7 @@ class PoolHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/stream":
             n = min(int(qs.get("n", ["5"])[0]), 500)
+            as_app = qs.get("as", [None])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -252,7 +274,7 @@ class PoolHandler(BaseHTTPRequestHandler):
             try:
                 while True:
                     with _lock:
-                        msgs = pool.tail(n)
+                        msgs = pool.tail(n, as_app=as_app)
                     if len(msgs) > seen:
                         for m in msgs[seen:]:
                             self.wfile.write(f"data: {json.dumps(m, ensure_ascii=False)}\n\n".encode())
@@ -273,11 +295,12 @@ class PoolHandler(BaseHTTPRequestHandler):
             app = body.get("app", "?")
             kind = body.get("kind", "chat")
             text = body.get("text", "")
+            to = body.get("to", "all")
             if not text:
                 self._json(400, {"error": "text required"})
                 return
             with _lock:
-                result = pool.append(app, kind, text)
+                result = pool.append(app, kind, text, to=to)
             self._json(200, {"ok": True, "hash": result["hash"]})
         elif parsed.path == "/flush":
             path = pool.flush_emit()
