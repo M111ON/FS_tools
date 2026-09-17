@@ -14,6 +14,8 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(DIR, "log.jsonl")
 STATE = os.path.join(DIR, ".flush_state.json")
 APPS = os.path.join(DIR, "apps.json")  # dynamic identity registry
+CTX_DB = r"I:\cortexkit\magic-context\context.db"  # living memory
+BRIDGE_STATE = os.path.join(DIR, ".bridge_state.json")
 
 # Exact port of DWGLS core/rdh_capture.h (RDH_CAPTURE_144, S=1).
 # Role: ADDRESS only (routing hint). NOT integrity: walk sees low nibbles
@@ -338,6 +340,79 @@ def flush_emit():
     return path
 
 
+# ── living memory bridge (pool → Magic Context) ───────────────────
+BRIDGE_RE = re.compile(
+    r"^(SESSION|RECOVERY|HANDOFF|DECISION|VERDICT)\b", re.IGNORECASE)
+BRIDGE_CATEGORIES = {
+    "HANDOFF": "HANDOFF",
+    "SESSION": "HANDOFF",
+    "RECOVERY": "HANDOFF",
+    "DECISION": "DECISION",
+    "VERDICT": "DECISION",
+}
+
+
+def _bridge_load():
+    if not os.path.exists(BRIDGE_STATE):
+        return 0
+    try:
+        return json.load(open(BRIDGE_STATE, encoding="utf-8")).get("last_t", 0)
+    except Exception:
+        return 0
+
+
+def _bridge_save(last_t):
+    json.dump({"last_t": last_t}, open(BRIDGE_STATE, "w", encoding="utf-8"))
+
+
+def memory_bridge(dry_run=False):
+    """Living memory: scan pool lines newer than the bridge cursor,
+    lift handoff/decision/verdict messages into Magic Context's
+    memories (context.db) so every OpenCode session recalls them.
+    Mirrors ctx_memory's TS-authority write path (direct insert with
+    FTS trigger). Returns list of (kind, text, memory_id)."""
+    import sqlite3
+    since = _bridge_load()
+    lifted = []
+    last_t = since
+    for m in tail(500):
+        t = m.get("t", 0)
+        if t <= since:
+            continue
+        last_t = max(last_t, t)
+        text = (m.get("text") or "").strip()
+        mkey = BRIDGE_RE.match(text)
+        if not mkey:
+            continue
+        kind = mkey.group(1).upper()
+        category = BRIDGE_CATEGORIES.get(kind)
+        if not category:
+            continue
+        content = f"[chat-pool/{m.get('app', '?')}] {text}"
+        nhash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+        if dry_run:
+            lifted.append((category, content, None))
+            continue
+        now = int(time.time() * 1000)
+        db = sqlite3.connect(CTX_DB)
+        try:
+            cur = db.execute(
+                "INSERT INTO memories(project_path, category, content, "
+                "normalized_hash, importance, source_type, first_seen_at, "
+                "created_at, updated_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("git:174753f2375c19a1c0ce1388ef592bfa02d2b056", category,
+                 content, nhash, 60, "chat-pool", now, now, now, now))
+            db.commit()
+            lifted.append((category, content, cur.lastrowid))
+        except sqlite3.IntegrityError:
+            pass  # duplicate memory — bridge is idempotent
+        finally:
+            db.close()
+    if not dry_run and last_t > since:
+        _bridge_save(last_t)
+    return lifted
+
+
 def demo():
     for p in (LOG, STATE, LOG + ".lock"):
         if os.path.exists(p):
@@ -366,30 +441,41 @@ def demo():
     assert not any("run the flush" in m["text"] for m in inbox("codex", mark_read=False)), "codex inbox clean"
     ib2 = inbox("hermes")  # mark read
     assert inbox("hermes") == [], "inbox drains after read"
+    # living memory bridge (dry run — no db write in demo)
+    append("opencode", "chat", "DECISION: pool stays file-first, server optional")
+    lifted = memory_bridge(dry_run=True)
+    assert any("DECISION" in c for c, _, _ in lifted), "bridge lifts decisions"
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
-    assert len(json.load(open(ep1, encoding="utf-8"))) == 4, "emit 4 lines (3 chat + 1 DM)"
+    assert len(json.load(open(ep1, encoding="utf-8"))) == 5, "emit 5 lines (4 chat + 1 DM)"
     assert flush_emit() is None, "emit skips when unchanged"
     append("codex", "chat", "third msg")
     ep3 = flush_emit()
     assert ep3 is not None, "emit fires on new line"
     assert len(json.load(open(ep3, encoding="utf-8"))) == 1, "emit only new"
     shutil.rmtree(os.path.join(DIR, "outbox"), ignore_errors=True)
-    for p in (APPS,):
+    for p in (APPS, BRIDGE_STATE):
         if os.path.exists(p):
             os.remove(p)
-    print("POOL-SELFCHECK: 19/19 PASS")
+    print("POOL-SELFCHECK: 20/20 PASS")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "demo":
         demo()  # wipes LOG+STATE: test only, never scheduled
+    elif len(sys.argv) > 1 and sys.argv[1] == "bridge":
+        dry = "--dry" in sys.argv
+        lifted = memory_bridge(dry_run=dry)
+        for cat, content, mid in lifted:
+            print(f"[{cat}]{' #' + str(mid) if mid else ''} {content[:100]}")
+        print(f"bridge: {len(lifted)} lifted" + (" (dry)" if dry else ""))
     elif len(sys.argv) > 1 and sys.argv[1] == "view":
         n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 20
         print("\n".join(view(n, cloud="--cloud" in sys.argv)))
     else:
         path = flush_emit()  # hourly safe default: emit+push or skip
+        memory_bridge()  # living memory: lift handoff/decision into magic context
         pushed, failed = push_outbox()
         if failed:
             print("PUSH-FAILED", failed)
