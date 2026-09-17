@@ -463,15 +463,32 @@ class PoolHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "?rkey=<int> required"})
                 return
+            lv = qs.get("level", ["0"])[0]
+            as_app = qs.get("as", [None])[0]
+            if lv not in ("0", "1", "2"):
+                self._json(400, {"error": "?level=0 (cell) | 1 (block map) | 2 (plane map)"})
+                return
             with _lock:
-                if qs.get("level", ["0"])[0] == "1":
-                    # L1 coarse read: MAP only (fine-cell addresses + counts)
-                    self._json(200, pool._coarse_map(rk))
-                    return
-                cells = pool.neighbors(rk)
-            self._json(200, {"point": rk,
-                             "cells": [{"rkey": rk2, "lines": lines}
-                                       for rk2, lines in cells]})
+                # one pointer, one level, one read: L0 content · L1 12x12
+                # block map · L2 whole-plane map. Over-budget cells come
+                # back already split (stacked), never as a wall of lines.
+                vis = pool.open_pointer(rk, level=int(lv), as_app=as_app)
+            self._json(200, vis)
+
+        elif parsed.path == "/pointers":
+            # shared awareness WITHOUT a central pointer: sightings are
+            # ordinary lines, so this is derived, never stored server state
+            try:
+                rk = qs.get("rkey", [""])[0]
+                lv = qs.get("level", [""])[0]
+                rk = int(rk) if rk else None
+                lv = int(lv) if lv else None
+            except ValueError:
+                self._json(400, {"error": "?rkey=<int>&level=<int> are optional"})
+                return
+            with _lock:
+                seen = pool.pointers_at(rk, lv)
+            self._json(200, {"point": rk, "level": lv, "pointers": seen})
 
         elif parsed.path == "/bonds":
             # blast-radius read at one point: edges touching a line hash

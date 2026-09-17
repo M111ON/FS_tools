@@ -25,14 +25,20 @@ _RDX = ( (1,0),(1,1),(0,1),(1,-1),(-1,0),(-1,-1),(0,-1),(-1,1),
          (2,0),(1,2),(-1,2),(-2,0) )
 
 
-def rkey(data: bytes):
+def rkey(data: bytes, phase: int = 0):
+    """RDH capture — exact port of RDH_CAPTURE_144 (S=1). ADDRESS only.
+    `phase` rotates the walk start: the SAME 144x144 plane, an independent
+    axis over the same bytes. phase=0 is the locked capture, byte-identical
+    to before. This is the stacking axis (§5.4): a plane is never scaled
+    (RDH_CAPTURE_SCALE would move every existing address = break the one
+    shared plane), an overflowing cell is split by later phases instead."""
     if not data:
         return 0
     F = 144
     ax = ay = 0
     steps = max(len(data), 48)
     for i in range(steps):
-        n = data[i % len(data)] & 0x0F
+        n = data[(i + phase) % len(data)] & 0x0F
         dx, dy = _RDX[n] if n < 12 else (0, 0)
         ax += dx
         ay += dy
@@ -488,6 +494,136 @@ def _coarse_map(rkey0, block=12):
             "fine_cells": dict(sorted(cells.items()))}
 
 
+VISION_BUDGET = 64  # lines one cell may hold before a read needs stacking
+
+
+def _plane_map():
+    """L2 vision: the whole 144x144 plane read as one MAP.
+    Spatial depth stops here — 20,736 = 144x144 has exactly three useful
+    views (20736 cells / 144 blocks / 1 plane); deeper levels add nothing.
+    Cells over budget are only FLAGGED, never expanded: expanding one is
+    the caller's next explicit read. Addresses + counts, no content."""
+    cells = {}
+    for m in tail(1000):
+        rk = m.get("rkey")
+        if rk is not None:
+            cells[rk] = cells.get(rk, 0) + 1
+    return {"level": 2, "plane": 144 * 144, "budget": VISION_BUDGET,
+            "fine_cells": dict(sorted(cells.items())),
+            "over_budget": sorted(k for k, c in cells.items()
+                                  if c > VISION_BUDGET)}
+
+
+def _axis(line, depth):
+    """Sub-axis of a line inside its own cell (§5.4 stacking).
+    Recomputed from the line's own content at read time — the same bytes
+    append() captured — so stacking needs ZERO storage change and every
+    line already written gets it retroactively. Never stored, never in
+    the hash: deterministic replay gives the same bucket every time."""
+    raw = (line.get("app", "") + line.get("kind", "")
+           + line.get("text", "")).encode("utf-8")
+    return rkey(raw, phase=depth) % 144
+
+
+def sub_map(rkey0, depth=1):
+    """Stacked read: ONE overflowing cell split by axis `depth`.
+    Same rule as L1 — a MAP only (sub-addresses + counts), no content.
+    Depth 1 gives 144 sub-cells; every further depth multiplies by 144,
+    so a cell absorbs 144^d x budget lines without the plane growing."""
+    cells = {}
+    for m in tail(1000):
+        if m.get("rkey") == rkey0:
+            k = _axis(m, depth)
+            cells[k] = cells.get(k, 0) + 1
+    return {"level": "0.%d" % depth, "cell": rkey0, "depth": depth,
+            "budget": VISION_BUDGET, "sub_cells": dict(sorted(cells.items()))}
+
+
+def _needed_depth(lines):
+    """Cheapest depth at which every bucket of a cell reads under budget.
+    Answered by reading the lines — the data still knows nothing."""
+    depth = 1
+    while depth < 6:
+        counts = {}
+        for m in lines:
+            k = _axis(m, depth)
+            counts[k] = counts.get(k, 0) + 1
+        if max(counts.values()) <= VISION_BUDGET:
+            return depth
+        depth += 1
+    return depth
+
+
+# --- pointer (§5.3 decision 2026-09-17) -------------------------------
+# Iron law 5: no central pointer. A pointer is born at one read and dies
+# with it, so the system keeps NO pointer state anywhere — not in a file,
+# not in the server. What CAN be shared is not a live cursor but a
+# *sighting*: an ordinary immutable line declaring that a read happened
+# at a point. Awareness comes from data; the read stays per-caller.
+
+def sighting(rkey0, level=0, app="system"):
+    """Declare a read at one point, as data. kind:"pointer", text
+    "point=<rkey> level=<n>". Goes through append() like anything else,
+    so it is chained, hashed and addressed for free — and a sighting that
+    'ends' is simply the next sighting, never an edit or a delete."""
+    return append(app, "pointer", "point=%d level=%d" % (rkey0, level))
+
+
+def pointers_at(rkey0=None, level=None, as_app=None):
+    """Who declared a read where — derived from lines, nothing stored.
+    Latest sighting per app wins. Kill the server mid-read and this still
+    answers the same, because there is no server state to lose."""
+    out = {}
+    for m in tail(1000, as_app=as_app):
+        if m.get("kind") != "pointer":
+            continue
+        p = (m.get("text") or "").split()
+        if len(p) != 2 or not p[0].startswith("point="):
+            continue
+        try:
+            pt = int(p[0][6:])
+            lv = int(p[1].split("=", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if rkey0 is not None and pt != rkey0:
+            continue
+        if level is not None and lv != level:
+            continue
+        a = m.get("app")
+        if a not in out or m.get("t", 0) >= out[a]["t"]:
+            out[a] = {"app": a, "point": pt, "level": lv,
+                      "t": m.get("t"), "hash": m.get("hash")}
+    return sorted(out.values(), key=lambda x: -x["t"])
+
+
+def open_pointer(rkey0, level=0, app="system", record=False, depth=None,
+                 as_app=None):
+    """Open ONE pointer at ONE point and close it (§5.3).
+    L0 = content of that cell only · L1 = containing 12x12 block as a map ·
+    L2 = whole plane as a map. If the pointed cell is over budget the
+    answer carries a stacked sub-map instead of drowning the reader.
+    Nothing about the read is kept unless the caller asks for a sighting,
+    and no other caller shares it — that is iron law 5 exactly.
+    Maps are address-only, so they carry no content and need no visibility
+    filter; only L0 content is filtered by as_app."""
+    if level == 2:
+        vis = _plane_map()
+    elif level == 1:
+        vis = _coarse_map(rkey0)
+    else:
+        lines = [m for m in tail(1000, as_app=as_app)
+                 if m.get("rkey") == rkey0]
+        vis = {"level": 0, "point": rkey0, "count": len(lines),
+               "lines": lines}
+        if len(lines) > VISION_BUDGET:
+            d = depth or _needed_depth(lines)
+            vis["stacked"] = sub_map(rkey0, d)
+            vis["over_budget"] = True
+    if record:
+        vis["sighting"] = sighting(rkey0, level=level, app=app)["hash"]
+    return vis
+
+
 def demo():
     """Self-check. Runs against a TEMP copy of the module directory —
     a crashed demo used to wipe the live log mid-assert (it happened);
@@ -575,10 +711,47 @@ def _demo_body():
     r0 = tail(50)[0]["rkey"]
     nv = neighbors(r0)
     assert nv == [(r0, [m for m in tail(1000) if m.get("rkey") == r0])], "vision = exactly the pointed cell"
+    # §5.3 pointer: per-read and ephemeral; awareness only as data
+    p0 = tail(50)[0]["rkey"]
+    assert pointers_at(p0) == [], "no pointer state exists before any read"
+    v0 = open_pointer(p0, level=0, app="codex")
+    assert v0["count"] == len([m for m in tail(1000) if m.get("rkey") == p0]), "L0 = content of the pointed cell only"
+    assert pointers_at(p0) == [], "a read leaves no trace unless the caller declares one"
+    sg = sighting(p0, level=0, app="codex")
+    assert sg["kind"] == "pointer", "sighting is data, not server state"
+    assert sg["rkey"] == rkey(("codex" + "pointer" + sg["text"]).encode("utf-8")), "sighting chained/address like any line"
+    seen = pointers_at(p0)
+    assert len(seen) == 1 and seen[0]["app"] == "codex" and seen[0]["level"] == 0, "awareness derived from lines alone"
+    assert pointers_at(0) == [], "points nobody read stay silent"
+    assert pointers_at(p0, level=1) == [], "level is part of the point"
+    sighting(p0, level=0, app="hermes")
+    assert {s["app"] for s in pointers_at(p0)} == {"codex", "hermes"}, "each pointer stays its own — no central pointer"
+    assert len(pointers_at(p0)) == 2, "two readers, two independent pointers at the same point"
+    # §5.4 RDH 144: one fixed leaf plane; overflow STACKS by phase axis
+    pm = _plane_map()
+    assert pm["level"] == 2 and pm["plane"] == 20736, "L2 = whole plane, the spatial ceiling"
+    assert sum(pm["fine_cells"].values()) == len([m for m in tail(1000) if m.get("rkey") is not None]), "plane map counts every addressed line"
+    assert pm["over_budget"] == [], "nothing over budget here — stacking stays lazy"
+    assert rkey(b"same bytes", phase=1) != rkey(b"same bytes", phase=0), "phase is an independent axis in the same plane"
+    assert rkey(b"same bytes") == rkey(b"same bytes", phase=0), "phase 0 = the locked capture, unchanged"
+    assert _axis({"app": "a", "kind": "k", "text": "t"}, 1) == rkey(b"akt", phase=1) % 144, "sub-axis recomputed from the line itself"
+    pcell = tail(50)[0]["rkey"]
+    sub = sub_map(pcell, depth=1)
+    assert sub["level"] == "0.1" and sum(sub["sub_cells"].values()) == len([m for m in tail(1000) if m.get("rkey") == pcell]), "stacked read splits exactly that one cell, addresses only"
+    assert all(isinstance(k, int) for k in sub["sub_cells"]), "stacked read is a map, never content"
+    load = [{"app": "load", "kind": "chat", "text": "line %d" % i} for i in range(200)]
+    d = _needed_depth(load)
+    counts = {}
+    for m in load:
+        k = _axis(m, d)
+        counts[k] = counts.get(k, 0) + 1
+    assert max(counts.values()) <= VISION_BUDGET, "stacking splits until every bucket reads under budget"
+    big = open_pointer(pcell, level=0, app="load")
+    assert "stacked" not in big, "a cell under budget is never split — breathing only when needed"
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
-    assert len(json.load(open(ep1, encoding="utf-8"))) == 8, "emit 8 lines (4 chat incl DM + 1 code + 3 bonds)"
+    assert len(json.load(open(ep1, encoding="utf-8"))) == 10, "emit 10 lines (4 chat incl DM + 1 code + 3 bonds + 2 pointers)"
     assert flush_emit() is None, "emit skips when unchanged"
     append("codex", "chat", "third msg")
     ep3 = flush_emit()
@@ -591,7 +764,7 @@ def _demo_body():
                 os.replace(APPS + ".demo-bak", APPS)  # restore real registry
             else:
                 os.remove(p)
-    print("POOL-SELFCHECK: 30/30 PASS")
+    print("POOL-SELFCHECK: 45/45 PASS")
 
 
 if __name__ == "__main__":
