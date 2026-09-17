@@ -259,8 +259,7 @@ function render(){
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
 }
-window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
-window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
+window.setIdentity=async a=>{identity=a;refresh().catch(()=>{});await registerIdentity();loadInbox().catch(()=>{})};
 
 async function loadInbox(mark){
   const regbox=$('#regbox'), inboxbox=$('#inboxbox');
@@ -345,6 +344,10 @@ function listen(){
     if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render()}};
 }
 listen();
+// boot: initial pull for chain/registry/inbox — SSE only carries new lines,
+// without this a LAN phone shows the shell with a stuck "chain…" forever
+refresh().catch(()=>{});
+loadInbox().catch(()=>{});
 </script>
 </body>
 </html>"""
