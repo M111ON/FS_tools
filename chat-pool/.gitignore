@@ -14,3 +14,4 @@ apps.json
 .pool_token
 .bridge_state.json
 log.jsonl.lock
+.cloud_push_state.json

@@ -616,4 +616,9 @@ if __name__ == "__main__":
         pushed, failed = push_outbox()
         if failed:
             print("PUSH-FAILED", failed)
+        try:  # cloud backup: best-effort mirror, never blocks the flush
+            import pool_cloud
+            pool_cloud.push()
+        except Exception as e:
+            print("cloud-push ERROR", e)
         print(path if path else "SKIP", f"pushed={len(pushed)}")
