@@ -375,10 +375,7 @@ async function refresh(){
   document.getElementById('qrpanel')?.style.setProperty('display','none');
   msgs=tail;
   render();
-  const links=Math.max(h.hashes.length-1,0);
-  const el=$('#chain');
-  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
-  el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
+  paintChain(h);
 }
 function listen(){
   const as=identity==='admin'?'':'&as='+identity;
@@ -386,7 +383,25 @@ function listen(){
   es.onopen=()=>$('#dot').classList.add('on');
   es.onerror=()=>{$('#dot').classList.remove('on');es.close();setTimeout(listen,3000)};
   es.onmessage=ev=>{const m=JSON.parse(ev.data);
-    if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render()}};
+    if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render();syncChain()}};
+}
+function paintChain(h){
+  const links=Math.max(h.hashes.length-1,0);
+  const el=$('#chain');
+  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
+  el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
+}
+// SSE carries new lines but not the chain count, so a line arriving after
+// boot used to leave "chain ✓ N links" stale by however many pushed since
+let chainT=null;
+function syncChain(){
+  clearTimeout(chainT);
+  chainT=setTimeout(async()=>{
+    try{
+      const as=identity==='admin'?'':'&as='+identity;
+      paintChain(await fetch('/view?n=500'+as,{headers:H}).then(r=>r.json()));
+    }catch{}
+  },1200);
 }
 listen();
 
