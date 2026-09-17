@@ -479,18 +479,34 @@ def bonds_for(hash8_or_full, as_app=None):
     return out
 
 
+def _block_of(rkey0, block=12):
+    """Spatial super-cell holding this point, as (wedge0, ring0).
+    rkey = ring*144 + wedge, so a 12x12 block is a 2-D square of
+    (wedge, ring) pairs. 144 *consecutive* addresses are NOT a square —
+    they run diagonally across rows, which is what the heatmap made
+    obvious: L1 must be a square or "zoom out" would not frame the point."""
+    wedge, ring = rkey0 % 144, rkey0 // 144
+    return (wedge // block) * block, (ring // block) * block
+
+
+def _in_block(rk, wedge0, ring0, block=12):
+    return (wedge0 <= rk % 144 < wedge0 + block
+            and ring0 <= rk // 144 < ring0 + block)
+
+
 def _coarse_map(rkey0, block=12):
-    """L1 vision at one point: the containing 12x12 super-cell.
-    Answers with a MAP ONLY — fine-cell addresses that hold lines,
-    each with a count. No content ever crosses the read point.
-    Want content? Point at a fine rkey from the map: new read."""
-    base = (rkey0 // block) * block
+    """L1 vision at one point: the containing 12x12 SPATIAL super-cell.
+    Answers with a MAP ONLY — fine-cell addresses that hold lines, each
+    with a count. No content ever crosses the read point. Want content?
+    Point at a fine rkey from the map: new read."""
+    bw, br = _block_of(rkey0, block)
     cells = {}
     for m in tail(1000):
         rk = m.get("rkey")
-        if rk is not None and base <= rk < base + block * block:
+        if rk is not None and _in_block(rk, bw, br, block):
             cells[rk] = cells.get(rk, 0) + 1
-    return {"level": 1, "base": base, "block": block,
+    return {"level": 1, "block": block, "origin": {"wedge": bw, "ring": br},
+            "base": br * 144 + bw,
             "fine_cells": dict(sorted(cells.items()))}
 
 
@@ -525,25 +541,39 @@ def _axis(line, depth):
     return rkey(raw, phase=depth) % 144
 
 
-def sub_map(rkey0, depth=1):
+def sub_map(rkey0, depth=1, path=()):
     """Stacked read: ONE overflowing cell split by axis `depth`.
     Same rule as L1 — a MAP only (sub-addresses + counts), no content.
     Depth 1 gives 144 sub-cells; every further depth multiplies by 144,
-    so a cell absorbs 144^d x budget lines without the plane growing."""
+    so a cell absorbs 144^d x budget lines without the plane growing.
+    `path` = sub-cells already chosen at shallower depths — a point
+    inside a point. Each step down is the caller's own explicit read."""
+    path = tuple(path or ())
     cells = {}
     for m in tail(1000):
-        if m.get("rkey") == rkey0:
-            k = _axis(m, depth)
-            cells[k] = cells.get(k, 0) + 1
+        if m.get("rkey") != rkey0:
+            continue
+        if any(_axis(m, i + 1) != v for i, v in enumerate(path)):
+            continue
+        k = _axis(m, depth)
+        cells[k] = cells.get(k, 0) + 1
+    over = sorted(k for k, c in cells.items() if c > VISION_BUDGET)
     return {"level": "0.%d" % depth, "cell": rkey0, "depth": depth,
-            "budget": VISION_BUDGET, "sub_cells": dict(sorted(cells.items()))}
+            "path": list(path), "budget": VISION_BUDGET,
+            # a map is only drillable if its keys live at ONE known depth,
+            # so the stack advances one axis per read and says whether the
+            # reader still needs another step (§5.4: walk, don't teleport)
+            "still_over": len(over), "next_depth": depth + 1,
+            "sub_cells": dict(sorted(cells.items()))}
 
 
-def _needed_depth(lines):
-    """Cheapest depth at which every bucket of a cell reads under budget.
-    Answered by reading the lines — the data still knows nothing."""
-    depth = 1
-    while depth < 6:
+def _depth_for(lines, start=1):
+    """Cheapest depth at which every bucket reads under budget.
+    Answered by reading the lines — the data still knows nothing.
+    `start` is the first fresh axis: once depth 1 was chosen as a step,
+    splitting again on depth 1 would only repeat the same bucket."""
+    depth = max(1, start)
+    while depth < 8:
         counts = {}
         for m in lines:
             k = _axis(m, depth)
@@ -552,6 +582,10 @@ def _needed_depth(lines):
             return depth
         depth += 1
     return depth
+
+
+def _needed_depth(lines):
+    return _depth_for(lines, 1)
 
 
 # --- pointer (§5.3 decision 2026-09-17) -------------------------------
@@ -597,15 +631,18 @@ def pointers_at(rkey0=None, level=None, as_app=None):
 
 
 def open_pointer(rkey0, level=0, app="system", record=False, depth=None,
-                 as_app=None):
+                 path=None, as_app=None):
     """Open ONE pointer at ONE point and close it (§5.3).
     L0 = content of that cell only · L1 = containing 12x12 block as a map ·
     L2 = whole plane as a map. If the pointed cell is over budget the
-    answer carries a stacked sub-map instead of drowning the reader.
+    answer carries a stacked sub-map instead of drowning the reader, and
+    `path` walks one sub-cell down at a time (a point inside a point) —
+    each step still answers a map until the reader asks for content.
     Nothing about the read is kept unless the caller asks for a sighting,
     and no other caller shares it — that is iron law 5 exactly.
     Maps are address-only, so they carry no content and need no visibility
     filter; only L0 content is filtered by as_app."""
+    path = tuple(path or ())
     if level == 2:
         vis = _plane_map()
     elif level == 1:
@@ -613,11 +650,14 @@ def open_pointer(rkey0, level=0, app="system", record=False, depth=None,
     else:
         lines = [m for m in tail(1000, as_app=as_app)
                  if m.get("rkey") == rkey0]
+        for i, v in enumerate(path):
+            lines = [m for m in lines if _axis(m, i + 1) == v]
         vis = {"level": 0, "point": rkey0, "count": len(lines),
                "lines": lines}
+        if path:
+            vis["path"] = list(path)
         if len(lines) > VISION_BUDGET:
-            d = depth or _needed_depth(lines)
-            vis["stacked"] = sub_map(rkey0, d)
+            vis["stacked"] = sub_map(rkey0, depth or len(path) + 1, path=path)
             vis["over_budget"] = True
     if record:
         vis["sighting"] = sighting(rkey0, level=level, app=app)["hash"]
@@ -698,10 +738,14 @@ def _demo_body():
     b2 = bond(h1, "produces", h2, app="opencode")
     assert len(bonds_for(h1[:8])) == 1 and bonds_for(h1[:8])[0]["rel"] == "produces", "new bond after tombstone"
     cm = _coarse_map(b2["rkey"])
-    assert cm["level"] == 1 and cm["base"] <= b2["rkey"] < cm["base"] + 144, "L1 map contains the pointed fine cell"
-    expect = sum(1 for m in tail(1000)
-                 if m.get("rkey") is not None and cm["base"] <= m["rkey"] < cm["base"] + 144)
-    assert expect >= 1 and sum(cm["fine_cells"].values()) == expect, "map counts exactly the lines living in this super-cell"
+    bw, br = cm["origin"]["wedge"], cm["origin"]["ring"]
+    assert cm["level"] == 1 and cm["block"] == 12, "L1 = exactly one 12x12 super-cell"
+    assert bw <= b2["rkey"] % 144 < bw + 12, "the square frames the pointed cell in wedge"
+    assert br <= b2["rkey"] // 144 < br + 12, "the square frames the pointed cell in ring"
+    expect = sum(1 for m in tail(1000) if m.get("rkey") is not None
+                 and _in_block(m["rkey"], bw, br))
+    assert expect >= 1 and sum(cm["fine_cells"].values()) == expect, "map counts exactly the lines in this super-cell"
+    assert all(_in_block(k, bw, br) for k in cm["fine_cells"]), "every address in the map lies inside the square"
     assert all(isinstance(k, int) for k in cm["fine_cells"]), "map is addresses only — no content"
     # living memory bridge (dry run — no db write in demo)
     append("opencode", "chat", "DECISION: pool stays file-first, server optional")
@@ -746,6 +790,14 @@ def _demo_body():
         k = _axis(m, d)
         counts[k] = counts.get(k, 0) + 1
     assert max(counts.values()) <= VISION_BUDGET, "stacking splits until every bucket reads under budget"
+    assert _needed_depth(load) == d, "depth is deterministic — same lines, same split axis"
+    b1 = {}
+    for m in load:
+        b1.setdefault(_axis(m, 1), []).append(m)
+    pick = b1[sorted(b1)[0]]
+    assert _depth_for(pick, 2) == 2, "after choosing axis 1, the next split opens a fresh axis"
+    sm_path = sub_map(pcell, 2, path=(sorted(sub["sub_cells"])[0],))
+    assert sum(sm_path["sub_cells"].values()) <= sum(sub["sub_cells"].values()), "a path narrows the read, never widens it"
     big = open_pointer(pcell, level=0, app="load")
     assert "stacked" not in big, "a cell under budget is never split — breathing only when needed"
     import shutil
@@ -764,7 +816,14 @@ def _demo_body():
                 os.replace(APPS + ".demo-bak", APPS)  # restore real registry
             else:
                 os.remove(p)
-    print("POOL-SELFCHECK: 45/45 PASS")
+    # count the checks we actually wrote — a stale total was one more thing
+    # that could silently rot, so read it off the source instead
+    import ast
+    tree = ast.parse(open(__file__, encoding="utf-8").read())
+    fn = next(nd for nd in ast.walk(tree)
+              if isinstance(nd, ast.FunctionDef) and nd.name == "_demo_body")
+    total = sum(1 for nd in ast.walk(fn) if isinstance(nd, ast.Assert))
+    print("POOL-SELFCHECK: %d/%d PASS" % (total, total))
 
 
 if __name__ == "__main__":

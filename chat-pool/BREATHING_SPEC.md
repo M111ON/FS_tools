@@ -45,7 +45,8 @@ VISION (ผลลัพธ์)  : สิ่งที่เห็น = ผลข�
 - bond เป็น line ธรรมดา (`kind:"bond"`) — `pool.bonds_for()` / `GET /bonds?hash=`
 - pointer layer: `open_pointer()` · `sighting()` (line kind:"pointer") ·
   `pointers_at()` / `GET /pointers` — per-read, ไม่มี pointer state ในระบบ
-- stacking: `rkey(data, phase=d)` · `sub_map()` · `_needed_depth()` — คำนวณตอนอ่าน
+- stacking: `rkey(data, phase=d)` · `sub_map()` · `_axis()` — คำนวณตอนอ่าน
+- dashboard heatmap 144×144 (canvas) — คลิกช่อง = pointer ใหม่, ซูม L1 block ได้
 - registry (apps.json), inbox (mention/DM), memory bridge → magic context
 
 ## 4. แผนที่ไปสู่ Breathing DB (ขั้นตอนต่อยอด ไม่ทำลาย)
@@ -60,6 +61,25 @@ VISION (ผลลัพธ์)  : สิ่งที่เห็น = ผลข�
   ชัดเจนของผู้อ่าน (pointer ใหม่) ไม่ใช่ query ทั่วไป
 - ผล: DB เดิมยังใช้เต็มรูปแบบ (MCP/magic context ไม่พัง) แต่ "การมอง"
   เริ่มเป็น pointer-based แล้ว
+
+### ทางเลือก A — ผลการทดลอง (2026-09-17, `ctx_plane.py` — prototype read-only)
+พิสูจน์บน `I:\cortexkit\magic-context\context.db` (245MB, ตาราง `memories` 962 rows)
+โดย**ไม่แตะ DB จริงเลย** — connection เปิด `mode=ro` ทุกครั้ง, content ไม่เคยถูกคัดลอก,
+และ scan จะ raise ถ้าไฟล์ต้นทางเปลี่ยนขนาด/mtime ระหว่างอ่าน (ตรวจแล้วก่อน/หลังเหมือนกันเป๊ะ)
+
+| สิ่งที่ทดลอง | ผล |
+|---|---|
+| capture ตอน scan | 962 rows → **863 เซลล์** (4.16% ของระนาบ) · 116/144 บล็อก · 0.14 วิ |
+| index เป็นแค่ cache | `ctx_plane.db` เก็บ **rowid + address** เท่านั้น (content อยู่ที่ context.db) · fingerprint เดิม = ไม่ rebuild · ลบแล้วสแกนใหม่ = address เดิมทุกตัว |
+| vision แทน SELECT | `read_at(rkey, level)` L0/L1/L2 ทำงานครบ · map ไม่มี content หลุดเลย |
+| stacking | axis เดียวกับ pool (แกน phase) — เซลล์แน่นเกิน budget แตกได้โดยไม่ต้องมีคอลัมน์เพิ่ม |
+| **ระนาบร่วม** | **6 เซลล์มีทั้ง memory และ chat line ของ pool** → ข้อมูลคนละระบบลงระนาบเดียวกันได้จริง ไม่ต้องมี coordinate system ที่สอง |
+
+- **trigger แบบ natives**: `memories_ai` ก็ทำงานจาก `new.id/new.content` แบบเดียวกันอยู่แล้ว
+  → ของจริงคือ `AFTER INSERT` trigger ที่คำนวณ rkey (index ในโน้ตนี้คือตัวแทนชั่วคราว)
+- **เปิดใช้แล้ว**: `GET /ctx/at?rkey=&level=&path=` และ `GET /ctx/stats` (ผ่าน pool_server)
+- ⚠️ **แก้ที่เจอตอนทำ heatmap**: L1 เดิมนับเป็น 144 address *ติดกัน* ซึ่งไม่ใช่สี่เหลี่ยม
+  (มันพาดข้ามแถว) → แก้เป็น **สี่เหลี่ยมเชิงพื้นที่ (wedge, ring)** แล้ว — ดู §7
 
 ### ทางเลือก B — log-first (ขยาย pool ตรงๆ)
 ทุก record ทุกตารางไหลผ่าน log.jsonl ก่อน (append-only เดียว) — DB เป็นแค่
@@ -118,9 +138,13 @@ materialized view ที่สร้างใหม่ได้จาก log —
    - **คำนวณตอนอ่านเท่านั้น ไม่เก็บอะไรเพิ่ม**: `_axis(line, d)` คิด sub-address
      ใหม่จาก `app+kind+text` ของ line นั้น (ไบต์ชุดเดียวกับที่ append() capture)
      → line เก่าทุกบรรทัดใน log ได้ความสามารถนี้ย้อนหลังทันที ไม่ต้อง migrate
-   - depth เลือกอัตโนมัติ (`_needed_depth`): แตกเท่าที่จำเป็นให้ทุก bucket อ่าน
-     ไม่เกิน budget — "หายใจเมื่อจำเป็น" จริงๆ · determinism ยังครบ (content เดียว
-     + depth เดียว = bucket เดียว ทุก replay, ไม่พึ่ง wall clock)
+   - **เดินทีละแกน** (แก้ระหว่างทำ heatmap): แต่ละครั้งที่แตก จะเปิดแกน*
+     `len(path)+1` เท่านั้น ไม่กระโดดข้ามชั้น — เพราะแมพที่ key มาจากคนละ depth
+     จะ**ระบุด้วย path ไม่ได้** ซึ่งทำลาย "walk จุดต่อจุด" ทั้งหมด
+     ตอบกลับมาพร้อม `still_over` / `next_depth` ให้รู้ว่าต้องลงอีกกี่ก้าว
+     (utility `_depth_for` ยังอยู่สำหรับคำนวณ/ทดสอบ แต่ read path ไม่ใช้มันข้ามชั้น)
+   - determinism ยังครบ: content เดียว + depth เดียว = bucket เดียว ทุก replay
+     ไม่พึ่ง wall clock
    - ความจุต่อเซลล์ = 144^d × VISION_BUDGET → d=1 = 9,216 lines, d=2 = 1.33M
    - อ่านทางเดียว: `pool.open_pointer(rkey, level=0|1|2)` /
      `GET /neighbors?rkey=&level=0|1|2` (เกิน budget = มาพร้อม `stacked` เอง)
@@ -142,6 +166,7 @@ pool.open_pointer(r0, level=0)                            # อ่านเง�
 pool.open_pointer(r0, level=1, app="codex", record=True)  # + ประกาศว่าอ่านแล้ว
 pool.pointers_at(r0)                                      # ใครอ่านจุดนี้ล่าสุด
 pool.sub_map(r0, depth=1)                                 # แตกเซลล์ที่แน่นเกิน
+pool.open_pointer(r0, level=0, path=(1, 42))               # เดินลงทีละแกน ไม่กระโดดชั้น
 
 # bond: edge คือ line
 h1, h2 = pool.tail(2)[0]["hash"], pool.tail(1)[0]["hash"]
@@ -162,7 +187,14 @@ pool.unbind(bond_hash)                       # tombstone — ของเดิ�
 - tower geometry locked 2026-09-16 พิสูจน์บน 211,497 chunks (F1)
 - geometry = MAP/address, ไม่ใช่ semantic recall (VERDICT จาก F1)
 - single writer / lock-free readers, append-only, never demo live
-- pool_server + neighbors + bonds + bridge + pointer/stacking: demo 45/45 (temp-dir isolated), ใช้งานจริงบน :8390
-- phase axis พิสูจน์แล้วในระนาบจริง: 26 lines → 25 เซลล์, L2 map นับครบ, cells ยังไม่ over budget (stacking ยังไม่ต้องตื่น = ถูกต้องตามดีไซน์)
+- pool_server + neighbors + bonds + bridge + pointer/stacking: **demo 58/58**
+  (temp-dir isolated; จำนวน check อ่านจาก source เอง ไม่มีเลขค้างให้เน่า)
+- `ctx_plane.py` self-check ผ่านบน fixture · ทดลองจริงกับ context.db โดยไม่เขียนเลย
+  (size/mtime ก่อน-หลังเท่ากันเป๊ะ) · 0.14 วิ ต่อ 962 rows
+- **แก้ L1**: เดิมนับ 144 address ติดกันเป็น "บล็อก 12×12" ซึ่งไม่ใช่สี่เหลี่ยมจริง
+  (พาดข้ามแถว) — เจอตอนวาด heatmap แล้วแก้เป็นสี่เหลี่ยม (wedge, ring) + เทสต์กันไว้
+  (บทเรียนเดียวกับตอน demo ลบ log: ของที่ดู "น่าจะถูก" ต้องมีเทสต์จับ)
+- heatmap ยืนยันจากหน้าเว็บจริง: 27 เซลล์/28 lines บนระนาบ · คลิกช่อง = pointer ใหม่
+  · ซูม L1 block ได้ · sub-grid 144 ช่อง + เจาะลงชั้นได้ (`path` ถูกส่งจริง)
 - 2026-09-17: crashed demo เคยลบ log จริง → กู้จาก pool.db chunk + re-append ที่รู้เนื้อหา,
   demo ถูก isolation ใน temp dir ตั้งแต่นั้น (ของจริงแตะไม่ได้แม้ demo พัง)

@@ -15,3 +15,5 @@ apps.json
 .bridge_state.json
 log.jsonl.lock
 .cloud_push_state.json
+ctx_plane.db
+ctx_plane.db.tmp

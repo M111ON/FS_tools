@@ -165,6 +165,29 @@ button.send:hover{filter:brightness(1.1)}
 .cloudwrap.open{max-height:400px;overflow-y:auto}
 .clabel{font-size:10px;color:var(--dim);cursor:pointer;user-select:none}
 .clabel:hover{color:var(--acc2)}
+.pbtn{font:11px var(--mono);padding:4px 11px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);cursor:pointer}
+.pbtn:hover{color:var(--fg)}
+.pbtn.on{color:var(--acc);border-color:var(--acc)}
+#plane-modal{position:fixed;inset:0;background:rgba(0,0,0,.74);display:none;align-items:center;justify-content:center;z-index:50;padding:14px}
+#plane-modal.open{display:flex}
+#plane-box{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:min(1080px,100%);height:min(780px,100%);display:flex;flex-direction:column;overflow:hidden}
+#plane-head{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#plane-body{flex:1;display:flex;min-height:0}
+#plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:auto}
+#plane-cv{background:var(--bg);border:1px solid var(--line);border-radius:8px;cursor:crosshair;image-rendering:pixelated}
+#plane-side{width:360px;border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#plane-detail{flex:1;overflow-y:auto;padding:12px 15px;font:11px var(--mono);color:var(--dim);line-height:1.6}
+#plane-tip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 8px;font:10px var(--mono);color:var(--fg);display:none;white-space:nowrap}
+#subgrid{display:grid;grid-template-columns:repeat(12,1fr);gap:2px;margin-top:7px}
+#subgrid div{aspect-ratio:1;border-radius:2px;background:var(--panel2);cursor:pointer}
+#subgrid div:hover{outline:1px solid var(--fg)}
+.pline{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:6px 8px;margin:6px 0;color:var(--fg)}
+.pline .ph{color:var(--dim);cursor:pointer}
+.pline .ph:hover{color:var(--acc2)}
+@media (max-width:860px){
+  #plane-body{flex-direction:column}
+  #plane-side{width:100%;border-left:none;border-top:1px solid var(--line)}
+}
 </style>
 </head>
 <body>
@@ -172,6 +195,7 @@ button.send:hover{filter:brightness(1.1)}
   <span class="dot" id="dot"></span>
   <h1>chat<b>-pool</b></h1>
   <span id="chain">chain…</span>
+  <button class="pbtn" id="open-plane" title="มองระนาบ RDH 144×144 — เปิด pointer ที่จุดที่คลิก">▦ ระนาบ</button>
   <span style="margin-left:auto;font:10px var(--mono);color:var(--dim)" id="clock"></span>
 </header>
 <main>
@@ -221,6 +245,27 @@ button.send:hover{filter:brightness(1.1)}
   </aside>
 </main>
 <div class="toast" id="toast"></div>
+<div id="plane-modal">
+  <div id="plane-box">
+    <div id="plane-head">
+      <b style="font-size:13px;color:var(--acc)">ระนาบ RDH 144×144</b>
+      <span id="plane-info" style="font:10px var(--mono);color:var(--dim)"></span>
+      <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="pbtn on" id="pv-plane" title="L2 — ทั้งระนาบเป็นแผนที่ (address+count เท่านั้น)">L2 ระนาบ</button>
+        <button class="pbtn" id="pv-blocks" title="L1 — ย่อเป็นบล็อก 12×12">L1 บล็อก</button>
+        <button class="pbtn" id="pv-block" title="ซูมเข้าบล็อก 12×12 ที่จุดที่เลือก">ซูมบล็อก</button>
+        <button class="pbtn" id="plane-close">ปิด ✕</button>
+      </span>
+    </div>
+    <div id="plane-body">
+      <div id="plane-canvaswrap">
+        <canvas id="plane-cv"></canvas>
+        <div id="plane-tip"></div>
+      </div>
+      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)</span></div></div>
+    </div>
+  </div>
+</div>
 <script>
 const $=s=>document.querySelector(s);
 let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
@@ -344,6 +389,179 @@ function listen(){
     if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render()}};
 }
 listen();
+
+/* ── RDH plane 144×144 — vision you can see ───────────────────────────
+   The plane is a MAP, so this canvas can only ever draw addresses and
+   counts: no content reaches it without a pointer. Every click is one
+   explicit read (cell → sub-cell → sub-sub-cell), and L1/L2 are just
+   later reads at a coarser point — nothing here is cached state. */
+const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
+          budget:64,over:[],sights:[],lines:null,stacked:null,timer:null};
+const pcv=$('#plane-cv');
+const pstep=()=>PV.n===144?3:36;
+
+function pvDerive(){
+  if(PV.mode==='plane'){PV.n=144;PV.cells=PV.plane;return}
+  if(PV.mode==='blocks'){
+    PV.n=12;const agg={};
+    for(const k in PV.plane){
+      const rk=+k,bx=Math.floor((rk%144)/12),by=Math.floor(rk/144/12),key=by*12+bx;
+      agg[key]=(agg[key]||0)+PV.plane[k];
+    }
+    PV.cells=agg;return;
+  }
+  const bw=PV.origin.wedge,br=PV.origin.ring;PV.n=12;const c={};
+  for(const k in PV.plane){
+    const rk=+k,w=rk%144,r=Math.floor(rk/144);
+    if(w>=bw&&w<bw+12&&r>=br&&r<br+12)c[rk]=PV.plane[k];
+  }
+  PV.cells=c;
+}
+function pvXY(rk){
+  if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
+  if(PV.mode==='blocks')return[Math.floor((rk%144)/12),Math.floor(rk/144/12)];
+  return[rk%144-PV.origin.wedge,Math.floor(rk/144)-PV.origin.ring];
+}
+function pvRkeyAt(x,y){
+  if(PV.mode==='plane')return y*144+x;
+  if(PV.mode==='blocks')return(y*12)*144+x*12;          // origin of that square
+  return(PV.origin.ring+y)*144+PV.origin.wedge+x;
+}
+function pvCountAt(x,y,rk){return(PV.mode==='blocks'?PV.cells[y*12+x]:PV.cells[rk])||0}
+function pvDraw(){
+  const n=PV.n,step=pstep(),px=n*step,dpr=window.devicePixelRatio||1;
+  pcv.width=px*dpr;pcv.height=px*dpr;pcv.style.width=px+'px';pcv.style.height=px+'px';
+  const c=pcv.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);
+  c.fillStyle='#0d1117';c.fillRect(0,0,px,px);
+  const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
+  for(const k in PV.cells){
+    const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
+    c.fillStyle='rgba(126,231,135,'+(0.22+0.78*(PV.cells[k]/max)).toFixed(2)+')';
+    c.fillRect(x*step,y*step,step,step);
+  }
+  PV.sights.forEach(s=>{                    // declared reads (data, not state)
+    const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
+    c.strokeStyle='#79c0ff';c.lineWidth=1;c.strokeRect(x*step+.5,y*step+.5,step-1,step-1);
+  });
+  if(PV.sel!=null){
+    const [x,y]=pvXY(PV.sel);
+    if(x>=0&&y>=0&&x<n&&y<n){c.strokeStyle='#ffa657';c.lineWidth=2;c.strokeRect(x*step+1,y*step+1,step-2,step-2)}
+  }
+}
+function pvCellAt(ev){
+  const r=pcv.getBoundingClientRect(),step=pstep();
+  const x=Math.floor((ev.clientX-r.left)/step),y=Math.floor((ev.clientY-r.top)/step);
+  if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+  return[x,y,pvRkeyAt(x,y)];
+}
+function pvInfo(){
+  const tot=Object.values(PV.plane).reduce((a,b)=>a+b,0);
+  $('#plane-info').textContent='• เซลล์ '+Object.keys(PV.plane).length+'/'+20736+' · '+tot+' lines'
+    +' · budget '+PV.budget+(PV.over.length?' · ต้องแตกชั้น '+PV.over.length+' เซลล์':'')
+    +' · sightings '+PV.sights.length;
+}
+function pvMode(){
+  $('#pv-plane').classList.toggle('on',PV.mode==='plane');
+  $('#pv-blocks').classList.toggle('on',PV.mode==='blocks');
+  $('#pv-block').classList.toggle('on',PV.mode==='block');
+  pvDerive();pvDraw();pvInfo();
+}
+async function loadPlane(){
+  try{
+    const [d,s]=await Promise.all([
+      fetch('/neighbors?rkey=0&level=2',{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
+      fetch('/pointers',{headers:H}).then(r=>r.json())
+    ]);
+    PV.plane=d.fine_cells||{};PV.budget=d.budget||64;PV.over=d.over_budget||[];
+    PV.sights=s.pointers||[];
+    pvMode();
+  }catch(e){$('#plane-info').textContent='โหลดระนาบไม่ได้ ('+e+')'}
+}
+async function pvZoomBlock(rk){
+  const d=await fetch('/neighbors?rkey='+rk+'&level=1',{headers:H}).then(r=>r.json());
+  PV.origin=d.origin;PV.mode='block';pvMode();
+  const keys=Object.keys(d.fine_cells).map(Number);
+  const busiest=keys.length?keys.reduce((a,b)=>d.fine_cells[a]>=d.fine_cells[b]?a:b):d.base;
+  openPoint(busiest);
+}
+async function openPoint(rk,path){
+  PV.sel=rk;PV.path=path||[];
+  const q='/neighbors?rkey='+rk+'&level=0'+(PV.path.length?'&path='+PV.path.join(','):'');
+  const d=await fetch(q,{headers:H}).then(r=>r.json());
+  PV.lines=d;PV.stacked=d.stacked||null;
+  pvDetail();pvDraw();
+}
+function pvDetail(){
+  const d=PV.lines,el=$('#plane-detail');
+  if(!d){el.textContent='…';return}
+  let h='<div style="color:var(--fg);font-size:12px">point <b style="color:var(--warn)">'+d.point
+    +'</b> · '+d.count+' line(s)</div>';
+  h+='<div style="margin:4px 0">(x '+(d.point%144)+', y '+Math.floor(d.point/144)+') บนระนาบ'
+    +(PV.path.length?' · path '+PV.path.map((v,i)=>'ชั้น '+(i+1)+'='+v).join(' → '):'')+'</div>';
+  if(PV.path.length)h+='<button class="pbtn" id="pv-up">↑ ขึ้นชั้น</button>';
+  if(PV.stacked){
+    const cells=PV.stacked.sub_cells,keys=Object.keys(cells).map(Number);
+    const max=keys.length?Math.max(...keys.map(k=>cells[k])):1;
+    h+='<div style="color:var(--warn);margin-top:8px">แน่นเกิน budget '+PV.stacked.budget
+      +' — แตกเป็น sub-map ชั้น '+PV.stacked.depth+' (address ล้วน)'
+      +(PV.stacked.still_over?' · ยังมี '+PV.stacked.still_over+' ช่องที่ต้องลงต่อ':'')+'</div>';
+    h+='<div id="subgrid">';
+    for(let i=0;i<144;i++){
+      const v=cells[i]||0,bg=v?'rgba(126,231,135,'+(0.25+0.75*(v/max)).toFixed(2)+')':'var(--panel2)';
+      h+='<div data-sub="'+i+'" title="sub '+i+' · '+v+' line(s)" style="background:'+bg+'"></div>';
+    }
+    h+='</div>';
+  }
+  const ls=d.lines||[];
+  h+=ls.length?ls.slice(0,40).map(m=>'<div class="pline"><span class="badge">'+esc(m.app||'?')
+      +'</span> <span class="badge kind">'+esc(m.kind||'')+'</span> <span class="ph" onclick="navigator.clipboard.writeText(\''
+      +(m.hash||'')+'\');toast(\'copied '+hash8(m.hash)+'\')">'+hash8(m.hash)+'</span>'
+      +'<div style="white-space:pre-wrap;margin-top:3px">'+esc((m.text||'').slice(0,240))+'</div></div>').join('')
+    :'<div style="margin-top:6px">เซลล์นี้ว่าง — ไม่มี line อยู่ตรงนี้</div>';
+  el.innerHTML=h;
+  el.querySelectorAll('#subgrid div').forEach(node=>{
+    node.onclick=()=>openPoint(PV.sel,PV.path.concat([+node.dataset.sub]));
+  });
+  const up=$('#pv-up');
+  if(up)up.onclick=()=>openPoint(PV.sel,PV.path.slice(0,-1));
+}
+pcv.onmousemove=ev=>{
+  const tip=$('#plane-tip'),hit=pvCellAt(ev);
+  if(!hit){tip.style.display='none';return}
+  const [x,y,rk]=hit,n=pvCountAt(x,y,rk);
+  const who=PV.sights.filter(s=>s.point===rk).map(s=>s.app).join(',');
+  tip.textContent=(PV.mode==='blocks'?'บล็อก ':'rkey ')+rk+' ('+x+','+y+') · '+n+' line'+(n===1?'':'s')
+    +(who?' · 👁 '+who:'');
+  tip.style.display='block';
+  const wrap=$('#plane-canvaswrap').getBoundingClientRect();
+  tip.style.left=(ev.clientX-wrap.left+12)+'px';tip.style.top=(ev.clientY-wrap.top+12)+'px';
+};
+pcv.onmouseleave=()=>$('#plane-tip').style.display='none';
+pcv.onclick=ev=>{
+  const hit=pvCellAt(ev);if(!hit)return;
+  const [x,y,rk]=hit;
+  if(PV.mode==='blocks'){pvZoomBlock(rk);return}   // zoom = another read, finer
+  openPoint(rk);
+};
+$('#open-plane').onclick=()=>{
+  $('#plane-modal').classList.add('open');
+  loadPlane();
+  PV.timer=setInterval(loadPlane,8000);           // watch it breathe
+};
+function pvClose(){
+  $('#plane-modal').classList.remove('open');
+  if(PV.timer){clearInterval(PV.timer);PV.timer=null}
+}
+$('#plane-close').onclick=pvClose;
+$('#plane-modal').onclick=e=>{if(e.target.id==='plane-modal')pvClose()};
+document.addEventListener('keydown',e=>{if(e.key==='Escape')pvClose()});
+$('#pv-plane').onclick=()=>{PV.mode='plane';pvMode()};
+$('#pv-blocks').onclick=()=>{PV.mode='blocks';pvMode()};
+$('#pv-block').onclick=()=>{
+  if(PV.sel==null||!PV.plane[PV.sel]){toast('เลือกจุดบนระนาบก่อน');return}
+  pvZoomBlock(PV.sel);
+};
+
 // boot: initial pull for chain/registry/inbox — SSE only carries new lines,
 // without this a LAN phone shows the shell with a stuck "chain…" forever
 refresh().catch(()=>{});
@@ -468,11 +686,18 @@ class PoolHandler(BaseHTTPRequestHandler):
             if lv not in ("0", "1", "2"):
                 self._json(400, {"error": "?level=0 (cell) | 1 (block map) | 2 (plane map)"})
                 return
+            raw = qs.get("path", [""])[0].strip()
+            try:
+                path = tuple(int(p) for p in raw.split(",") if p != "") if raw else ()
+            except ValueError:
+                self._json(400, {"error": "?path=<int>[,<int>...] — the sub-cell chosen at each depth"})
+                return
             with _lock:
                 # one pointer, one level, one read: L0 content · L1 12x12
                 # block map · L2 whole-plane map. Over-budget cells come
-                # back already split (stacked), never as a wall of lines.
-                vis = pool.open_pointer(rk, level=int(lv), as_app=as_app)
+                # back already split (stacked), never as a wall of lines,
+                # and &path=1,42 walks one sub-cell down at a time.
+                vis = pool.open_pointer(rk, level=int(lv), path=path, as_app=as_app)
             self._json(200, vis)
 
         elif parsed.path == "/pointers":
@@ -500,6 +725,36 @@ class PoolHandler(BaseHTTPRequestHandler):
             with _lock:
                 edges = pool.bonds_for(h, as_app=as_app)
             self._json(200, {"hash": h, "edges": edges})
+
+        elif parsed.path == "/ctx" or parsed.path.startswith("/ctx/"):
+            # BREATHING_SPEC §4 ทาง A — the same pointer read, pointed at
+            # Magic Context's db instead of the log. Read-only by construction.
+            try:
+                import ctx_plane
+            except Exception as e:
+                self._json(500, {"error": "ctx_plane unavailable: %s" % e})
+                return
+            try:
+                if parsed.path == "/ctx/stats":
+                    self._json(200, ctx_plane.stats())
+                    return
+                rk = int(qs.get("rkey", [""])[0])
+                lv = int(qs.get("level", ["0"])[0])
+                if lv not in (0, 1, 2):
+                    self._json(400, {"error": "?level=0 (rows in the cell) | 1 (block map) | 2 (plane map)"})
+                    return
+                raw = qs.get("path", [""])[0].strip()
+                path = tuple(int(p) for p in raw.split(",") if p != "") if raw else ()
+                with _lock:
+                    self._json(200, ctx_plane.read_at(
+                        rk, level=lv, path=path,
+                        full=qs.get("full", ["0"])[0] == "1"))
+            except FileNotFoundError:
+                self._json(503, {"error": "no ctx index yet — run: python ctx_plane.py scan"})
+            except (ValueError, TypeError):
+                self._json(400, {"error": "?rkey=<int> and optional ?level=&path="})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
 
         elif parsed.path == "/view":
             n = min(int(qs.get("n", ["20"])[0]), 1000)
