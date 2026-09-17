@@ -1,16 +1,18 @@
-"""pool_server.py — stdlib HTTP wrapper for pool.py.
+"""pool_server.py — stdlib HTTP wrapper for pool.py + dashboard UI.
 POST /append   {app, kind, text}  → {ok, hash}
-GET  /tail?n=10                    → [{t, app, ...}, ...]
-GET  /stream?n=5  (SSE)           → real-time new messages
+GET  /tail?n=10                    → [messages...]
+GET  /view?n=20&cloud=0            → rendered chat log (pool.view)
+GET  /stream?n=5  (SSE)            → real-time new messages
+POST /flush                        → flush_emit + push_outbox now
 GET  /health                       → {ok, lines}
-No dependencies beyond stdlib.
+GET  /                             → dashboard (single file, no CDN)
 """
 import json
 import os
 import sys
 import time
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +20,179 @@ import pool
 
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
+
+DASHBOARD = r"""<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chat-pool</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#2d333b;
+  --fg:#e6edf3; --dim:#8b949e; --acc:#7ee787; --acc2:#79c0ff; --warn:#ffa657;
+  --mono:'Cascadia Code',Consolas,'Courier New',monospace;
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,'Segoe UI',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+header h1{font-size:15px;font-weight:600;letter-spacing:.4px}
+header h1 b{color:var(--acc)}
+.dot{width:9px;height:9px;border-radius:50%;background:#f85149;transition:.3s}
+.dot.on{background:var(--acc);box-shadow:0 0 8px var(--acc)}
+#chain{font:11px var(--mono);color:var(--dim)}
+#chain.ok{color:var(--acc)}
+main{flex:1;display:flex;min-height:0}
+#feed{flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:8px;min-width:0}
+@media (max-width:720px){
+  main{flex-direction:column}
+  aside{width:100%;border-left:none;border-top:1px solid var(--line);flex-direction:row;flex-wrap:wrap}
+  aside section{flex:1 1 46%;border-bottom:none}
+  #composer{width:100%;margin-top:0}
+  #flushtip{width:100%}
+}
+#feed::-webkit-scrollbar{width:8px}#feed::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+.msg{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 13px;max-width:72ch;animation:in .25s ease}
+@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+.msg .top{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
+.badge{font:10px var(--mono);padding:1px 8px;border-radius:9px;background:var(--panel2);color:var(--acc2);border:1px solid var(--line)}
+.badge.kind{color:var(--warn)}
+.time{font:10px var(--mono);color:var(--dim)}
+.hash{font:10px var(--mono);color:var(--dim);margin-left:auto;cursor:pointer}
+.hash:hover{color:var(--acc2)}
+.text{white-space:pre-wrap;word-break:break-word}
+aside{width:300px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
+aside section{padding:13px 15px;border-bottom:1px solid var(--line)}
+aside h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:9px}
+#q{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 11px;font-size:13px;outline:none}
+#q:focus{border-color:var(--acc2)}
+.apps{display:flex;flex-wrap:wrap;gap:6px}
+.appbtn{font:11px var(--mono);padding:3px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);cursor:pointer}
+.appbtn.on{color:var(--acc);border-color:var(--acc)}
+.stat{font:11px var(--mono);color:var(--dim);display:flex;justify-content:space-between;padding:2px 0}
+.stat b{color:var(--fg)}
+#composer{display:flex;gap:8px;padding:12px 15px;border-top:1px solid var(--line);margin-top:auto}
+#msg-in{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 11px;font:13px var(--mono);outline:none;resize:none;height:38px}
+#msg-in:focus{border-color:var(--acc)}
+button.send{background:var(--acc);color:#0d1117;border:none;border-radius:8px;padding:0 16px;font-weight:600;cursor:pointer}
+button.send:hover{filter:brightness(1.1)}
+#flushtip{font:10px var(--mono);color:var(--dim);text-align:center;padding:6px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--acc);color:var(--acc);font:12px var(--mono);padding:8px 18px;border-radius:9px;opacity:0;transition:.3s;pointer-events:none}
+.toast.show{opacity:1}
+.cloudwrap{max-height:0;overflow:hidden;transition:max-height .3s}
+.cloudwrap.open{max-height:400px;overflow-y:auto}
+.clabel{font-size:10px;color:var(--dim);cursor:pointer;user-select:none}
+.clabel:hover{color:var(--acc2)}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>chat<b>-pool</b></h1>
+  <span id="chain">chain…</span>
+  <span style="margin-left:auto;font:10px var(--mono);color:var(--dim)" id="clock"></span>
+</header>
+<main>
+  <div id="feed"></div>
+  <aside>
+    <section>
+      <h2>Search</h2>
+      <input id="q" placeholder="กรองข้อความ…">
+    </section>
+    <section>
+      <h2>Apps</h2>
+      <div class="apps" id="apps"></div>
+    </section>
+    <section>
+      <h2>Status</h2>
+      <div class="stat"><span>lines</span><b id="st-lines">–</b></div>
+      <div class="stat"><span>last append</span><b id="st-last">–</b></div>
+      <div class="stat">
+        <span>cloud (pool.db)</span>
+        <label class="clabel"><input type="checkbox" id="cloudck" style="accent-color:var(--acc)"> show</label>
+      </div>
+      <div class="cloudwrap" id="cloudwrap"><div id="cloudout" style="font:11px var(--mono);color:var(--dim);white-space:pre-wrap;padding-top:6px">…</div></div>
+    </section>
+    <div id="composer">
+      <textarea id="msg-in" placeholder="พิมพ์ข้อความ… (Enter ส่ง)"></textarea>
+      <button class="send" id="send">ส่ง</button>
+    </div>
+    <div id="flushtip">hourly flush อัตโนมัติอยู่แล้ว · <a href="#" id="flushnow" style="color:var(--acc2)">flush เดี๋ยวนี้</a></div>
+  </aside>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+let msgs=[], filterQ='', filterApps=new Set();
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
+function hash8(h){return h?h.slice(0,8):''}
+
+function render(){
+  const feed=$('#feed');
+  const list=msgs.filter(m=>
+    (!filterQ||(m.text||'').toLowerCase().includes(filterQ))&&
+    (filterApps.size===0||filterApps.has(m.app))
+  );
+  feed.innerHTML=list.map(m=>{
+    const kind=m.kind||'chat';
+    const kbadge=kind==='chat'?'':`<span class="badge kind">${esc(kind)}</span>`;
+    return `<div class="msg"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}<span class="time">${fmt(m.t)}</span><span class="hash" title="คลิกเพื่อ copy" onclick="navigator.clipboard.writeText('${m.hash||''}');toast('copied '+ '${hash8(m.hash)}')">${hash8(m.hash)}</span></div><div class="text">${esc(m.text||'')}</div></div>`;
+  }).join('')||'<div style="color:var(--dim);text-align:center;padding:40px">ไม่มีข้อความ</div>';
+  // app chips
+  const apps={};msgs.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
+  $('#apps').innerHTML=Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>
+    `<span class="appbtn ${filterApps.has(a)?'on':''}" onclick="toggleApp('${esc(a)}')">${esc(a)} ${n}</span>`).join('');
+  $('#st-lines').textContent=msgs.length;
+  $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
+}
+window.toggleApp=a=>{filterApps.has(a)?filterApps.delete(a):filterApps.add(a);render()};
+window.toast=t=>{const el=$('#toast');el.textContent=t;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
+
+$('#q').oninput=e=>{filterQ=e.target.value.toLowerCase();render()};
+$('#cloudck').onchange=async e=>{
+  $('#cloudwrap').classList.toggle('open',e.target.checked);
+  if(e.checked){const r=await fetch('/view?n=6&cloud=1').then(r=>r.json());
+    $('#cloudout').textContent=r.lines?.join('\n')||'(empty)';}
+};
+async function send(){
+  const el=$('#msg-in');const text=el.value.trim();if(!text)return;
+  el.value='';el.style.height='38px';
+  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'dashboard',kind:'chat',text})}).then(r=>r.json());
+  if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
+}
+$('#send').onclick=send;
+$('#msg-in').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
+$('#msg-in').oninput=e=>{e.target.style.height='38px';e.target.style.height=Math.min(e.target.scrollHeight,140)+'px'};
+$('#flushnow').onclick=async e=>{e.preventDefault();const r=await fetch('/flush',{method:'POST'}).then(r=>r.json());toast(r.pushed?`flush ok: ${r.pushed.length} pushed`:(r.emitted?'flush ok':'nothing to flush'));refresh()};
+
+async function refresh(){
+  const [tail,h]=await Promise.all([
+    fetch('/tail?n=200').then(r=>r.json()),
+    fetch('/view?n=500').then(r=>r.json())
+  ]);
+  msgs=tail;
+  render();
+  const links=Math.max(h.hashes.length-1,0);
+  const el=$('#chain');
+  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
+  el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
+}
+setInterval(()=>$('#clock').textContent=new Date().toLocaleTimeString('th-TH'),1000);
+refresh();
+// SSE live
+function listen(){
+  const es=new EventSource('/stream?n=200');
+  es.onopen=()=>$('#dot').classList.add('on');
+  es.onerror=()=>{$('#dot').classList.remove('on');es.close();setTimeout(listen,3000)};
+  es.onmessage=ev=>{const m=JSON.parse(ev.data);
+    if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render()}};
+}
+listen();
+</script>
+</body>
+</html>"""
 
 
 class PoolHandler(BaseHTTPRequestHandler):
@@ -34,7 +209,15 @@ class PoolHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        if parsed.path == "/health":
+        if parsed.path == "/" or parsed.path == "/index.html":
+            body = DASHBOARD.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/health":
             lines = 0
             if os.path.exists(pool.LOG):
                 with open(pool.LOG, "rb") as f:
@@ -42,14 +225,24 @@ class PoolHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "lines": lines, "log": pool.LOG})
 
         elif parsed.path == "/tail":
-            n = int(qs.get("n", ["10"])[0])
-            n = min(n, 500)
+            n = min(int(qs.get("n", ["10"])[0]), 500)
             with _lock:
                 msgs = pool.tail(n)
             self._json(200, msgs)
 
+        elif parsed.path == "/view":
+            n = min(int(qs.get("n", ["20"])[0]), 1000)
+            cloud = qs.get("cloud", ["0"])[0] == "1"
+            try:
+                lines = pool.view(n, cloud=cloud)
+                # chain audit for the dashboard header
+                ok, hashes = _chain_audit()
+                self._json(200, {"lines": lines, "chain_ok": ok, "hashes": hashes})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+
         elif parsed.path == "/stream":
-            n = int(qs.get("n", ["5"])[0])
+            n = min(int(qs.get("n", ["5"])[0]), 500)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -61,10 +254,9 @@ class PoolHandler(BaseHTTPRequestHandler):
                     with _lock:
                         msgs = pool.tail(n)
                     if len(msgs) > seen:
-                        for m in msgs[max(seen - len(msgs) + len(msgs), 0):]:
-                            data = json.dumps(m, ensure_ascii=False)
-                            self.wfile.write(f"data: {data}\n\n".encode())
-                            self.wfile.flush()
+                        for m in msgs[seen:]:
+                            self.wfile.write(f"data: {json.dumps(m, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
                         seen = len(msgs)
                     time.sleep(1)
             except (BrokenPipeError, ConnectionResetError):
@@ -75,33 +267,63 @@ class PoolHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/append":
+        if parsed.path == "/append":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            app = body.get("app", "?")
+            kind = body.get("kind", "chat")
+            text = body.get("text", "")
+            if not text:
+                self._json(400, {"error": "text required"})
+                return
+            with _lock:
+                result = pool.append(app, kind, text)
+            self._json(200, {"ok": True, "hash": result["hash"]})
+        elif parsed.path == "/flush":
+            path = pool.flush_emit()
+            pushed, failed = pool.push_outbox()
+            self._json(200, {"emitted": path, "pushed": pushed, "failed": failed})
+        else:
             self._json(404, {"error": "not found"})
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length))
-        app = body.get("app", "?")
-        kind = body.get("kind", "chat")
-        text = body.get("text", "")
-        if not text:
-            self._json(400, {"error": "text required"})
-            return
-        with _lock:
-            result = pool.append(app, kind, text)
-        self._json(200, {"ok": True, "hash": result["hash"]})
 
     def log_message(self, fmt, *args):
         pass  # silent
 
 
+def _chain_audit():
+    """Walk the whole log: True when every line links to the previous hash."""
+    if not os.path.exists(pool.LOG):
+        return True, []
+    hashes = []
+    prevs = []
+    with open(pool.LOG, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = json.loads(line)
+            hashes.append(m.get("hash"))
+            prevs.append(m.get("prev"))
+    ok = True
+    for i in range(1, len(hashes)):
+        if prevs[i] != hashes[i - 1]:
+            ok = False
+            break
+    return ok, hashes
+
+
 def main():
-    server = HTTPServer(("0.0.0.0", PORT), PoolHandler)
+    # Threaded: SSE streams hold a connection each; the dashboard also
+    # fires /tail+/view+/stream in parallel on load — a single-threaded
+    # server deadlocks on the second request.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), PoolHandler)
+    server.daemon_threads = True
     print(f"pool-server listening on http://0.0.0.0:{PORT}")
     print(f"  log: {pool.LOG}")
+    print(f"  UI : http://localhost:{PORT}/   (dashboard)")
     print(f"  POST /append   {{app, kind, text}}")
-    print(f"  GET  /tail?n=10")
-    print(f"  GET  /stream?n=5  (SSE)")
-    print(f"  GET  /health")
+    print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
+    print(f"  POST /flush   (emit + push now)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
