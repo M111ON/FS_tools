@@ -10,3 +10,7 @@ __pycache__/
 *.exp
 *.obj
 *.spv
+apps.json
+.pool_token
+.bridge_state.json
+log.jsonl.lock
