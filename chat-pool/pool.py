@@ -124,52 +124,24 @@ VENV_PY = r"I:\tools\cloud-workspace\.venv\Scripts\python.exe"
 SESSION = "chat-pool"
 
 
-def _render_push_text(new):
-    """Readable chat-log header + RAW JSON footer.
-    Search/embedding sees human lines; the RAW block after the 'RAW:'
-    marker keeps prev/hash intact for cloud restore (proven by the
-    2026-09-17 RECOVERY). Archives stay raw JSON — only the pushed
-    text is rendered."""
-    lines = []
-    for m in new:
-        ts = time.strftime("%m-%d %H:%M", time.localtime(m.get("t", time.time())))
-        lines.append("[%s] %s (%s): %s" % (
-            ts, m.get("app", "?"), m.get("kind", "chat"), m.get("text", "")))
-    return "\n".join(lines) + "\nRAW:" + json.dumps(new, ensure_ascii=False)
-
-
 def push_outbox(session=SESSION):
     """Push pending outbox payloads via existing pool CLI, then archive.
-    Pushed text = rendered chat log + RAW footer; archive stays raw JSON.
-    Returns (pushed, failed)."""
+    Storage stays raw JSON (prev/hash intact for cloud restore).
+    Rendering to a readable chat log is view()'s job, not storage's.
+    Returns (pushed, failed). Cloud/searchable afterwards via session-pool."""
     import subprocess
     py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
     pushed, failed = [], []
     for path in outbox_list():
-        src = path
-        tmp = None
-        try:
-            batch = json.load(open(path, encoding="utf-8"))
-        except Exception:
-            batch = None
-        if isinstance(batch, list) and batch:
-            tmp = path + ".push"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(_render_push_text(batch))
-            src = tmp
         r = subprocess.run(
             [py, CLI, "embed", "--session", session,
-             "--topic", "hourly", "--file", src],
+             "--topic", "hourly", "--file", path],
             capture_output=True, text=True, timeout=300)
         if r.returncode == 0:
-            if tmp:
-                os.remove(tmp)
             done = path + ".pushed"
             os.replace(path, done)
             pushed.append(done)
         else:
-            if tmp:
-                os.remove(tmp)
             failed.append((path, r.stderr.strip()[-300:]))
     return pushed, failed
 
@@ -180,6 +152,61 @@ def tail(n=10):
     with open(LOG, encoding="utf-8") as f:
         lines = f.read().strip().split("\n")
     return [json.loads(x) for x in lines[-n:] if x]
+
+
+CLOUD_DB = r"I:\tools\cloud-workspace\pool.db"
+
+
+def pretty(m):
+    """One-line minimal chat-log view of a pool line.
+    kind 'chat' is the default and stays implicit in the label."""
+    ts = time.strftime("%m-%d %H:%M", time.localtime(m.get("t", time.time())))
+    kind = m.get("kind", "chat")
+    label = m.get("app", "?") if kind == "chat" else "%s/%s" % (m.get("app", "?"), kind)
+    text = m.get("text", "").replace("\n", "\n    ")
+    return "[%s] %s: %s" % (ts, label, text)
+
+
+def _chunk_msgs(text):
+    """Extract message list from a cloud chunk text (raw JSON array,
+    or legacy chat-log+RAW footer). Returns None when unparseable."""
+    try:
+        msgs = json.loads(text)
+        if isinstance(msgs, list):
+            return msgs
+    except Exception:
+        pass
+    if "RAW:" in text:
+        try:
+            msgs = json.loads(text.split("RAW:", 1)[1])
+            if isinstance(msgs, list):
+                return msgs
+        except Exception:
+            pass
+    return None
+
+
+def view(n=20, cloud=False):
+    """Minimal human-readable view. Local log tail by default;
+    --cloud renders recent session-pool chunks (pool.db, read-only).
+    Storage stays raw everywhere — this is display-only."""
+    if not cloud:
+        return [pretty(m) for m in tail(n)]
+    import sqlite3
+    db = sqlite3.connect("file:" + CLOUD_DB.replace("\\", "/") + "?mode=ro", uri=True)
+    rows = db.execute(
+        "SELECT seq, text FROM chunks WHERE session_id=? ORDER BY seq DESC LIMIT ?",
+        (SESSION, n)).fetchall()
+    db.close()
+    out = []
+    for seq, text in rows:
+        out.append("== chunk seq=%d ==" % seq)
+        msgs = _chunk_msgs(text)
+        if msgs:
+            out.extend("  " + pretty(m) for m in msgs if isinstance(m, dict))
+        else:
+            out.append("  " + text[:200])
+    return out
 
 
 def flush_check():
@@ -242,6 +269,9 @@ def demo():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "demo":
         demo()  # wipes LOG+STATE: test only, never scheduled
+    elif len(sys.argv) > 1 and sys.argv[1] == "view":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 20
+        print("\n".join(view(n, cloud="--cloud" in sys.argv)))
     else:
         path = flush_emit()  # hourly safe default: emit+push or skip
         pushed, failed = push_outbox()
