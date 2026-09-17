@@ -124,22 +124,52 @@ VENV_PY = r"I:\tools\cloud-workspace\.venv\Scripts\python.exe"
 SESSION = "chat-pool"
 
 
+def _render_push_text(new):
+    """Readable chat-log header + RAW JSON footer.
+    Search/embedding sees human lines; the RAW block after the 'RAW:'
+    marker keeps prev/hash intact for cloud restore (proven by the
+    2026-09-17 RECOVERY). Archives stay raw JSON — only the pushed
+    text is rendered."""
+    lines = []
+    for m in new:
+        ts = time.strftime("%m-%d %H:%M", time.localtime(m.get("t", time.time())))
+        lines.append("[%s] %s (%s): %s" % (
+            ts, m.get("app", "?"), m.get("kind", "chat"), m.get("text", "")))
+    return "\n".join(lines) + "\nRAW:" + json.dumps(new, ensure_ascii=False)
+
+
 def push_outbox(session=SESSION):
     """Push pending outbox payloads via existing pool CLI, then archive.
-    Returns (pushed, failed). Cloud/searchable afterwards via session-pool."""
+    Pushed text = rendered chat log + RAW footer; archive stays raw JSON.
+    Returns (pushed, failed)."""
     import subprocess
     py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
     pushed, failed = [], []
     for path in outbox_list():
+        src = path
+        tmp = None
+        try:
+            batch = json.load(open(path, encoding="utf-8"))
+        except Exception:
+            batch = None
+        if isinstance(batch, list) and batch:
+            tmp = path + ".push"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(_render_push_text(batch))
+            src = tmp
         r = subprocess.run(
             [py, CLI, "embed", "--session", session,
-             "--topic", "hourly", "--file", path],
+             "--topic", "hourly", "--file", src],
             capture_output=True, text=True, timeout=300)
         if r.returncode == 0:
+            if tmp:
+                os.remove(tmp)
             done = path + ".pushed"
             os.replace(path, done)
             pushed.append(done)
         else:
+            if tmp:
+                os.remove(tmp)
             failed.append((path, r.stderr.strip()[-300:]))
     return pushed, failed
 
