@@ -161,7 +161,7 @@ function render(){
   }).join('')||'<div style="color:var(--dim);text-align:center;padding:40px">ไม่มีข้อความ</div>';
   // populate selects (apps filter, view-as, to)
   const apps={};msgs.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
-  const known=[...new Set([...Object.keys(apps),'hermes','codex','dashboard'])].sort();
+  const known=[...new Set([...Object.keys(apps),'hermes','codex','human'])].sort();
   const asel=$('#apps-sel');const acur=asel.value;
   asel.innerHTML='<option value="">ทุกแอป</option>'+Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>`<option value="${esc(a)}">${esc(a)} (${n})</option>`).join('');
   if([...asel.options].some(o=>o.value===acur))asel.value=acur;
@@ -169,7 +169,7 @@ function render(){
   isel.innerHTML='<option value="admin">admin (เห็นหมด)</option>'+known.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
   if([...isel.options].some(o=>o.value===icur))isel.value=icur;
   const sel=$('#to-sel');const cur=sel.value;
-  sel.innerHTML='<option value="all">→ all</option>'+known.filter(a=>a!=='dashboard').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
+  sel.innerHTML='<option value="all">→ all</option>'+known.filter(a=>a!=='human').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
   if([...sel.options].some(o=>o.value===cur))sel.value=cur;
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
@@ -209,7 +209,7 @@ $('#cloudck').onchange=async e=>{
 async function send(){
   const el=$('#msg-in');const text=el.value.trim();if(!text)return;
   el.value='';el.style.height='38px';
-  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'dashboard',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
+  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'human',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
   if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
 }
 

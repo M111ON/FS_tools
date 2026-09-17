@@ -496,6 +496,10 @@ if __name__ == "__main__":
     else:
         path = flush_emit()  # hourly safe default: emit+push or skip
         memory_bridge()  # living memory: lift handoff/decision into magic context
+        try:  # heartbeat: flusher liveness, visible on the dashboard registry
+            register_app("flusher")
+        except Exception:
+            pass
         pushed, failed = push_outbox()
         if failed:
             print("PUSH-FAILED", failed)

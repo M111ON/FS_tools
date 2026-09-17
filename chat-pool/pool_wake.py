@@ -63,6 +63,13 @@ def main():
     args = ap.parse_args()
 
     _register(args.app)
+    try:  # heartbeat: wake runner proves liveness every cycle
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location("cpool", r"I:/tools/chat-pool/pool.py")
+        _m = _iu.module_from_spec(_spec); _spec.loader.exec_module(_m)
+        _m.touch_app(args.app)
+    except Exception:
+        pass
     items = peek(args.app)
     if not items:
         print("sleep: inbox empty")
