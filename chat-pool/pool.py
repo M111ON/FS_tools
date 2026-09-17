@@ -53,23 +53,62 @@ def _prev():
 
 
 def append(app, kind, text):
-    prev = _prev()
-    raw = (app + kind + text).encode("utf-8")
-    body = {"v": 2, "t": time.time(), "app": app, "kind": kind,
-            "text": text, "prev": prev,
-            "rkey": rkey(raw),  # ADDRESS (routing hint, not integrity)
-            "enc": rkey(raw) % 1440}  # free: frame_seek view
-    body["hash"] = hashlib.sha256(
-        (prev + app + kind + text).encode("utf-8")).hexdigest()
-    line = json.dumps(body, ensure_ascii=False)
-    raw = (line + "\n").encode("utf-8")
-    fd = os.open(LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY)  # 1 syscall
-    try:
-        assert os.write(fd, raw) == len(raw), "short write"
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    return body
+    """Append one message. Thread-safe via threading.Lock;
+    process-safe via msvcrt.lock on a .lock file (Windows) or fcntl (Unix)."""
+    # Atomic: compute prev + body + write under process lock
+    lock_path = LOG + ".lock"
+    if sys.platform == 'win32':
+        import msvcrt
+        lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            os.lseek(lfd, 0, os.SEEK_SET)
+            msvcrt.locking(lfd, msvcrt.LK_LOCK, 1)
+            prev = _prev()
+            raw_bytes = (app + kind + text).encode("utf-8")
+            body = {"v": 2, "t": time.time(), "app": app, "kind": kind,
+                    "text": text, "prev": prev,
+                    "rkey": rkey(raw_bytes),
+                    "enc": rkey(raw_bytes) % 1440}
+            body["hash"] = hashlib.sha256(
+                (prev + app + kind + text).encode("utf-8")).hexdigest()
+            line = json.dumps(body, ensure_ascii=False)
+            raw = (line + "\n").encode("utf-8")
+            fd = os.open(LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY)
+            try:
+                assert os.write(fd, raw) == len(raw), "short write"
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return body
+        finally:
+            os.lseek(lfd, 0, os.SEEK_SET)
+            msvcrt.locking(lfd, msvcrt.LK_UNLCK, 1)
+            os.close(lfd)
+    else:
+        import fcntl
+        fd_lock = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd_lock, fcntl.LOCK_EX)
+            prev = _prev()
+            raw_bytes = (app + kind + text).encode("utf-8")
+            body = {"v": 2, "t": time.time(), "app": app, "kind": kind,
+                    "text": text, "prev": prev,
+                    "rkey": rkey(raw_bytes),
+                    "enc": rkey(raw_bytes) % 1440}
+            body["hash"] = hashlib.sha256(
+                (prev + app + kind + text).encode("utf-8")).hexdigest()
+            line = json.dumps(body, ensure_ascii=False)
+            raw = (line + "\n").encode("utf-8")
+            fd = os.open(LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY)
+            try:
+                assert os.write(fd, raw) == len(raw), "short write"
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return body
+        finally:
+            fcntl.flock(fd_lock, fcntl.LOCK_UN)
+            os.close(fd_lock)
 
 
 def outbox_list():
@@ -146,7 +185,7 @@ def flush_emit():
 
 
 def demo():
-    for p in (LOG, STATE):
+    for p in (LOG, STATE, LOG + ".lock"):
         if os.path.exists(p):
             os.remove(p)
     append("opencode", "chat", "hello pool")
