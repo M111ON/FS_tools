@@ -291,6 +291,20 @@ class PoolHandler(BaseHTTPRequestHandler):
                 msgs = pool.inbox(app, mark_read=mark)
             self._json(200, msgs)
 
+        elif parsed.path == "/neighbors":
+            # multi-pointer vision read: ?rkey=<int>&vision=<0|1|2>
+            try:
+                rk = int(qs.get("rkey", [""])[0])
+                vs = min(max(int(qs.get("vision", ["1"])[0]), 0), 2)
+            except ValueError:
+                self._json(400, {"error": "?rkey=<int> required"})
+                return
+            with _lock:
+                cells = pool.neighbors(rk, vision=vs)
+            self._json(200, {"point": rk, "vision": vs,
+                             "cells": [{"rkey": rk2, "lines": lines}
+                                       for rk2, lines in cells]})
+
         elif parsed.path == "/view":
             n = min(int(qs.get("n", ["20"])[0]), 1000)
             cloud = qs.get("cloud", ["0"])[0] == "1"
