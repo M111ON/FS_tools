@@ -125,7 +125,7 @@ def inbox(app, mark_read=True):
     reg.setdefault(app, {})["last_read"] = time.time() if mark_read else reg.get(app, {}).get("last_read", 0)
     if mark_read:
         _save_apps(reg)
-    return [m for m in tail(500)
+    return [m for m in tail(None)   # unread stays unread however old it is
             if m.get("t", 0) > since
             and (app in m.get("tags", []) or m.get("to") == app)]
 
@@ -145,6 +145,7 @@ def append(app, kind, text, to="all"):
         try:
             os.lseek(lfd, 0, os.SEEK_SET)
             msvcrt.locking(lfd, msvcrt.LK_LOCK, 1)
+            key0 = _log_key()          # cache state before OUR write
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
             body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
@@ -162,6 +163,7 @@ def append(app, kind, text, to="all"):
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            _derived_absorb(body, raw, key0)
             return body
         finally:
             os.lseek(lfd, 0, os.SEEK_SET)
@@ -172,6 +174,7 @@ def append(app, kind, text, to="all"):
         fd_lock = os.open(lock_path, os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(fd_lock, fcntl.LOCK_EX)
+            key0 = _log_key()          # cache state before OUR write
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
             body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
@@ -189,6 +192,7 @@ def append(app, kind, text, to="all"):
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            _derived_absorb(body, raw, key0)
             return body
         finally:
             fcntl.flock(fd_lock, fcntl.LOCK_UN)
@@ -240,19 +244,180 @@ def _visible(m, as_app=None):
     return as_app == to or as_app == m.get("app")
 
 
+def _iter_lines(reverse=False):
+    """Stream the log line by line — nothing materializes the whole file.
+    `reverse` reads backwards in chunks, so tail(n) stops paying for the whole
+    history (measured: tail(20) used to cost the same as tail(1000), both
+    parsing every line, because the old tail() read the file and sliced)."""
+    if not os.path.exists(LOG):
+        return
+    if not reverse:
+        with open(LOG, encoding="utf-8") as f:
+            for raw in f:
+                if raw.strip():
+                    yield json.loads(raw)
+        return
+    CHUNK = 65536
+    with open(LOG, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        carry = b""
+        while pos > 0:
+            step = min(CHUNK, pos)
+            pos -= step
+            f.seek(pos)
+            parts = (f.read(step) + carry).split(b"\n")
+            carry = parts[0]        # may be a partial line — glue it to the next chunk
+            for raw in reversed(parts[1:]):
+                if raw.strip():
+                    yield json.loads(raw.decode("utf-8"))
+        if carry.strip():
+            yield json.loads(carry.decode("utf-8"))
+
+
 def tail(n=10, as_app=None):
+    """Newest n lines this reader may see.
+    **n=None means the whole history** — use that whenever completeness
+    matters (maps, bonds, the memory bridge). A capped read is a silent
+    truncation: at 1,000 bonds the cap returned 200 edges whose ends could
+    not even be resolved. The log is append-only, so "all" has one meaning."""
     if not os.path.exists(LOG):
         return []
-    with open(LOG, encoding="utf-8") as f:
-        lines = f.read().strip().split("\n")
+    if n is None:
+        return [m for m in _iter_lines() if _visible(m, as_app)]
     out = []
-    for x in lines:
-        if not x:
-            continue
-        m = json.loads(x)
+    for m in _iter_lines(reverse=True):
         if _visible(m, as_app):
             out.append(m)
-    return out[-n:]
+            if len(out) >= n:
+                break
+    out.reverse()
+    return out
+
+
+_DERIVED = {"key": None}
+
+
+def _log_key():
+    try:
+        st = os.stat(LOG)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def derived():
+    """One streaming pass keeping only what the plane reads often: cell counts,
+    hash→rkey, the live bond list, sightings and the tick timeline.
+    Cached against (size, mtime) — an append-only file changes one of those or
+    nothing at all, so the cache can never serve a stale plane.
+    Deliberately NOT persisted: ~10 MB at 100k lines, and the place a real
+    index belongs is pool.db — the materialized view the hourly flush already
+    rebuilds. See bond_scale.py for the numbers behind that call."""
+    key = _log_key()
+    if _DERIVED.get("key") == key and "cells" in _DERIVED:
+        return _DERIVED
+    cells, hash_rkey, bonds, hidden, pointers, timeline = {}, {}, [], set(), [], []
+    for m in _iter_lines():
+        rk, h, kind = m.get("rkey"), m.get("hash"), m.get("kind")
+        if h:
+            hash_rkey[h] = rk
+        if rk is not None:
+            cells[rk] = cells.get(rk, 0) + 1
+        to, tags = m.get("to", "all"), tuple(m.get("tags") or ())
+        timeline.append((m.get("t"), rk, kind, (h or "")[:8], to, tags))
+        if kind == "bond":
+            p = (m.get("text") or "").split()
+            if len(p) == 3:
+                if p[1] == "unbinds" and p[0] == p[2]:
+                    hidden.add(p[0])           # tombstone: hide, never delete
+                else:
+                    bonds.append({"hash": h, "src": p[0], "rel": p[1], "dst": p[2],
+                                  "app": m.get("app"), "t": m.get("t")})
+        elif kind == "pointer":
+            pointers.append(m)
+    _DERIVED.update({"key": key, "cells": cells, "hash_rkey": hash_rkey,
+                     "bonds": [b for b in bonds if b["hash"] not in hidden],
+                     "pointers": pointers, "timeline": timeline,
+                     # bump so the resolved-edge cache below knows the edge
+                     # set changed — a chat append must not rebuild it
+                     "bonds_rev": _DERIVED.get("bonds_rev", 0) + 1})
+    return _DERIVED
+
+
+def _last_line_is(body):
+    """Is the line on the end of the log the one we just wrote?
+
+    The absorb guard cannot use byte arithmetic, and not only because another
+    process might write in between: on Windows `os.open` without O_BINARY gives
+    a TEXT-mode fd, so the CRT expands our "\\n" to "\\r\\n" and the file grows
+    by one byte more than we handed the kernel. (The live log is CRLF for that
+    reason; the chain never saw it, because the hash covers content and
+    `_prev()` parses JSON, which ignores trailing whitespace.) Reading the tail
+    back and matching the hash is exact on both platforms and needs no such
+    assumption."""
+    try:
+        size = os.path.getsize(LOG)
+        with open(LOG, "rb") as f:
+            f.seek(max(size - 4096, 0))
+            tailb = f.read()
+    except OSError:
+        return False
+    ends = [ln for ln in tailb.split(b"\n") if ln.strip()]
+    if not ends:
+        return False
+    try:
+        return json.loads(ends[-1].decode("utf-8")).get("hash") == body.get("hash")
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
+def _derived_absorb(body, raw, key0):
+    """Feed one just-written line into the index instead of dropping it.
+
+    Append-only means the index is a fold over the log, so a new line is an
+    update, not a rebuild. That distinction is the whole cost curve: at 55k
+    lines a rebuild is ~460 ms (bond_scale.py), and paying it on the refresh
+    after every message is the only part of this that actually hurts today.
+
+    Guarded on purpose. The cache is only updated when it matched the file
+    exactly before our own write AND the line now on the end of the log is the
+    one we wrote (_last_line_is). If another process slipped a line in either
+    side of us, the cache would claim coverage it does not have — so it is
+    dropped and the next read rebuilds it. Lying is worse than being slow."""
+    d = _DERIVED
+    if d.get("key") is None or "cells" not in d:
+        return                               # nothing cached to keep in step
+    if d["key"] != key0 or not key0 or not _last_line_is(body):
+        d["key"] = None                      # unaccounted-for write: rebuild
+        return
+    rk, h, kind = body.get("rkey"), body.get("hash"), body.get("kind")
+    if h:
+        d["hash_rkey"][h] = rk
+    if rk is not None:
+        d["cells"][rk] = d["cells"].get(rk, 0) + 1
+    d["timeline"].append((body.get("t"), rk, kind, (h or "")[:8],
+                          body.get("to", "all"), tuple(body.get("tags") or ())))
+    if kind == "bond":
+        p = (body.get("text") or "").split()
+        if len(p) == 3:
+            d["bonds_rev"] = d.get("bonds_rev", 0) + 1
+            if p[1] == "unbinds" and p[0] == p[2]:
+                d["bonds"] = [b for b in d["bonds"] if b["hash"] != p[0]]
+            else:
+                d["bonds"].append({"hash": h, "src": p[0], "rel": p[1],
+                                   "dst": p[2], "app": body.get("app"),
+                                   "t": body.get("t")})
+    elif kind == "pointer":
+        d["pointers"].append(body)
+    d["key"] = _log_key()                    # the state we just verified
+
+
+def _cell_lines(rkey0, as_app=None):
+    """The lines living in ONE cell — streamed and filtered, so a point read
+    never materializes the history (and never truncates it either)."""
+    return [m for m in _iter_lines()
+            if m.get("rkey") == rkey0 and _visible(m, as_app)]
 
 
 CLOUD_DB = r"I:\tools\cloud-workspace\pool.db"
@@ -381,7 +546,7 @@ def memory_bridge(dry_run=False):
     since = _bridge_load()
     lifted = []
     last_t = since
-    for m in tail(500):
+    for m in tail(None):   # a capped read here loses old lines silently
         t = m.get("t", 0)
         if t <= since:
             continue
@@ -424,8 +589,7 @@ def neighbors(rkey0):
     Open a vision at one point (rkey0), see only that cell's lines.
     Data never moves and knows nothing; every read is a fresh pointer.
     Broader rings are the caller's next explicit read, not ours."""
-    lines = [m for m in tail(1000) if m.get("rkey") == rkey0]
-    return [(rkey0, lines)]
+    return [(rkey0, _cell_lines(rkey0))]
 
 
 # --- bonds (§5.2 decision 2026-09-17) ---------------------------------
@@ -460,23 +624,9 @@ def bonds_for(hash8_or_full, as_app=None):
     a later 'unbinds' line hides its target bond. Returns dicts
     {hash, src, rel, dst, app, t} — walk blast radius by pointing
     at each dst next; that is the caller's next explicit read."""
-    want = hash8_or_full.lower()
-    all_lines = tail(1000, as_app=as_app)
-    hidden = set()
-    for m in all_lines:
-        if m.get("kind") == "bond":
-            p = m.get("text", "").split()
-            if len(p) == 3 and p[1] == "unbinds" and p[0] == p[2]:
-                hidden.add(p[0])
-    out = []
-    for m in all_lines:
-        if m.get("kind") != "bond" or m["hash"] in hidden:
-            continue
-        p = m.get("text", "").split()
-        if len(p) == 3 and p[1] != "unbinds" and (p[0].startswith(want) or p[2].startswith(want)):
-            out.append({"hash": m["hash"], "src": p[0], "rel": p[1],
-                        "dst": p[2], "app": m.get("app"), "t": m.get("t")})
-    return out
+    want = (hash8_or_full or "").lower()
+    return [b for b in derived()["bonds"]
+            if b["src"].startswith(want) or b["dst"].startswith(want)]
 
 
 def _block_of(rkey0, block=12):
@@ -498,26 +648,24 @@ def all_bonds(as_app=None):
     """Every live edge in one read — same tombstone rule as bonds_for, but
     with both ends resolved to the rkey they sit in, so a caller can draw
     the edge on the plane without a second lookup. Addresses are not
-    content, so edges are not visibility-filtered (same rule as maps)."""
-    lines = tail(1000, as_app=as_app)
-    where = {m["hash"]: m.get("rkey") for m in lines if m.get("hash")}
-    hidden = set()
-    for m in lines:
-        p = (m.get("text") or "").split()
-        if m.get("kind") == "bond" and len(p) == 3 and p[1] == "unbinds" and p[0] == p[2]:
-            hidden.add(p[0])
-    out = []
-    for m in lines:
-        if m.get("kind") != "bond" or m["hash"] in hidden:
-            continue
-        p = (m.get("text") or "").split()
-        if len(p) != 3 or p[1] == "unbinds":
-            continue
-        out.append({"hash": m["hash"], "src": p[0], "rel": p[1], "dst": p[2],
-                    "src8": p[0][:8], "dst8": p[2][:8], "app": m.get("app"),
-                    "t": m.get("t"), "src_rkey": where.get(p[0]),
-                    "dst_rkey": where.get(p[2])})
-    return out
+    content, so edges are not visibility-filtered (same rule as maps).
+
+    Resolving 5,000 ends costs ~10 ms, which is 5% of a refresh budget spent
+    on a value that only changes when the edge SET changes — so it is cached
+    against bonds_rev. A chat line no longer makes the plane re-resolve the
+    whole graph; a new bond re-resolves it once. Treat the result as
+    read-only."""
+    d = derived()
+    if d.get("edges_rev") != d["bonds_rev"]:
+        d["edges"] = [
+            {"hash": b["hash"], "src": b["src"], "rel": b["rel"],
+             "dst": b["dst"], "src8": b["src"][:8], "dst8": b["dst"][:8],
+             "app": b["app"], "t": b["t"],
+             "src_rkey": d["hash_rkey"].get(b["src"]),
+             "dst_rkey": d["hash_rkey"].get(b["dst"])}
+            for b in d["bonds"]]
+        d["edges_rev"] = d["bonds_rev"]
+    return d["edges"]
 
 
 def timeline(as_app=None):
@@ -525,11 +673,10 @@ def timeline(as_app=None):
     never wall clock — so replaying a tick gives exactly the same plane
     (iron law 7). `t` rides along only as a human-readable label.
     Ordinals are counted inside the reader's own view."""
-    lines = tail(1000, as_app=as_app)
-    return {"unit": "seq", "count": len(lines),
-            "lines": [[i, m.get("t"), m.get("rkey"), m.get("kind"),
-                       (m.get("hash") or "")[:8]]
-                      for i, m in enumerate(lines)]}
+    vis = [r for r in derived()["timeline"]
+           if as_app is None or as_app in r[5] or r[4] == as_app]
+    return {"unit": "seq", "count": len(vis),
+            "lines": [[i, r[0], r[1], r[2], r[3]] for i, r in enumerate(vis)]}
 
 
 def _coarse_map(rkey0, block=12):
@@ -538,11 +685,8 @@ def _coarse_map(rkey0, block=12):
     with a count. No content ever crosses the read point. Want content?
     Point at a fine rkey from the map: new read."""
     bw, br = _block_of(rkey0, block)
-    cells = {}
-    for m in tail(1000):
-        rk = m.get("rkey")
-        if rk is not None and _in_block(rk, bw, br, block):
-            cells[rk] = cells.get(rk, 0) + 1
+    cells = {rk: n for rk, n in derived()["cells"].items()
+             if _in_block(rk, bw, br, block)}
     return {"level": 1, "block": block, "origin": {"wedge": bw, "ring": br},
             "base": br * 144 + bw,
             "fine_cells": dict(sorted(cells.items()))}
@@ -557,11 +701,7 @@ def _plane_map():
     views (20736 cells / 144 blocks / 1 plane); deeper levels add nothing.
     Cells over budget are only FLAGGED, never expanded: expanding one is
     the caller's next explicit read. Addresses + counts, no content."""
-    cells = {}
-    for m in tail(1000):
-        rk = m.get("rkey")
-        if rk is not None:
-            cells[rk] = cells.get(rk, 0) + 1
+    cells = dict(derived()["cells"])
     return {"level": 2, "plane": 144 * 144, "budget": VISION_BUDGET,
             "fine_cells": dict(sorted(cells.items())),
             "over_budget": sorted(k for k, c in cells.items()
@@ -588,9 +728,7 @@ def sub_map(rkey0, depth=1, path=()):
     inside a point. Each step down is the caller's own explicit read."""
     path = tuple(path or ())
     cells = {}
-    for m in tail(1000):
-        if m.get("rkey") != rkey0:
-            continue
+    for m in _cell_lines(rkey0):
         if any(_axis(m, i + 1) != v for i, v in enumerate(path)):
             continue
         k = _axis(m, depth)
@@ -646,8 +784,8 @@ def pointers_at(rkey0=None, level=None, as_app=None):
     Latest sighting per app wins. Kill the server mid-read and this still
     answers the same, because there is no server state to lose."""
     out = {}
-    for m in tail(1000, as_app=as_app):
-        if m.get("kind") != "pointer":
+    for m in derived()["pointers"]:
+        if not _visible(m, as_app):
             continue
         p = (m.get("text") or "").split()
         if len(p) != 2 or not p[0].startswith("point="):
@@ -686,8 +824,7 @@ def open_pointer(rkey0, level=0, app="system", record=False, depth=None,
     elif level == 1:
         vis = _coarse_map(rkey0)
     else:
-        lines = [m for m in tail(1000, as_app=as_app)
-                 if m.get("rkey") == rkey0]
+        lines = _cell_lines(rkey0, as_app)
         for i, v in enumerate(path):
             lines = [m for m in lines if _axis(m, i + 1) == v]
         vis = {"level": 0, "point": rkey0, "count": len(lines),
@@ -780,7 +917,7 @@ def _demo_body():
     assert cm["level"] == 1 and cm["block"] == 12, "L1 = exactly one 12x12 super-cell"
     assert bw <= b2["rkey"] % 144 < bw + 12, "the square frames the pointed cell in wedge"
     assert br <= b2["rkey"] // 144 < br + 12, "the square frames the pointed cell in ring"
-    expect = sum(1 for m in tail(1000) if m.get("rkey") is not None
+    expect = sum(1 for m in tail(None) if m.get("rkey") is not None
                  and _in_block(m["rkey"], bw, br))
     assert expect >= 1 and sum(cm["fine_cells"].values()) == expect, "map counts exactly the lines in this super-cell"
     assert all(_in_block(k, bw, br) for k in cm["fine_cells"]), "every address in the map lies inside the square"
@@ -788,12 +925,12 @@ def _demo_body():
     # bonds + timeline as plane data: every edge places both ends itself
     edges = all_bonds()
     assert len(edges) == 1 and edges[0]["rel"] == "produces", "all_bonds gives every live edge"
-    src_line = next(m for m in tail(1000) if m["hash"] == edges[0]["src"])
+    src_line = next(m for m in tail(None) if m["hash"] == edges[0]["src"])
     assert edges[0]["src_rkey"] == src_line["rkey"], "edge resolves src to the rkey it lives in"
-    assert edges[0]["dst_rkey"] == next(m for m in tail(1000) if m["hash"] == edges[0]["dst"])["rkey"], "edge resolves dst too — both ends place themselves"
+    assert edges[0]["dst_rkey"] == next(m for m in tail(None) if m["hash"] == edges[0]["dst"])["rkey"], "edge resolves dst too — both ends place themselves"
     assert edges[0]["dst8"] == edges[0]["dst"][:8] and len(edges[0]["dst"]) == 64, "edge carries short hashes for display"
     tl = timeline()
-    assert tl["unit"] == "seq" and tl["count"] == len(tail(1000)), "timeline counts every line the reader can see"
+    assert tl["unit"] == "seq" and tl["count"] == len(tail(None)), "timeline counts every line the reader can see"
     assert [r[0] for r in tl["lines"]] == list(range(tl["count"])), "ticks are dense ordinals in append order"
     assert tl["lines"][-1][2] == tail(1)[0]["rkey"], "the last tick is the newest line"
     assert tl["lines"][-1][4] == tail(1)[0]["hash"][:8], "each tick carries its line's short hash"
@@ -804,12 +941,12 @@ def _demo_body():
     # multi-pointer vision read: at the actual read point only
     r0 = tail(50)[0]["rkey"]
     nv = neighbors(r0)
-    assert nv == [(r0, [m for m in tail(1000) if m.get("rkey") == r0])], "vision = exactly the pointed cell"
+    assert nv == [(r0, [m for m in tail(None) if m.get("rkey") == r0])], "vision = exactly the pointed cell"
     # §5.3 pointer: per-read and ephemeral; awareness only as data
     p0 = tail(50)[0]["rkey"]
     assert pointers_at(p0) == [], "no pointer state exists before any read"
     v0 = open_pointer(p0, level=0, app="codex")
-    assert v0["count"] == len([m for m in tail(1000) if m.get("rkey") == p0]), "L0 = content of the pointed cell only"
+    assert v0["count"] == len([m for m in tail(None) if m.get("rkey") == p0]), "L0 = content of the pointed cell only"
     assert pointers_at(p0) == [], "a read leaves no trace unless the caller declares one"
     sg = sighting(p0, level=0, app="codex")
     assert sg["kind"] == "pointer", "sighting is data, not server state"
@@ -824,14 +961,14 @@ def _demo_body():
     # §5.4 RDH 144: one fixed leaf plane; overflow STACKS by phase axis
     pm = _plane_map()
     assert pm["level"] == 2 and pm["plane"] == 20736, "L2 = whole plane, the spatial ceiling"
-    assert sum(pm["fine_cells"].values()) == len([m for m in tail(1000) if m.get("rkey") is not None]), "plane map counts every addressed line"
+    assert sum(pm["fine_cells"].values()) == len([m for m in tail(None) if m.get("rkey") is not None]), "plane map counts every addressed line — no 1000-line cap"
     assert pm["over_budget"] == [], "nothing over budget here — stacking stays lazy"
     assert rkey(b"same bytes", phase=1) != rkey(b"same bytes", phase=0), "phase is an independent axis in the same plane"
     assert rkey(b"same bytes") == rkey(b"same bytes", phase=0), "phase 0 = the locked capture, unchanged"
     assert _axis({"app": "a", "kind": "k", "text": "t"}, 1) == rkey(b"akt", phase=1) % 144, "sub-axis recomputed from the line itself"
     pcell = tail(50)[0]["rkey"]
     sub = sub_map(pcell, depth=1)
-    assert sub["level"] == "0.1" and sum(sub["sub_cells"].values()) == len([m for m in tail(1000) if m.get("rkey") == pcell]), "stacked read splits exactly that one cell, addresses only"
+    assert sub["level"] == "0.1" and sum(sub["sub_cells"].values()) == len([m for m in tail(None) if m.get("rkey") == pcell]), "stacked read splits exactly that one cell, addresses only"
     assert all(isinstance(k, int) for k in sub["sub_cells"]), "stacked read is a map, never content"
     load = [{"app": "load", "kind": "chat", "text": "line %d" % i} for i in range(200)]
     d = _needed_depth(load)
@@ -859,6 +996,94 @@ def _demo_body():
     ep3 = flush_emit()
     assert ep3 is not None, "emit fires on new line"
     assert len(json.load(open(ep3, encoding="utf-8"))) == 1, "emit only new"
+    # ---- scale: the bug this fixed (measured by bond_scale.py) -------------
+    # 1,200 lines with 40 edges spread through them, written straight to the
+    # log (append() would fsync 1,200 times). The old capped read returned
+    # 200 of 1,000 edges and could not resolve the ends of the ones it kept,
+    # silently — so completeness is what gets asserted here, at a size where
+    # a cap would actually bite.
+    import json as _json
+    n_chat, n_bond = 1200, 40
+    step = n_chat // n_bond
+    made, first_bond, first_end = 0, None, None
+    with open(LOG, "w", encoding="utf-8") as fh:
+        prev, t, hs = "GENESIS", 1.0, []
+        for i in range(n_chat):
+            # a bond needs two lines to point at, so the first few are chats
+            kind = "bond" if (hs and i % step == 0 and made < n_bond) else "chat"
+            text = ("%s uses %s" % (hs[len(hs) // 2], hs[-1])) if kind == "bond" else "l%d" % i
+            raw = ("bench" + kind + text).encode("utf-8")
+            h = hashlib.sha256((prev + "bench" + kind + "all" + text).encode("utf-8")).hexdigest()
+            fh.write(_json.dumps({"v": 3, "t": t, "app": "bench", "kind": kind,
+                                  "text": text, "to": "all", "tags": [], "prev": prev,
+                                  "rkey": rkey(raw), "enc": rkey(raw) % 1440, "hash": h},
+                                 ensure_ascii=False) + "\n")
+            if kind == "bond":
+                made += 1
+                if first_bond is None:
+                    first_bond, first_end = h, hs[len(hs) // 2]
+            else:
+                hs.append(h)
+            prev, t = h, t + 0.001
+    assert n_chat > 1000, "the fixture must exceed the old cap for this to mean anything"
+    assert len(tail(None)) == n_chat == len(tail(10 ** 9)), "asking for more than exists still reads the whole log"
+    assert tail(5) == tail(None)[-5:], "the backwards reader returns the newest lines in the same order"
+    assert made >= n_bond - 1, "the fixture wrote the edges it meant to write"
+    big = all_bonds()
+    assert len(big) == made, "every edge is in the graph — the capped read returned a fifth of them"
+    assert all(e["src_rkey"] is not None and e["dst_rkey"] is not None for e in big), "and every end resolves to its cell"
+    # query by an ENDPOINT (that is what bonds_for takes) that sits near the
+    # start of the log — the very edge a 1000-line window used to hide
+    near_start = [e for e in bonds_for(first_end[:8]) if e["hash"] == first_bond]
+    assert near_start, "the oldest edge is still visible from its own endpoint"
+    assert near_start[0]["rel"] == "uses", "and it is still the edge that was written"
+    assert sum(_plane_map()["fine_cells"].values()) == n_chat, "the plane map counts every line, not the newest 1000"
+    assert timeline()["count"] == n_chat, "the tick timeline covers the whole log"
+    assert len(derived()["hash_rkey"]) == n_chat, "the derived index sees every line"
+    _DERIVED["key"] = None
+    assert len(all_bonds()) == made, "the derived index rebuilds from scratch and agrees"
+    # ---- the index is a fold: a new line is an update, not a rebuild ------
+    # Measured in bond_scale.py — a rebuild at 55k lines is ~460 ms, and paying
+    # it on the refresh after every message is the only real cost left here.
+    d0 = derived()
+    n0, cells0 = len(d0["timeline"]), sum(d0["cells"].values())
+    fresh_rk = rkey(("bench" + "chat" + "absorbed line").encode("utf-8"))
+    append("bench", "chat", "absorbed line")
+    d1 = derived()
+    assert d1 is d0, "an append feeds the cached index instead of discarding it"
+    assert len(d1["timeline"]) == n0 + 1, "and the new line is in the index at once"
+    assert sum(d1["cells"].values()) == cells0 + 1, "counted on the plane too"
+    assert d1["cells"].get(fresh_rk, 0) >= 1, "in the cell its rkey says it is in"
+    want_cells, want_tl = dict(d1["cells"]), len(d1["timeline"])
+    _DERIVED["key"] = None
+    assert derived()["cells"] == want_cells, "incremental index equals a from-scratch rebuild"
+    assert len(derived()["timeline"]) == want_tl, "timeline length agrees too"
+    bhash = append("bench", "bond", "%s uses %s" % (hs[0], hs[1]))["hash"]
+    assert any(e["hash"] == bhash for e in all_bonds()), "a fresh edge is in the graph without a rebuild"
+    assert len(all_bonds()) == made + 1, "only the edge set changing re-resolves the edges"
+    b2 = append("bench", "bond", "%s unbinds %s" % (bhash, bhash))["hash"]
+    assert not any(e["hash"] == bhash for e in all_bonds()), "a tombstone takes the edge out of the graph"
+    assert not any(e["hash"] == b2 for e in all_bonds()), "and the tombstone is not itself an edge"
+    # a writer this process cannot account for: trust the file, not the cache
+    _DERIVED["key"] = None
+    n2 = len(derived()["timeline"])      # an int, not the dict: derived() updates in place
+    foreign = {"v": 3, "t": 9.0, "app": "bench", "kind": "chat", "text": "foreign",
+               "to": "all", "tags": [], "prev": "x" * 64, "rkey": rkey(b"benchchatforeign"),
+               "enc": 0, "hash": "y" * 64}
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(foreign, ensure_ascii=False) + "\n")
+    assert len(derived()["timeline"]) == n2 + 1, "another writer's line invalidates by (size, mtime)"
+    before = dict(derived()["cells"])
+    _derived_absorb({"hash": "z" * 64, "rkey": fresh_rk, "kind": "chat",
+                     "t": 0, "to": "all", "tags": []}, b"nothing\n", (0, 0))
+    assert _DERIVED["key"] is None, "a key we cannot verify drops the cache instead of trusting it"
+    assert derived()["cells"] == before, "and the rebuild agrees with what was already there"
+    # the guard identifies the tail line by hash, not by counting bytes — the
+    # log is CRLF on Windows (text-mode fd), so byte arithmetic would be off by
+    # one per line and the absorb would never fire
+    assert _last_line_is({"hash": "0" * 64}) is False, "the tail is not a line we did not write"
+    assert _last_line_is(tail(1)[0]) is True, "and it is the line we did write"
+    assert open(LOG, "rb").read().endswith(b"\n"), "lines end in a newline on every platform"
     shutil.rmtree(os.path.join(DIR, "outbox"), ignore_errors=True)
     for p in (BRIDGE_STATE, APPS):
         if os.path.exists(p):

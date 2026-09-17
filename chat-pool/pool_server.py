@@ -266,6 +266,7 @@ button.send:hover{filter:brightness(1.1)}
     <div id="plane-bar">
       <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> bonds</label>
       <label class="clabel"><input type="checkbox" id="pv-ctx" style="accent-color:var(--acc2)"> memory</label>
+      <label class="clabel" title="ให้สีตามความหมายของ edge (uses/produces/...) — สีประจำ rel ไม่เปลี่ยนระหว่างการวาด"><input type="checkbox" id="pv-rel" checked style="accent-color:var(--acc2)"> สีตาม rel</label>
       <select id="pv-style" title="วิธีวาด edge" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
         <option value="auto">อัตโนมัติ (วัดแล้ว)</option>
         <option value="density">จางตามความแน่น</option>
@@ -292,7 +293,7 @@ button.send:hover{filter:brightness(1.1)}
         <div id="plane-tip"></div>
         <div id="plane-pop"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นส้ม = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ จุดฟ้า = memory ของ magic-context · เส้นม่วงประ = edge ข้ามระบบ (บรรทัดที่ถูกยกเข้า memory)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span></div></div>
+      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นขาว = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ จุดฟ้า = memory ของ magic-context · เส้นม่วงประ = edge ข้ามระบบ (บรรทัดที่ถูกยกเข้า memory)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
     </div>
   </div>
 </div>
@@ -444,7 +445,7 @@ const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
           bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
           style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
-          autoAt:120,hubK:12};   // measured: past ~120 edges a full draw is mostly ink
+          autoAt:120,hubK:12,relColour:true};   // measured: past ~120 edges a full draw is mostly ink
 const pcv=$('#plane-cv');
 const pstep=()=>PV.n===144?3:36;
 
@@ -526,8 +527,39 @@ function pvDegrees(edges){
 //   flat    : every edge the same weight
 //   density : alpha falls with the busiest end's degree, so hubs do not blot out
 //   bundle  : one stroke per cell PAIR (width by how many edges share it)
+// A relation is a closed set, so each one gets a FIXED hue: the same edge looks
+// the same on every render and in the side list, and a free `x-<rel>` is allowed
+// but hashed into a hue of its own. Nothing here reads the content of a line —
+// a rel is a field of the bond line, exactly like the addresses are.
+const REL_COLORS={uses:'58a6ff',produces:'7ee787',validates:'d2a8ff',
+                  decides:'ffa657',follows:'39c5cf',contradicts:'ff7b72',
+                  lifted:'bc8cff'};
+function relCSS(rel,alpha){
+  const a=Math.max(0,Math.min(1,alpha)).toFixed(3);
+  const hex=REL_COLORS[rel];
+  if(hex)return 'rgba('+parseInt(hex.slice(0,2),16)+','+parseInt(hex.slice(2,4),16)
+    +','+parseInt(hex.slice(4,6),16)+','+a+')';
+  let h=7;for(const ch of String(rel||'?'))h=(h*31+ch.charCodeAt(0))%360;
+  return 'hsla('+h+',72%,62%,'+a+')';
+}
+function pvRelOf(e){return e.rel||e.kind||'?'}
+// the same hue in the plane and in the side lists — one relation, one colour
+function pvRelInk(b){return PV.relColour?relCSS(pvRelOf(b),1)
+  :(b.kind==='lifted'?'#bc8cff':'var(--acc2)')}
+// which edges the current style actually draws — the legend must be able to say
+// how much of each rel it left out, or a hub view looks like a complete graph
+function pvDrawnEdges(){
+  const edges=pvGraphEdges();
+  if(PV.style==='degree')return edges;
+  const hubMode=PV.style==='hub'||(PV.style==='auto'&&edges.length>PV.autoAt);
+  if(!hubMode)return edges;
+  const deg=pvDegrees(edges);
+  const top=Object.keys(deg).map(Number).sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK);
+  const set=new Set(top);
+  return edges.filter(e=>set.has(e.src_rkey)||set.has(e.dst_rkey));
+}
 function pvEdgeStrokes(keep){
-  const step=pstep(),edges=pvGraphEdges();
+  const step=pstep(),edges=pvDrawnEdges();
   const deg=pvDegrees(edges);   // degree is needed by three of the styles
   // Above a few hundred edges the plane is mostly ink and no alpha fixes that
   // (measured: 600 edges cover 67% either way) — so those styles cut STROKES
@@ -547,9 +579,7 @@ function pvEdgeStrokes(keep){
     return out;
   }
   if(hubMode){
-    const top=Object.keys(deg).map(Number).sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK);
-    const set=new Set(top);
-    return pvEdgeStrokesOf(edges.filter(e=>set.has(e.src_rkey)||set.has(e.dst_rkey)),keep,'density');
+    return pvEdgeStrokesOf(edges,keep,'density');
   }
   if(PV.style==='auto')return pvEdgeStrokesOf(edges,keep,'density');
   return pvEdgeStrokesOf(edges,keep,PV.style);
@@ -561,11 +591,14 @@ function pvEdgeStrokesOf(edges,keep,style){
   const out=[],groups={};
   const push=(e,a,z,alpha,width)=>{
     const h=hot(e);
-    out.push({x1:a[0],y1:a[1],x2:z[0],y2:z[1],
+    // selection is a shape cue (white, thicker, drawn on top), never a hue:
+    // with rel colours on, a hue would collide with a real relation
+    out.push({x1:a[0],y1:a[1],x2:z[0],y2:z[1],rel:pvRelOf(e),
               width:h?Math.max(width,2):width,alpha:h?1:alpha,hot:h,step,
               loop:a[0]===z[0]&&a[1]===z[1],
               dash:e.kind==='lifted'?[3,2]:null,
-              css:h?'#ffa657':'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+','+alpha.toFixed(3)+')'});
+              css:h?'#ffffff':(PV.relColour?relCSS(pvRelOf(e),alpha)
+                    :'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+','+alpha.toFixed(3)+')')});
   };
   edges.forEach(e=>{
     const a=pvCenter(e.src_rkey),z=pvCenter(e.dst_rkey);
@@ -645,6 +678,67 @@ function pvBench(N,hubCount,hubDeg){
   return {edges:N,hubs:hubCount+'x'+hubDeg,planeCells:20736,result:res};
 }
 window.pvBench=pvBench;
+// Does colouring edges by rel stay as readable as hub mode? Flat ink/hot cannot
+// answer that — colour does not remove strokes, so the question is whether you
+// can still TELL WHICH rel a pixel belongs to. So this measures two more
+// numbers per mode: mixed = share of edge pixels where two different rels are
+// drawn on top of each other (unreadable either way), pure = share carrying
+// exactly one rel (attributable). "rel" = colour only, "rel+hub" = colour with
+// the stroke cut auto already switches to.
+function pvBenchRel(N,hubK){
+  N=N||200;hubK=hubK||12;
+  const W=432,rnd=()=>Math.floor(Math.random()*20736),edges=[];
+  const mix=['uses','uses','uses','produces','produces','validates','decides','follows','contradicts'];
+  const hubs=[];for(let i=0;i<8;i++)hubs.push(rnd());
+  for(let i=0;i<N;i++)edges.push({src_rkey:(i%3===0)?hubs[i%hubs.length]:rnd(),
+                                  dst_rkey:rnd(),kind:'bond',rel:mix[i%mix.length]});
+  const saved={};Object.keys(PV).forEach(k=>saved[k]=PV[k]);
+  PV.bonds=edges;PV.sel=null;PV.focus=0;PV.ctxOn=false;PV.timeline=[];PV.seq=null;
+  PV.mode='plane';PV.showBonds=true;PV.hubK=hubK;
+  const res={};
+  // colour on/off on the SAME graph: hue never changes which pixels are inked,
+  // so the only honest comparison is what colour does to attribution
+  [['rel','flat',true],['plain','flat',false],
+   ['rel-hub','hub',true],['hub-plain','hub',false]].forEach(([name,style,colr])=>{
+    PV.style=style;PV.relColour=colr;
+    const strokes=pvEdgeStrokes(null);
+    const mask=(list)=>{const cv=document.createElement('canvas');cv.width=cv.height=W;
+      const cx=cv.getContext('2d');list.forEach(s=>pvStroke(cx,s,0.05));
+      return cx.getImageData(0,0,W,W).data};
+    const vis=document.createElement('canvas'),acc=document.createElement('canvas');
+    vis.width=vis.height=acc.width=acc.height=W;
+    const vc=vis.getContext('2d'),ac=acc.getContext('2d');
+    vc.fillStyle='#000000';vc.fillRect(0,0,W,W);
+    strokes.forEach(s=>{pvStroke(vc,s);pvStroke(ac,s,0.05)});
+    const vd=vc.getImageData(0,0,W,W).data,ad=ac.getImageData(0,0,W,W).data;
+    // group by what the eye can distinguish: with colour off every stroke is one
+    // visible group, so `mixed` is 0 by construction and the difference below is
+    // the real cost of colouring by rel
+    const byRel={};strokes.forEach(s=>{const k=colr?(s.rel||'?'):'all';(byRel[k]=byRel[k]||[]).push(s)});
+    const masks=Object.values(byRel).map(mask);
+    const owners=new Int16Array(W*W);
+    masks.forEach(m=>{for(let p=0,i=3;i<m.length;i+=4,p++)if(m[i]>0)owners[p]++});
+    let ink=0,hotPx=0,sum=0,mixed=0;
+    for(let i=0;i<vd.length;i+=4){
+      if(vd[i]+vd[i+1]+vd[i+2]<=24)continue;
+      ink++;const n=Math.round(ad[i+3]/13);sum+=n;if(n>=3)hotPx++;
+      if(owners[i/4]>1)mixed++;
+    }
+    res[name]={strokes:strokes.length,rels:Object.keys(byRel).length,
+      inkPct:+(ink/(W*W)*100).toFixed(2),
+      hotPct:ink?+(hotPx/ink*100).toFixed(1):0,
+      mixedPct:ink?+(mixed/ink*100).toFixed(1):0,
+      purePct:ink?+(100-mixed/ink*100).toFixed(1):0};
+  });
+  // what the colour cost in ambiguity, on identical strokes
+  res['cost@'+N]=((res.rel.mixedPct-res.plain.mixedPct).toFixed(1)
+    +'pt at '+res.rel.strokes+' edges, '
+    +(res['rel-hub'].mixedPct-res['hub-plain'].mixedPct).toFixed(1)
+    +'pt at '+res['rel-hub'].strokes+' edges');
+  Object.assign(PV,saved);pvMode();
+  return {edges:N,rels:9,result:res};
+}
+window.pvBenchRel=pvBenchRel;
 function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
   if(PV.mode==='blocks')return[Math.floor((rk%144)/12),Math.floor(rk/144/12)];
@@ -707,7 +801,7 @@ function pvPop(){
   });
   mine.slice(0,4).forEach(b=>{
     const out=b.src_rkey===PV.sel;
-    h+='<div class="pp" style="color:'+(b.kind==='lifted'?'#bc8cff':'var(--acc2)')+'">'+esc(b.rel||'lifted')+' '
+    h+='<div class="pp" style="color:'+pvRelInk(b)+'">'+esc(b.rel||'lifted')+' '
       +(out?'→ ':'← ')+(out?(b.dst8||('#row'+b.dst_rowid)):b.src8)+'</div>';
   });
   if(keep)h+='<div class="pp">รัศมี '+PV.focus+' hop → '+keep.size+' เซลล์</div>';
@@ -746,6 +840,32 @@ function pvEdgeDisclosure(){
   }
   return '';
 }
+// The legend has to be part of the picture, not decoration: it says how many
+// edges each rel has AND how many of them the current style is not drawing.
+function pvRelLegend(){
+  const box=$('#rel-legend');if(!box)return;
+  if(!PV.relColour){box.innerHTML='';return}
+  // by content, not by object identity: every call rebuilds the edge objects,
+  // so a Set of them would report that nothing was drawn while the plane
+  // plainly draws it
+  const key=e=>e.hash||(pvRelOf(e)+'|'+(e.src8||e.src_rkey)+'>'+(e.dst8||e.dst_rowid||e.dst_rkey));
+  const all=pvGraphEdges(),drawn=new Set(pvDrawnEdges().map(key));
+  const tot={},showed={};
+  all.forEach(e=>{const r=pvRelOf(e);tot[r]=(tot[r]||0)+1;if(drawn.has(key(e)))showed[r]=(showed[r]||0)+1});
+  const keys=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]);
+  let h=keys.map(r=>'<span style="display:inline-flex;align-items:center;gap:4px;margin:0 9px 3px 0">'
+    +'<span style="width:12px;height:2px;background:'+relCSS(r,1)+';display:inline-block"></span>'
+    +esc(r)+' <span style="color:var(--dim)">'+(showed[r]||0)+'/'+tot[r]+'</span></span>').join('');
+  const hidden=all.length-drawn.size;
+  if(hidden>0)h+='<div style="color:var(--warn)">hub ไม่วาด '+hidden+' เส้นที่'
+    +'ไม่แตะ hub — ตัวเลข 0/12 ข้างบนคือ rel ที่ถูกตัดออกมากที่สุด</div>';
+  // the measurement, said out loud: hue is free on coverage but past a couple of
+  // hundred strokes the colours sit on top of each other and the panel is the
+  // only place a rel is still certain
+  if(drawn.size>200)h+='<div style="color:var(--dim)">สีเริ่มทับกันที่ขนาดนี้ —'
+    +' คลิกจุดหรือกดรัศมีเพื่อดู rel ให้แน่</div>';
+  box.innerHTML=h;
+}
 function pvInfo(){
   const src=(PV.seq===null||PV.seq>=PV.seqMax-1)?PV.plane:pvCellsUpTo(PV.seq);
   const tot=Object.values(src).reduce((a,b)=>a+b,0);
@@ -760,6 +880,7 @@ function pvInfo(){
       const shared=Object.keys(PV.ctxCells).filter(k=>PV.plane[k]).length;
       return ' · memory '+mem+' เซลล์ · ทับกัน '+shared+' · ข้ามระบบ '+PV.crossEdges.length+' เส้น';
     })();
+  pvRelLegend();
 }
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
@@ -849,7 +970,7 @@ function pvDetail(){
       const out=b.src_rkey===PV.sel,other=out?(b.dst8||('#row'+b.dst_rowid)):b.src8;
       const ork=out?b.dst_rkey:b.src_rkey,lift=b.kind==='lifted';
       return '<div class="pline" style="border-color:'+(lift?'#bc8cff':'var(--acc2)')+'"><span class="badge">'+esc(b.app||'?')
-        +'</span> '+(out?'→':'←')+' <b style="color:'+(lift?'#bc8cff':'var(--acc2)')+'">'+esc(b.rel||'lifted')+'</b> '
+        +'</span> '+(out?'→':'←')+' <b style="color:'+pvRelInk(b)+'">'+esc(b.rel||'lifted')+'</b> '
         +'<span class="ph" title="walk ไปปลายอีกด้าน" onclick="openPoint('+(ork==null?'null':ork)+')">'
         +other+(ork==null?' (ไม่เห็นปลายทาง)'+(lift?' · row '+b.dst_rowid:''):'')+'</span></div>';
     }).join('');
@@ -910,6 +1031,7 @@ $('#pv-ctx').onchange=async e=>{
   if(PV.ctxOn)toast('memory plane: '+Object.keys(PV.ctxCells).length+' เซลล์ · ข้ามระบบ '+PV.crossEdges.length+' เส้น');
 };
 $('#pv-style').onchange=e=>{PV.style=e.target.value;pvMode()};
+$('#pv-rel').onchange=e=>{PV.relColour=e.target.checked;pvDraw();pvInfo()};
 $('#pv-f0').onclick=()=>setFocus(0);
 $('#pv-f1').onclick=()=>setFocus(1);
 $('#pv-f2').onclick=()=>setFocus(2);
