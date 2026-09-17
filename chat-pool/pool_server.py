@@ -110,6 +110,10 @@ button.send:hover{filter:brightness(1.1)}
           <option value="admin">admin (เห็นหมด)</option>
         </select>
       </div>
+      <div id="regbox" style="margin-top:9px;display:none">
+        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">registry</div>
+        <div id="reg-list" style="font:11px var(--mono);color:var(--dim);max-height:130px;overflow-y:auto;white-space:pre-wrap;padding-top:4px"></div>
+      </div>
       <div id="inboxbox" style="margin-top:9px;display:none">
         <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">inbox <b id="ib-count" style="color:var(--acc)">0</b></div>
         <div id="ib-list" style="font:11px var(--mono);color:var(--dim);max-height:150px;overflow-y:auto;white-space:pre-wrap;padding-top:4px"></div>
@@ -174,8 +178,18 @@ window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadI
 window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
 
 async function loadInbox(mark){
-  if(identity==='admin'){$('#inboxbox').style.display='none';return}
-  $('#inboxbox').style.display='block';
+  const regbox=$('#regbox'), inboxbox=$('#inboxbox');
+  try{
+    const reg=await fetch('/apps').then(r=>r.json());
+    regbox.style.display='block';
+    $('#reg-list').innerHTML=reg.map(a=>{
+      const seen=new Date(a.last_seen*1000);
+      const live=(Date.now()-seen.getTime())<120000;
+      return `${live?'🟢':'⚪'} ${esc(a.app)} · ${seen.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})}`;
+    }).join('\n')||'(ยังไม่มีใคร register)';
+  }catch{regbox.style.display='none'}
+  if(identity==='admin'){inboxbox.style.display='none';return}
+  inboxbox.style.display='block';
   const r=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':'')).then(r=>r.json());
   if(r.error){$('#ib-list').textContent='⚠ '+r.error;$('#ib-count').textContent='?';return}
   myInbox=r;
@@ -276,6 +290,13 @@ class PoolHandler(BaseHTTPRequestHandler):
             with _lock:
                 msgs = pool.tail(n, as_app=as_app)
             self._json(200, msgs)
+
+        elif parsed.path == "/apps":
+            reg = pool.list_apps()
+            apps = sorted(
+                ({"app": name, **info} for name, info in reg.items()),
+                key=lambda a: -a.get("last_seen", 0))
+            self._json(200, apps)
 
         elif parsed.path == "/inbox":
             app = qs.get("app", [""])[0]
