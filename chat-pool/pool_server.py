@@ -21,6 +21,20 @@ import pool
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
 
+# LAN access: bearer token required for non-loopback clients.
+# Token file lives next to the log (0600-ish perms on NTFS via profile);
+# created on first boot. Loopback (dashboard on this PC) is always trusted.
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pool_token")
+
+
+def _get_token():
+    import secrets
+    if not os.path.exists(TOKEN_FILE):
+        tok = secrets.token_hex(16)
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(tok)
+    return open(TOKEN_FILE, encoding="utf-8").read().strip()
+
 DASHBOARD = r"""<!DOCTYPE html>
 <html lang="th">
 <head>
@@ -142,6 +156,9 @@ button.send:hover{filter:brightness(1.1)}
 <script>
 const $=s=>document.querySelector(s);
 let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
+// LAN access: token prompt (localhost skips auth server-side, this is harmless there)
+const TOKEN=(()=>{let t=localStorage.getItem('pool_token');if(!t){t=prompt('pool token (จาก I:/tools/chat-pool/.pool_token — เว้นว่างถ้าเปิดจากเครื่องนี้)')||'';localStorage.setItem('pool_token',t)}return t})();
+const H=TOKEN?{'Authorization':'Bearer '+TOKEN}:{'x-noauth':'1'};
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
@@ -180,7 +197,7 @@ window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadI
 async function loadInbox(mark){
   const regbox=$('#regbox'), inboxbox=$('#inboxbox');
   try{
-    const reg=await fetch('/apps').then(r=>r.json());
+    const reg=await fetch('/apps',{headers:H}).then(r=>r.json());
     regbox.style.display='block';
     $('#reg-list').innerHTML=reg.map(a=>{
       const seen=new Date(a.last_seen*1000);
@@ -190,7 +207,7 @@ async function loadInbox(mark){
   }catch{regbox.style.display='none'}
   if(identity==='admin'){inboxbox.style.display='none';return}
   inboxbox.style.display='block';
-  const r=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':'')).then(r=>r.json());
+  const r=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':''),{headers:H}).then(r=>r.json());
   if(r.error){$('#ib-list').textContent='⚠ '+r.error;$('#ib-count').textContent='?';return}
   myInbox=r;
   $('#ib-count').textContent=r.length;
@@ -203,13 +220,13 @@ $('#apps-sel').onchange=e=>{filterApps=new Set(e.target.value?[e.target.value]:[
 $('#id-sel').onchange=e=>setIdentity(e.target.value);
 $('#cloudck').onchange=async e=>{
   $('#cloudwrap').classList.toggle('open',e.target.checked);
-  if(e.checked){const r=await fetch('/view?n=6&cloud=1').then(r=>r.json());
+  if(e.checked){const r=await fetch('/view?n=6&cloud=1',{headers:H}).then(r=>r.json());
     $('#cloudout').textContent=r.lines?.join('\n')||'(empty)';}
 };
 async function send(){
   const el=$('#msg-in');const text=el.value.trim();if(!text)return;
   el.value='';el.style.height='38px';
-  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'human',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
+  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json',...H},body:JSON.stringify({app:'human',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
   if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
 }
 
@@ -221,13 +238,13 @@ async function registerIdentity(){
 $('#send').onclick=send;
 $('#msg-in').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
 $('#msg-in').oninput=e=>{e.target.style.height='38px';e.target.style.height=Math.min(e.target.scrollHeight,140)+'px'};
-$('#flushnow').onclick=async e=>{e.preventDefault();const r=await fetch('/flush',{method:'POST'}).then(r=>r.json());toast(r.pushed?`flush ok: ${r.pushed.length} pushed`:(r.emitted?'flush ok':'nothing to flush'));refresh()};
+$('#flushnow').onclick=async e=>{e.preventDefault();const r=await fetch('/flush',{method:'POST',headers:H}).then(r=>r.json());toast(r.pushed?`flush ok: ${r.pushed.length} pushed`:(r.emitted?'flush ok':'nothing to flush'));refresh()};
 
 async function refresh(){
   const as=identity==='admin'?'':'&as='+identity;
   const [tail,h]=await Promise.all([
-    fetch('/tail?n=200'+as).then(r=>r.json()),
-    fetch('/view?n=500'+as).then(r=>r.json())
+    fetch('/tail?n=200'+as,{headers:H}).then(r=>r.json()),
+    fetch('/view?n=500'+as,{headers:H}).then(r=>r.json())
   ]);
   msgs=tail;
   render();
@@ -243,7 +260,7 @@ setInterval(()=>{if(identity!=='admin')loadInbox(false)},8000);
 // SSE live
 function listen(){
   const as=identity==='admin'?'':'&as='+identity;
-  const es=new EventSource('/stream?n=200'+as);
+  const es=new EventSource('/stream?n=200'+as+(TOKEN?'&token='+TOKEN:''));
   es.onopen=()=>$('#dot').classList.add('on');
   es.onerror=()=>{$('#dot').classList.remove('on');es.close();setTimeout(listen,3000)};
   es.onmessage=ev=>{const m=JSON.parse(ev.data);
@@ -256,6 +273,19 @@ listen();
 
 
 class PoolHandler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        """Loopback = trusted (dashboard on this PC). Non-loopback
+        (phone/LAN) must present the bearer token from .pool_token
+        (header, or ?token= for EventSource which cannot set headers)."""
+        client = self.client_address[0]
+        if client in ("127.0.0.1", "::1"):
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {_get_token()}":
+            return True
+        parsed = urlparse(self.path)
+        return parse_qs(parsed.query).get("token", [""])[0] == _get_token()
+
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -268,6 +298,11 @@ class PoolHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+
+        if not self._authorized():
+            self._json(401, {"error": "token required — see .pool_token on the server",
+                             "howto": {"header": "Authorization: Bearer <token>"}})
+            return
 
         if parsed.path == "/" or parsed.path == "/index.html":
             body = DASHBOARD.encode("utf-8")
@@ -366,6 +401,9 @@ class PoolHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not self._authorized():
+            self._json(401, {"error": "token required — see .pool_token on the server"})
+            return
         if parsed.path == "/register":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -433,7 +471,19 @@ def main():
     # server deadlocks on the second request.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), PoolHandler)
     server.daemon_threads = True
+    tok = _get_token()
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        lan_ip = "<your-lan-ip>"
     print(f"pool-server listening on http://0.0.0.0:{PORT}")
+    print(f"  this PC : http://localhost:{PORT}")
+    print(f"  LAN     : http://{lan_ip}:{PORT}  (Authorization: Bearer {tok[:4]}…{tok[-4:]})")
+    print(f"  token   : {TOKEN_FILE}")
     print(f"  log: {pool.LOG}")
     print(f"  UI : http://localhost:{PORT}/   (dashboard)")
     print(f"  POST /register  {{app}}            (first-time identity)")
