@@ -67,23 +67,43 @@ materialized view ที่สร้างใหม่ได้จาก log —
 - Active memory = set ของ pointer ที่ session/agent ถืออยู่ชั่วคราว —
   ไม่เขียนกลับเป็น state ของ DB
 
-## 5. สิ่งที่ยังเปิด (ต้องตัดสินใจก่อน implement)
+## 5. การตัดสินใจแล้ว (owner ตัดสิน 2026-09-17)
 
-1. vision level กี่ระดับ และแต่ละระดับ "รวม" อะไรบ้าง (ถ่อมไว้: ระดับเดียว =
-   เซลล์เดียว ตามที่ทำอยู่ตอนนี้)
-2. bond เขียนกลับเข้า log จริงไหม รูปแบบ line หน้าตายังไง
-3. multi-human/multi-agent: pointer ต่อ agent แยกกันสุด หรือมีมุมมองร่วมได้
-4. RDH 144 พอไหมสำหรับ FS จริง (20736 เซลล์) หรือต้อง stack หลายชั้น
+1. **Vision levels: L0 + L1** — L0 = เซลล์เดียวที่ pointer ชี้ (เนื้อหาเต็ม,
+   ตามเดิม) L1 = zoom out 144 เท่า (บล็อก 12×12 ของ RDH): ตอบเป็น MAP ล้วน —
+   รายชื่อ fine-cell ที่มีของ + นับ line (**ไม่มีเนื้อหาข้ามจุดอ่าน**) อยากเนื้อหา
+   ไหนชี้ลง fine-cell นั้นต่อเอง อ่านหยาบคือการอ่าน*ที่จุดใหม่* ไม่ใช่การลากของ
+   มาให้ — ยังตรงกฎ "ไม่รองรับระหว่างทาง" เป๊ะ
+2. **Bond: line ธรรมดา `kind:"bond"`** — text = `<src64hex> <rel> <dst64hex>`
+   ผูก*บรรทัดกับบรรทัด* (hash) ไม่ใช่ cell กับ cell (cell รับได้หลายพัน line —
+   หลวมเกิน) bond โดน hash/rkey/chain คลุมเองจาก append() โดยไม่แตะกลไกเดิม;
+   bond มี rkey ของตัวเอง = อยู่ cell ของมัน ไม่แอบอยู่ cell ปลายทาง
+   (address-from-content ไม่ฉัก)
+   - rel ชุดปิด: `uses produces validates decides follows contradicts` +
+     ทางหนี `x-<อะไรก็ได้>` + `unbinds` (tombstone: dst = hash ของ bond ที่ยกเลิก)
+   - one edge per line, แก้/ลบ = เขียน line ใหม่, append-only ไม่มี UPDATE/DELETE
+   - หา bond: `pool.bonds_for(hash)` / `GET /bonds?hash=` — blast radius =
+     walk จุดต่อจุด (ชี้ → เห็น edges → ชี้ปลายต่อ) — geometry ชี้ที่, bond บอกความหมาย
+3. **ยังเปิด**: pointer ต่อ agent แยกสุด vs มุมมองร่วม · RDH 144 พอไหมสำหรับ FS จริง
 
 ## 6. ตัวอย่างการอ่านแบบ pointer (จากโค้ดจริงวันนี้)
 
 ```python
 # pointer เกิดที่จุดอ่าน — ระบุ "จุด" ได้จาก rkey ของ line ใดก็ได้
 r0 = pool.tail(50)[0]["rkey"]          # จุด = 19450 (เซลล์ x=10,y=135)
-pool.neighbors(r0)                      # เห็นเฉพาะเซลล์ที่ชี้ → [(19450, [line])]
+pool.neighbors(r0)                      # L0: เห็นเฉพาะเซลล์ที่ชี้ → [(19450, [line])]
+pool._coarse_map(r0)                    # L1: MAP ของบล็อก 12×12 (address+count ล้วน)
 # อยากมองจุดอื่น = pointer ใหม่ อ่านใหม่ — ไม่มี state ตกค้าง
 
-# HTTP: GET /neighbors?rkey=19450
+# bond: edge คือ line
+h1, h2 = pool.tail(2)[0]["hash"], pool.tail(1)[0]["hash"]
+pool.bond(h1, "uses", h2, app="opencode")   # line kind:"bond" — chain คลุมเอง
+pool.bonds_for(h1[:8])                       # edges ที่แตะ h1 (สองข้าง)
+pool.unbind(bond_hash)                       # tombstone — ของเดิมยังอยู่
+
+# HTTP: GET /neighbors?rkey=19450        (L0)
+# GET /neighbors?rkey=19450&level=1      (L1 map)
+# GET /bonds?hash=<line hash>            (blast radius ทีละจุด)
 ```
 
 ## 7. หลักฐานอ้างอิง (locked)
@@ -91,4 +111,6 @@ pool.neighbors(r0)                      # เห็นเฉพาะเซล�
 - tower geometry locked 2026-09-16 พิสูจน์บน 211,497 chunks (F1)
 - geometry = MAP/address, ไม่ใช่ semantic recall (VERDICT จาก F1)
 - single writer / lock-free readers, append-only, never demo live
-- pool_server + neighbors + bridge: demo 21/21, ใช้งานจริงบน :8390
+- pool_server + neighbors + bonds + bridge: demo 30/30 (temp-dir isolated), ใช้งานจริงบน :8390
+- 2026-09-17: crashed demo เคยลบ log จริง → กู้จาก pool.db chunk + re-append ที่รู้เนื้อหา,
+  demo ถูก isolation ใน temp dir ตั้งแต่นั้น (ของจริงแตะไม่ได้แม้ demo พัง)

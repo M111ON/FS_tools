@@ -422,7 +422,97 @@ def neighbors(rkey0):
     return [(rkey0, lines)]
 
 
+# --- bonds (§5.2 decision 2026-09-17) ---------------------------------
+# A bond is ordinary data: kind:"bond", text "<src> <rel> <dst>" where
+# src/dst are full 64-hex hashes of existing lines. It is hashed, keyed
+# and chained by append() exactly like any other line — zero special
+# mechanics. Unbind = tombstone line with rel "unbinds" and dst = the
+# hash of the bond line being revoked.
+BOND_RELS = ("uses", "produces", "validates", "decides", "follows", "contradicts")
+
+
+def bond(src, rel, dst, app="system"):
+    """Declare one edge between two lines, as a line. Returns the body.
+    src/dst must be line hashes (64 hex); rel is a closed verb or x-prefixed."""
+    if not re.fullmatch(r"[0-9a-f]{64}", src or "") or not re.fullmatch(r"[0-9a-f]{64}", dst or ""):
+        raise ValueError("src/dst must be full 64-hex line hashes")
+    if rel != "unbinds" and rel not in BOND_RELS and not rel.startswith("x-"):
+        raise ValueError("rel must be one of %s, 'unbinds', or x-<free>" % ", ".join(BOND_RELS))
+    return append(app, "bond", "%s %s %s" % (src, rel, dst))
+
+
+def unbind(bond_hash, app="system"):
+    """Tombstone a bond: write a new line pointing at the bond's hash.
+    The original line stays — append-only, never edit."""
+    if not re.fullmatch(r"[0-9a-f]{64}", bond_hash or ""):
+        raise ValueError("bond_hash must be a full 64-hex line hash")
+    return append(app, "bond", "%s unbinds %s" % (bond_hash, bond_hash))
+
+
+def bonds_for(hash8_or_full, as_app=None):
+    """Read edges touching a line (either end), latest state wins:
+    a later 'unbinds' line hides its target bond. Returns dicts
+    {hash, src, rel, dst, app, t} — walk blast radius by pointing
+    at each dst next; that is the caller's next explicit read."""
+    want = hash8_or_full.lower()
+    all_lines = tail(1000, as_app=as_app)
+    hidden = set()
+    for m in all_lines:
+        if m.get("kind") == "bond":
+            p = m.get("text", "").split()
+            if len(p) == 3 and p[1] == "unbinds" and p[0] == p[2]:
+                hidden.add(p[0])
+    out = []
+    for m in all_lines:
+        if m.get("kind") != "bond" or m["hash"] in hidden:
+            continue
+        p = m.get("text", "").split()
+        if len(p) == 3 and p[1] != "unbinds" and (p[0].startswith(want) or p[2].startswith(want)):
+            out.append({"hash": m["hash"], "src": p[0], "rel": p[1],
+                        "dst": p[2], "app": m.get("app"), "t": m.get("t")})
+    return out
+
+
+def _coarse_map(rkey0, block=12):
+    """L1 vision at one point: the containing 12x12 super-cell.
+    Answers with a MAP ONLY — fine-cell addresses that hold lines,
+    each with a count. No content ever crosses the read point.
+    Want content? Point at a fine rkey from the map: new read."""
+    base = (rkey0 // block) * block
+    cells = {}
+    for m in tail(1000):
+        rk = m.get("rkey")
+        if rk is not None and base <= rk < base + block * block:
+            cells[rk] = cells.get(rk, 0) + 1
+    return {"level": 1, "base": base, "block": block,
+            "fine_cells": dict(sorted(cells.items()))}
+
+
 def demo():
+    """Self-check. Runs against a TEMP copy of the module directory —
+    a crashed demo used to wipe the live log mid-assert (it happened);
+    the real LOG/registry/outbox must be untouchable even on failure."""
+    import shutil, tempfile
+    tmp = tempfile.mkdtemp(prefix="pool-demo-")
+    for f in ("pool.py",):
+        src = os.path.join(DIR, f)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(tmp, f))
+    sys.path.insert(0, tmp)
+    try:
+        demo_mod = __import__("pool")  # fresh module, DIR=tmp
+        demo_mod.DIR = tmp
+        demo_mod.LOG = os.path.join(tmp, "log.jsonl")
+        demo_mod.STATE = os.path.join(tmp, ".flush_state.json")
+        demo_mod.APPS = os.path.join(tmp, "apps.json")
+        demo_mod.BRIDGE_STATE = os.path.join(tmp, ".bridge_state.json")
+        demo_mod._demo_body()
+    finally:
+        sys.path.remove(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _demo_body():
     for p in (LOG, STATE, LOG + ".lock"):
         if os.path.exists(p):
             os.remove(p)
@@ -454,6 +544,29 @@ def demo():
     assert not any("run the flush" in m["text"] for m in inbox("codex", mark_read=False)), "codex inbox clean"
     ib2 = inbox("hermes")  # mark read
     assert inbox("hermes") == [], "inbox drains after read"
+    # bonds: ordinary lines, closed verbs, tombstone unbind, L1 coarse map
+    h1, h2 = tail(2)[0]["hash"], tail(1)[0]["hash"]
+    b = bond(h1, "uses", h2, app="opencode")
+    assert b["kind"] == "bond" and b["prev"] == h2, "bond is a chained line"
+    assert b["rkey"] == rkey(("opencode" + "bond" + b["text"]).encode("utf-8")), "bond has own rkey from content"
+    fb = bonds_for(h1[:8])
+    assert len(fb) == 1 and fb[0]["rel"] == "uses" and fb[0]["dst"] == h2, "bond readable from both ends"
+    assert bonds_for(h2[:8])[0]["src"] == h1, "edge visible from dst side too"
+    try:
+        bond(h1, "bogus", h2); assert False, "open verb must be rejected"
+    except ValueError:
+        pass
+    ub = unbind(fb[0]["hash"], app="opencode")
+    assert ub["kind"] == "bond", "tombstone is a bond line"
+    assert bonds_for(h1[:8]) == [], "unbinded bond hidden, original line intact"
+    b2 = bond(h1, "produces", h2, app="opencode")
+    assert len(bonds_for(h1[:8])) == 1 and bonds_for(h1[:8])[0]["rel"] == "produces", "new bond after tombstone"
+    cm = _coarse_map(b2["rkey"])
+    assert cm["level"] == 1 and cm["base"] <= b2["rkey"] < cm["base"] + 144, "L1 map contains the pointed fine cell"
+    expect = sum(1 for m in tail(1000)
+                 if m.get("rkey") is not None and cm["base"] <= m["rkey"] < cm["base"] + 144)
+    assert expect >= 1 and sum(cm["fine_cells"].values()) == expect, "map counts exactly the lines living in this super-cell"
+    assert all(isinstance(k, int) for k in cm["fine_cells"]), "map is addresses only — no content"
     # living memory bridge (dry run — no db write in demo)
     append("opencode", "chat", "DECISION: pool stays file-first, server optional")
     lifted = memory_bridge(dry_run=True)
@@ -465,7 +578,7 @@ def demo():
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
-    assert len(json.load(open(ep1, encoding="utf-8"))) == 5, "emit 5 lines (4 chat + 1 DM)"
+    assert len(json.load(open(ep1, encoding="utf-8"))) == 8, "emit 8 lines (4 chat incl DM + 1 code + 3 bonds)"
     assert flush_emit() is None, "emit skips when unchanged"
     append("codex", "chat", "third msg")
     ep3 = flush_emit()
@@ -478,12 +591,12 @@ def demo():
                 os.replace(APPS + ".demo-bak", APPS)  # restore real registry
             else:
                 os.remove(p)
-    print("POOL-SELFCHECK: 21/21 PASS")
+    print("POOL-SELFCHECK: 30/30 PASS")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "demo":
-        demo()  # wipes LOG+STATE: test only, never scheduled
+        demo()  # self-check in a temp dir: the real log is untouchable
     elif len(sys.argv) > 1 and sys.argv[1] == "bridge":
         dry = "--dry" in sys.argv
         lifted = memory_bridge(dry_run=dry)

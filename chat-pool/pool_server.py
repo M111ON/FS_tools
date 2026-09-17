@@ -464,10 +464,25 @@ class PoolHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "?rkey=<int> required"})
                 return
             with _lock:
+                if qs.get("level", ["0"])[0] == "1":
+                    # L1 coarse read: MAP only (fine-cell addresses + counts)
+                    self._json(200, pool._coarse_map(rk))
+                    return
                 cells = pool.neighbors(rk)
             self._json(200, {"point": rk,
                              "cells": [{"rkey": rk2, "lines": lines}
                                        for rk2, lines in cells]})
+
+        elif parsed.path == "/bonds":
+            # blast-radius read at one point: edges touching a line hash
+            h = qs.get("hash", [""])[0].strip().lower()
+            if not h:
+                self._json(400, {"error": "?hash=<line hash (8+ hex)> required"})
+                return
+            as_app = qs.get("as", [None])[0]
+            with _lock:
+                edges = pool.bonds_for(h, as_app=as_app)
+            self._json(200, {"hash": h, "edges": edges})
 
         elif parsed.path == "/view":
             n = min(int(qs.get("n", ["20"])[0]), 1000)
