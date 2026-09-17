@@ -6,12 +6,14 @@ ponytail: stdlib only, no server, no schema beyond chat+snippet."""
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(DIR, "log.jsonl")
 STATE = os.path.join(DIR, ".flush_state.json")
+APPS = os.path.join(DIR, "apps.json")  # dynamic identity registry
 
 # Exact port of DWGLS core/rdh_capture.h (RDH_CAPTURE_144, S=1).
 # Role: ADDRESS only (routing hint). NOT integrity: walk sees low nibbles
@@ -52,11 +54,81 @@ def _prev():
     return json.loads(last)["hash"]
 
 
+TAG_RE = re.compile(r"@([A-Za-z0-9_\-]+)")
+
+
+def _extract_tags(text):
+    """@mentions in text become notification targets (feed model:
+    everyone may see the post; tagged apps are the ones affected)."""
+    return list(dict.fromkeys(TAG_RE.findall(text)))
+
+
+# ── dynamic identity registry (apps.json) ──────────────────────────
+def _load_apps():
+    if not os.path.exists(APPS):
+        return {}
+    try:
+        return json.load(open(APPS, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_apps(reg):
+    json.dump(reg, open(APPS, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+
+def register_app(name):
+    """First-come registration. Idempotent: re-register touches last_seen.
+    Returns (registered: bool, created: bool)."""
+    if not name or not re.fullmatch(r"[A-Za-z0-9_\-]{1,32}", name):
+        raise ValueError("invalid app name (1-32 chars: a-z 0-9 _ -)")
+    reg = _load_apps()
+    created = name not in reg
+    now = time.time()
+    if created:
+        reg[name] = {"registered_at": now, "last_seen": now, "last_read": 0}
+    else:
+        reg[name]["last_seen"] = now
+    _save_apps(reg)
+    return True, created
+
+
+def is_registered(name):
+    return name in _load_apps()
+
+
+def touch_app(name):
+    reg = _load_apps()
+    if name in reg:
+        reg[name]["last_seen"] = time.time()
+        _save_apps(reg)
+
+
+def list_apps():
+    return _load_apps()
+
+
+def inbox(app, mark_read=True):
+    """Unread messages that affect `app`: @app mentioned, or to==app.
+    Feed model — broadcasts stay visible to everyone on the feed;
+    the inbox is the actionable subset. Marks last_read cursor."""
+    reg = _load_apps()
+    since = reg.get(app, {}).get("last_read", 0)
+    reg.setdefault(app, {})["last_read"] = time.time() if mark_read else reg.get(app, {}).get("last_read", 0)
+    if mark_read:
+        _save_apps(reg)
+    return [m for m in tail(500)
+            if m.get("t", 0) > since
+            and (app in m.get("tags", []) or m.get("to") == app)]
+
+
 def append(app, kind, text, to="all"):
     """Append one message. Thread-safe via threading.Lock;
     process-safe via msvcrt.lock on a .lock file (Windows) or fcntl (Unix).
-    to="all" = broadcast; to="hermes" = only hermes (or an admin view)
-    sees it. `to` is part of the hashed payload — immutable."""
+    Feed model: to="all" (default) posts to the shared feed; to=X also
+    restricts visibility to X (DM). @name in text tags apps — they get
+    the message in their inbox (the actionable effect). tags derive
+    from text, which is inside the hash — immutable."""
     # Atomic: compute prev + body + write under process lock
     lock_path = LOG + ".lock"
     if sys.platform == 'win32':
@@ -68,7 +140,8 @@ def append(app, kind, text, to="all"):
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
             body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
-                    "text": text, "to": to, "prev": prev,
+                    "text": text, "to": to,
+                    "tags": _extract_tags(text), "prev": prev,
                     "rkey": rkey(raw_bytes),
                     "enc": rkey(raw_bytes) % 1440}
             body["hash"] = hashlib.sha256(
@@ -94,7 +167,8 @@ def append(app, kind, text, to="all"):
             prev = _prev()
             raw_bytes = (app + kind + text).encode("utf-8")
             body = {"v": 3, "t": time.time(), "app": app, "kind": kind,
-                    "text": text, "to": to, "prev": prev,
+                    "text": text, "to": to,
+                    "tags": _extract_tags(text), "prev": prev,
                     "rkey": rkey(raw_bytes),
                     "enc": rkey(raw_bytes) % 1440}
             body["hash"] = hashlib.sha256(
@@ -283,17 +357,29 @@ def demo():
     assert all(m["text"] != "secret for hermes" for m in tail(10, as_app="codex")), "codex must not see hermes DM"
     assert tail(10, as_app="hermes")[-1]["text"] == "secret for hermes", "hermes sees own DM"
     assert tail(10, as_app="dashboard")[-1]["text"] == "secret for hermes", "sender sees own DM"
+    # dynamic registry + tags + inbox
+    register_app("hermes"); register_app("codex")
+    assert is_registered("hermes") and not is_registered("ghost"), "registry works"
+    append("dashboard", "chat", "@hermes please run the flush")
+    ib = inbox("hermes", mark_read=False)
+    assert any("run the flush" in m["text"] for m in ib), "mention lands in hermes inbox"
+    assert not any("run the flush" in m["text"] for m in inbox("codex", mark_read=False)), "codex inbox clean"
+    ib2 = inbox("hermes")  # mark read
+    assert inbox("hermes") == [], "inbox drains after read"
     import shutil
     ep1 = flush_emit()
     assert ep1 is not None, "first emit fires"
-    assert len(json.load(open(ep1, encoding="utf-8"))) == 3, "emit 3 lines (2 chat + 1 DM)"
+    assert len(json.load(open(ep1, encoding="utf-8"))) == 4, "emit 4 lines (3 chat + 1 DM)"
     assert flush_emit() is None, "emit skips when unchanged"
     append("codex", "chat", "third msg")
     ep3 = flush_emit()
     assert ep3 is not None, "emit fires on new line"
     assert len(json.load(open(ep3, encoding="utf-8"))) == 1, "emit only new"
     shutil.rmtree(os.path.join(DIR, "outbox"), ignore_errors=True)
-    print("POOL-SELFCHECK: 15/15 PASS")
+    for p in (APPS,):
+        if os.path.exists(p):
+            os.remove(p)
+    print("POOL-SELFCHECK: 19/19 PASS")
 
 
 if __name__ == "__main__":

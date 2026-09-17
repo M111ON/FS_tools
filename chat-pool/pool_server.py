@@ -106,6 +106,10 @@ button.send:hover{filter:brightness(1.1)}
     <section>
       <h2>View as</h2>
       <div class="apps" id="identities"></div>
+      <div id="inboxbox" style="margin-top:9px;display:none">
+        <h2>Inbox (<span id="ib-count">0</span>)</h2>
+        <div id="ib-list" style="font:11px var(--mono);color:var(--dim);max-height:180px;overflow-y:auto;white-space:pre-wrap"></div>
+      </div>
     </section>
     <section>
       <h2>Status</h2>
@@ -130,7 +134,7 @@ button.send:hover{filter:brightness(1.1)}
 <div class="toast" id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);
-let msgs=[], filterQ='', filterApps=new Set(), identity='admin';
+let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
@@ -161,7 +165,17 @@ function render(){
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
 }
-window.setIdentity=a=>{identity=a;refresh()};
+window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
+
+async function loadInbox(mark){
+  if(identity==='admin'){$('#inboxbox').style.display='none';return}
+  $('#inboxbox').style.display='block';
+  const r=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':'')).then(r=>r.json());
+  if(r.error){$('#ib-list').textContent='⚠ '+r.error;$('#ib-count').textContent='?';return}
+  myInbox=r;
+  $('#ib-count').textContent=r.length;
+  $('#ib-list').innerHTML=r.length?r.map(m=>`[${fmt(m.t)}] ${esc(m.app)}: ${esc(m.text).slice(0,90)}`).join('\n'):'(ว่าง — ไม่มี mention/DM ใหม่)';
+}
 window.toggleApp=a=>{filterApps.has(a)?filterApps.delete(a):filterApps.add(a);render()};
 window.toast=t=>{const el=$('#toast');el.textContent=t;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
 
@@ -176,6 +190,12 @@ async function send(){
   el.value='';el.style.height='38px';
   const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:'dashboard',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
   if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
+}
+
+async function registerIdentity(){
+  if(identity==='admin')return;
+  const r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:identity})}).then(r=>r.json());
+  if(r.error)toast('register fail: '+r.error);else toast(r.created?('registered '+identity):identity+' ok');
 }
 $('#send').onclick=send;
 $('#msg-in').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
@@ -197,6 +217,8 @@ async function refresh(){
 }
 setInterval(()=>$('#clock').textContent=new Date().toLocaleTimeString('th-TH'),1000);
 refresh();
+loadInbox();
+setInterval(()=>{if(identity!=='admin')loadInbox(false)},8000);
 // SSE live
 function listen(){
   const as=identity==='admin'?'':'&as='+identity;
@@ -248,6 +270,20 @@ class PoolHandler(BaseHTTPRequestHandler):
                 msgs = pool.tail(n, as_app=as_app)
             self._json(200, msgs)
 
+        elif parsed.path == "/inbox":
+            app = qs.get("app", [""])[0]
+            mark = qs.get("mark", ["1"])[0] != "0"
+            if not app:
+                self._json(400, {"error": "?app= required"})
+                return
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first"})
+                return
+            pool.touch_app(app)
+            with _lock:
+                msgs = pool.inbox(app, mark_read=mark)
+            self._json(200, msgs)
+
         elif parsed.path == "/view":
             n = min(int(qs.get("n", ["20"])[0]), 1000)
             cloud = qs.get("cloud", ["0"])[0] == "1"
@@ -289,10 +325,24 @@ class PoolHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/append":
+        if parsed.path == "/register":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            name = body.get("app", "")
+            try:
+                ok, created = pool.register_app(name)
+                self._json(200, {"ok": ok, "created": created,
+                                 "apps": sorted(pool.list_apps())})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+        elif parsed.path == "/append":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
             app = body.get("app", "?")
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first",
+                                 "howto": {"method": "POST", "url": "/register", "body": {"app": app}}})
+                return
             kind = body.get("kind", "chat")
             text = body.get("text", "")
             to = body.get("to", "all")
@@ -301,7 +351,8 @@ class PoolHandler(BaseHTTPRequestHandler):
                 return
             with _lock:
                 result = pool.append(app, kind, text, to=to)
-            self._json(200, {"ok": True, "hash": result["hash"]})
+            self._json(200, {"ok": True, "hash": result["hash"],
+                             "tags": result.get("tags", [])})
         elif parsed.path == "/flush":
             path = pool.flush_emit()
             pushed, failed = pool.push_outbox()
@@ -344,7 +395,9 @@ def main():
     print(f"pool-server listening on http://0.0.0.0:{PORT}")
     print(f"  log: {pool.LOG}")
     print(f"  UI : http://localhost:{PORT}/   (dashboard)")
-    print(f"  POST /append   {{app, kind, text}}")
+    print(f"  POST /register  {{app}}            (first-time identity)")
+    print(f"  POST /append    {{app, kind, text, to?, }}  @name in text = tag")
+    print(f"  GET  /inbox?app=X        (unread mentions+DMs, marks read; mark=0 peek)")
     print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
     print(f"  POST /flush   (emit + push now)")
     try:
