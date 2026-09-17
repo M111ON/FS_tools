@@ -37,7 +37,10 @@ def _get_token():
 
 
 def _lan_ips():
-    """Real LAN addresses (skip loopback + RFC1918 172.16/12 virtuals)."""
+    """Real LAN addresses (skip loopback + RFC1918 172.16/12 virtuals).
+    getaddrinfo(hostname) alone returns stale/wrong-order entries on
+    multi-adapter boxes — cross-check with a UDP connect to the LAN
+    gateway side and prefer the adapter the default route actually uses."""
     import socket
     ips = set()
     try:
@@ -48,6 +51,14 @@ def _lan_ips():
             if ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31:
                 continue  # WSL/Hyper-V virtual adapters
             ips.add(ip)
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.168.1.1", 80))  # home gateway — picks the live route
+        ips.discard(s.getsockname()[0])
+        ips = {s.getsockname()[0]} | ips
+        s.close()
     except Exception:
         pass
     return sorted(ips)
