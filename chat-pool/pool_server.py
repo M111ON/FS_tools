@@ -89,10 +89,13 @@ def _qr_panel():
     if not ips:
         return ""
     links = "".join(
-        f"<div style='margin:4px 0'><a href='http://{ip}:{PORT}' "
+        f"<div style='margin:4px 0'><a href='http://{ip}:{PORT}/?token={tok}' "
         f"style='color:var(--acc2);font:11px var(--mono)'>http://{ip}:{PORT}</a></div>"
         for ip in ips)
-    qr = _qr_svg(f"http://{ips[0]}:{PORT}/#token={tok}")
+    # token as a query param, not a #fragment: many QR scanners (LINE,
+    # some phone cameras) drop the fragment, and the fragment is also
+    # invisible to the server — a query param survives both
+    qr = _qr_svg(f"http://{ips[0]}:{PORT}/?token={tok}")
     hint = ("<div style='font:10px var(--mono);color:var(--dim);padding-top:4px'>"
             "สแกนแล้วเบราว์เซอร์จะเก็บ token ให้อัตโนมัติ</div>")
     return ("<div style='display:flex;gap:10px;align-items:flex-start;padding-top:6px'>"
@@ -104,6 +107,8 @@ DASHBOARD = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>chat-pool</title>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <style>
 :root{
   --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#2d333b;
@@ -220,7 +225,7 @@ button.send:hover{filter:brightness(1.1)}
 const $=s=>document.querySelector(s);
 let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
 // LAN access: token prompt (localhost skips auth server-side, this is harmless there)
-const TOKEN=(()=>{const m=location.hash.match(/token=([0-9a-f]+)/);if(m){localStorage.setItem('pool_token',m[1]);history.replaceState(null,'',location.pathname);return m[1]}return localStorage.getItem('pool_token')||''})();
+const TOKEN=(()=>{const m=location.hash.match(/token=([0-9a-f]+)/);const q=new URLSearchParams(location.search).get('token');const t=m?m[1]:q;if(t){localStorage.setItem('pool_token',t);history.replaceState(null,'',location.pathname)}return t||localStorage.getItem('pool_token')||''})();
 const H=TOKEN?{'Authorization':'Bearer '+TOKEN}:{'x-noauth':'1'};
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -317,10 +322,20 @@ async function refresh(){
   el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
 }
 setInterval(()=>$('#clock').textContent=new Date().toLocaleTimeString('th-TH'),1000);
-refresh();
-loadInbox();
-setInterval(()=>{if(identity!=='admin')loadInbox(false)},8000);
-// SSE live
+async function refresh(){
+  const as=identity==='admin'?'':'&as='+identity;
+  const [tail,h]=await Promise.all([
+    fetch('/tail?n=200'+as,{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
+    fetch('/view?n=500'+as,{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()})
+  ]).catch(()=>{document.getElementById('qrpanel')?.style.setProperty('display','block');throw 'auth'});
+  document.getElementById('qrpanel')?.style.setProperty('display','none');
+  msgs=tail;
+  render();
+  const links=Math.max(h.hashes.length-1,0);
+  const el=$('#chain');
+  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
+  el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
+}
 function listen(){
   const as=identity==='admin'?'':'&as='+identity;
   const es=new EventSource('/stream?n=200'+as+(TOKEN?'&token='+TOKEN:''));
@@ -355,6 +370,7 @@ class PoolHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -373,14 +389,18 @@ class PoolHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/" or parsed.path == "/index.html":
             body = DASHBOARD.encode("utf-8")
-            # LAN visitors who scanned a token-less link: the JS fetches
-            # will 401 → user opens /qr (server screen) to get a token.
+            # LAN visitors: JS hides the QR panel once auth succeeds; it
+            # stays visible when the token is missing/rejected.
             if self.client_address[0] not in ("127.0.0.1", "::1"):
-                body = body.replace(b"</body>",
-                                    (_qr_panel() + "</body>").encode("utf-8"))
+                body = body.replace(
+                    b"</body>",
+                    ("<div id='qrpanel' style='display:none;margin:12px 18px;padding:12px;border:1px solid var(--warn);border-radius:10px'>"
+                     + "<div style='font:12px var(--mono);color:var(--warn);margin-bottom:6px'>⚠ token ไม่ถูกต้อง — สแกน QR นี้จากมือถือ (token ฝังใน QR)</div>"
+                     + _qr_panel() + "</div></body>").encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
