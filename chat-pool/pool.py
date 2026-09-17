@@ -426,6 +426,10 @@ def demo():
     for p in (LOG, STATE, LOG + ".lock"):
         if os.path.exists(p):
             os.remove(p)
+    if os.path.exists(APPS):
+        # keep the real registry — back it up and restore after the demo
+        import shutil
+        shutil.copy(APPS, APPS + ".demo-bak")
     append("opencode", "chat", "hello pool")
     append("hermes", "code", "print(1+1)")
     assert len(tail(5)) == 2, "tail must see both apps"
@@ -468,9 +472,12 @@ def demo():
     assert ep3 is not None, "emit fires on new line"
     assert len(json.load(open(ep3, encoding="utf-8"))) == 1, "emit only new"
     shutil.rmtree(os.path.join(DIR, "outbox"), ignore_errors=True)
-    for p in (APPS, BRIDGE_STATE):
+    for p in (BRIDGE_STATE, APPS):
         if os.path.exists(p):
-            os.remove(p)
+            if p == APPS and os.path.exists(APPS + ".demo-bak"):
+                os.replace(APPS + ".demo-bak", APPS)  # restore real registry
+            else:
+                os.remove(p)
     print("POOL-SELFCHECK: 21/21 PASS")
 
 
