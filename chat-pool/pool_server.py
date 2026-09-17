@@ -172,6 +172,9 @@ button.send:hover{filter:brightness(1.1)}
 #plane-modal.open{display:flex}
 #plane-box{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:min(1080px,100%);height:min(780px,100%);display:flex;flex-direction:column;overflow:hidden}
 #plane-head{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#plane-bar{display:flex;align-items:center;gap:12px;padding:8px 15px;border-bottom:1px solid var(--line);font:10px var(--mono);color:var(--dim);flex-wrap:wrap}
+#pv-seq{flex:1;min-width:150px;accent-color:var(--acc)}
+#pv-when{min-width:220px}
 #plane-body{flex:1;display:flex;min-height:0}
 #plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:auto}
 #plane-cv{background:var(--bg);border:1px solid var(--line);border-radius:8px;cursor:crosshair;image-rendering:pixelated}
@@ -257,12 +260,19 @@ button.send:hover{filter:brightness(1.1)}
         <button class="pbtn" id="plane-close">ปิด ✕</button>
       </span>
     </div>
+    <div id="plane-bar">
+      <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> bonds</label>
+      <span id="pv-when">ทุกบรรทัด</span>
+      <input type="range" id="pv-seq" min="0" max="0" value="0">
+      <button class="pbtn" id="pv-play">▶ replay</button>
+      <button class="pbtn" id="pv-last">ล่าสุด</button>
+    </div>
     <div id="plane-body">
       <div id="plane-canvaswrap">
         <canvas id="plane-cv"></canvas>
         <div id="plane-tip"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)</span></div></div>
+      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นส้ม = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span></div></div>
     </div>
   </div>
 </div>
@@ -411,26 +421,50 @@ listen();
    explicit read (cell → sub-cell → sub-sub-cell), and L1/L2 are just
    later reads at a coarser point — nothing here is cached state. */
 const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
-          budget:64,over:[],sights:[],lines:null,stacked:null,timer:null};
+          budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
+          bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null};
 const pcv=$('#plane-cv');
 const pstep=()=>PV.n===144?3:36;
 
+// the plane at tick S: every line whose append ordinal is <= S, counted
+// straight from the log's own order — no wall clock is consulted anywhere
+function pvCellsUpTo(S){
+  const c={};
+  for(let i=0;i<PV.timeline.length&&i<=S;i++){
+    const rk=PV.timeline[i][2];
+    if(rk!=null)c[rk]=(c[rk]||0)+1;
+  }
+  return c;
+}
+function pvLiveBonds(){
+  if(PV.seq===null)return PV.bonds;
+  return PV.bonds.filter(b=>b.seq==null||b.seq<=PV.seq);   // an edge exists only after its line
+}
 function pvDerive(){
-  if(PV.mode==='plane'){PV.n=144;PV.cells=PV.plane;return}
+  const full=PV.seq===null||PV.seq>=PV.seqMax-1;
+  const src=full?PV.plane:pvCellsUpTo(PV.seq);
+  PV.over=Object.keys(src).filter(k=>src[k]>PV.budget).map(Number);
+  if(PV.mode==='plane'){PV.n=144;PV.cells=src;return}
   if(PV.mode==='blocks'){
     PV.n=12;const agg={};
-    for(const k in PV.plane){
+    for(const k in src){
       const rk=+k,bx=Math.floor((rk%144)/12),by=Math.floor(rk/144/12),key=by*12+bx;
-      agg[key]=(agg[key]||0)+PV.plane[k];
+      agg[key]=(agg[key]||0)+src[k];
     }
     PV.cells=agg;return;
   }
   const bw=PV.origin.wedge,br=PV.origin.ring;PV.n=12;const c={};
-  for(const k in PV.plane){
+  for(const k in src){
     const rk=+k,w=rk%144,r=Math.floor(rk/144);
-    if(w>=bw&&w<bw+12&&r>=br&&r<br+12)c[rk]=PV.plane[k];
+    if(w>=bw&&w<bw+12&&r>=br&&r<br+12)c[rk]=src[k];
   }
   PV.cells=c;
+}
+function pvCenter(rk){
+  const [x,y]=pvXY(rk);
+  if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+  const step=pstep();
+  return[x*step+step/2,y*step+step/2];
 }
 function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
@@ -452,12 +486,28 @@ function pvDraw(){
   for(const k in PV.cells){
     const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
     c.fillStyle='rgba(126,231,135,'+(0.22+0.78*(PV.cells[k]/max)).toFixed(2)+')';
-    c.fillRect(x*step,y*step,step,step);
+    // at plane scale one cell is ~3px, so a single line is nearly invisible;
+    // every occupied cell gets a floor of 2px so the map is actually readable
+    const w=Math.max(step,2),o=(w-step)/2;
+    c.fillRect(x*step-o,y*step-o,w,w);
   }
   PV.sights.forEach(s=>{                    // declared reads (data, not state)
     const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
     c.strokeStyle='#79c0ff';c.lineWidth=1;c.strokeRect(x*step+.5,y*step+.5,step-1,step-1);
   });
+  // edges are drawn from the addresses of their two ends — a bond line
+  // carries the meaning, the plane only shows where both ends sit
+  if(PV.showBonds){
+    pvLiveBonds().forEach(b=>{
+      const a=pvCenter(b.src_rkey),z=pvCenter(b.dst_rkey);
+      if(!a||!z)return;                       // only edges fully inside this view
+      const hot=PV.sel!=null&&(b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
+      c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,.5)';
+      c.lineWidth=hot?2:1;
+      c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(z[0],z[1]);c.stroke();
+      if(step>6||hot)[a,z].forEach(p=>{c.fillStyle=hot?'#ffa657':'#79c0ff';c.beginPath();c.arc(p[0],p[1],hot?2.5:1.8,0,7);c.fill()});
+    });
+  }
   if(PV.sel!=null){
     const [x,y]=pvXY(PV.sel);
     if(x>=0&&y>=0&&x<n&&y<n){c.strokeStyle='#ffa657';c.lineWidth=2;c.strokeRect(x*step+1,y*step+1,step-2,step-2)}
@@ -470,10 +520,11 @@ function pvCellAt(ev){
   return[x,y,pvRkeyAt(x,y)];
 }
 function pvInfo(){
-  const tot=Object.values(PV.plane).reduce((a,b)=>a+b,0);
-  $('#plane-info').textContent='• เซลล์ '+Object.keys(PV.plane).length+'/'+20736+' · '+tot+' lines'
+  const src=(PV.seq===null||PV.seq>=PV.seqMax-1)?PV.plane:pvCellsUpTo(PV.seq);
+  const tot=Object.values(src).reduce((a,b)=>a+b,0);
+  $('#plane-info').textContent='• เซลล์ '+Object.keys(src).length+'/'+20736+' · '+tot+' lines'
     +' · budget '+PV.budget+(PV.over.length?' · ต้องแตกชั้น '+PV.over.length+' เซลล์':'')
-    +' · sightings '+PV.sights.length;
+    +' · edges '+pvLiveBonds().length+' · sightings '+PV.sights.length;
 }
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
@@ -483,14 +534,29 @@ function pvMode(){
 }
 async function loadPlane(){
   try{
-    const [d,s]=await Promise.all([
+    const [d,s,b,t]=await Promise.all([
       fetch('/neighbors?rkey=0&level=2',{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
-      fetch('/pointers',{headers:H}).then(r=>r.json())
+      fetch('/pointers',{headers:H}).then(r=>r.json()),
+      fetch('/bonds',{headers:H}).then(r=>r.json()),
+      fetch('/plane/timeline',{headers:H}).then(r=>r.json())
     ]);
-    PV.plane=d.fine_cells||{};PV.budget=d.budget||64;PV.over=d.over_budget||[];
+    PV.plane=d.fine_cells||{};PV.budget=d.budget||64;
     PV.sights=s.pointers||[];
-    pvMode();
+    PV.timeline=t.lines||[];PV.seqMax=t.count||0;
+    // place each edge on the plane and stamp it with the tick of its own line,
+    // so scrubbing back in time hides edges that had not been written yet
+    const seqOf={};PV.timeline.forEach(r=>{seqOf[r[4]]=r[0]});
+    PV.bonds=(b.edges||[]).map(e=>({...e,seq:seqOf[e.hash.slice(0,8)]}));
+    const sl=$('#pv-seq');sl.max=Math.max(PV.seqMax-1,0);
+    if(PV.seq===null)sl.value=sl.max;
+    pvMode();pvWhen();
   }catch(e){$('#plane-info').textContent='โหลดระนาบไม่ได้ ('+e+')'}
+}
+function pvWhen(){
+  const S=PV.seq===null?PV.seqMax-1:PV.seq;
+  const row=PV.timeline[S];
+  $('#pv-when').textContent=(PV.seq===null?'ทุกบรรทัด':('tick '+S+'/'+Math.max(PV.seqMax-1,0)))
+    +(row?(' · '+fmt(row[1])+' · '+row[3]):'');
 }
 async function pvZoomBlock(rk){
   const d=await fetch('/neighbors?rkey='+rk+'&level=1',{headers:H}).then(r=>r.json());
@@ -526,6 +592,17 @@ function pvDetail(){
       h+='<div data-sub="'+i+'" title="sub '+i+' · '+v+' line(s)" style="background:'+bg+'"></div>';
     }
     h+='</div>';
+  }
+  const mine=PV.bonds.filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
+  if(mine.length){
+    h+='<div style="color:var(--acc2);margin-top:8px">bonds ที่แตะจุดนี้ ('+mine.length+') — คลิกปลายทางเพื่อเดินต่อ</div>';
+    h+=mine.map(b=>{
+      const out=b.src_rkey===PV.sel,other=out?b.dst8:b.src8,ork=out?b.dst_rkey:b.src_rkey;
+      return '<div class="pline" style="border-color:var(--acc2)"><span class="badge">'+esc(b.app||'?')
+        +'</span> '+(out?'→':'←')+' <b style="color:var(--acc2)">'+esc(b.rel)+'</b> '
+        +'<span class="ph" title="walk ไปปลายอีกด้าน" onclick="openPoint('+(ork==null?'null':ork)+')">'
+        +other+(ork==null?' (ไม่เห็นปลายทาง)':'')+'</span></div>';
+    }).join('');
   }
   const ls=d.lines||[];
   h+=ls.length?ls.slice(0,40).map(m=>'<div class="pline"><span class="badge">'+esc(m.app||'?')
@@ -575,6 +652,31 @@ $('#pv-blocks').onclick=()=>{PV.mode='blocks';pvMode()};
 $('#pv-block').onclick=()=>{
   if(PV.sel==null||!PV.plane[PV.sel]){toast('เลือกจุดบนระนาบก่อน');return}
   pvZoomBlock(PV.sel);
+};
+$('#pv-bonds').onchange=e=>{PV.showBonds=e.target.checked;pvDraw()};
+$('#pv-seq').oninput=e=>{
+  clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';
+  PV.seq=+e.target.value;
+  if(PV.seq>=PV.seqMax-1)PV.seq=null;      // pinned at the end = live plane
+  pvDerive();pvDraw();pvInfo();pvWhen();
+};
+$('#pv-last').onclick=()=>{
+  PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;
+  pvDerive();pvDraw();pvInfo();pvWhen();
+};
+$('#pv-play').onclick=()=>{
+  if(PV.playing){clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';return}
+  $('#pv-play').textContent='⏸ หยุด';
+  PV.seq=0;$('#pv-seq').value=0;
+  PV.playing=setInterval(()=>{
+    if(PV.seq===null||PV.seq>=PV.seqMax-1){
+      clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';
+      PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;pvDerive();pvDraw();pvInfo();pvWhen();
+      return;
+    }
+    PV.seq++;$('#pv-seq').value=PV.seq;
+    pvDerive();pvDraw();pvInfo();pvWhen();
+  },Math.max(60,Math.round(2400/Math.max(PV.seqMax,1))));
 };
 
 // boot: initial pull for chain/registry/inbox — SSE only carries new lines,
@@ -731,15 +833,24 @@ class PoolHandler(BaseHTTPRequestHandler):
             self._json(200, {"point": rk, "level": lv, "pointers": seen})
 
         elif parsed.path == "/bonds":
-            # blast-radius read at one point: edges touching a line hash
+            # blast-radius read at one point: edges touching a line hash.
+            # No ?hash= = every live edge, each end already placed in its cell
+            # (that is what lets the plane draw the whole graph in one read).
+            as_app = qs.get("as", [None])[0]
             h = qs.get("hash", [""])[0].strip().lower()
-            if not h:
-                self._json(400, {"error": "?hash=<line hash (8+ hex)> required"})
-                return
+            with _lock:
+                if h:
+                    self._json(200, {"hash": h, "edges": pool.bonds_for(h, as_app=as_app)})
+                    return
+                edges = pool.all_bonds(as_app=as_app)
+            self._json(200, {"hash": None, "count": len(edges), "edges": edges})
+
+        elif parsed.path == "/plane/timeline":
+            # the plane's own tick: append-order ordinals, not wall clock,
+            # so scrubbing to a tick replays the same plane every time
             as_app = qs.get("as", [None])[0]
             with _lock:
-                edges = pool.bonds_for(h, as_app=as_app)
-            self._json(200, {"hash": h, "edges": edges})
+                self._json(200, pool.timeline(as_app=as_app))
 
         elif parsed.path == "/ctx" or parsed.path.startswith("/ctx/"):
             # BREATHING_SPEC §4 ทาง A — the same pointer read, pointed at

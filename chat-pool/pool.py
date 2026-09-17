@@ -494,6 +494,44 @@ def _in_block(rk, wedge0, ring0, block=12):
             and ring0 <= rk // 144 < ring0 + block)
 
 
+def all_bonds(as_app=None):
+    """Every live edge in one read — same tombstone rule as bonds_for, but
+    with both ends resolved to the rkey they sit in, so a caller can draw
+    the edge on the plane without a second lookup. Addresses are not
+    content, so edges are not visibility-filtered (same rule as maps)."""
+    lines = tail(1000, as_app=as_app)
+    where = {m["hash"]: m.get("rkey") for m in lines if m.get("hash")}
+    hidden = set()
+    for m in lines:
+        p = (m.get("text") or "").split()
+        if m.get("kind") == "bond" and len(p) == 3 and p[1] == "unbinds" and p[0] == p[2]:
+            hidden.add(p[0])
+    out = []
+    for m in lines:
+        if m.get("kind") != "bond" or m["hash"] in hidden:
+            continue
+        p = (m.get("text") or "").split()
+        if len(p) != 3 or p[1] == "unbinds":
+            continue
+        out.append({"hash": m["hash"], "src": p[0], "rel": p[1], "dst": p[2],
+                    "src8": p[0][:8], "dst8": p[2][:8], "app": m.get("app"),
+                    "t": m.get("t"), "src_rkey": where.get(p[0]),
+                    "dst_rkey": where.get(p[2])})
+    return out
+
+
+def timeline(as_app=None):
+    """The plane's own tick: `seq` is a line's ordinal in append order,
+    never wall clock — so replaying a tick gives exactly the same plane
+    (iron law 7). `t` rides along only as a human-readable label.
+    Ordinals are counted inside the reader's own view."""
+    lines = tail(1000, as_app=as_app)
+    return {"unit": "seq", "count": len(lines),
+            "lines": [[i, m.get("t"), m.get("rkey"), m.get("kind"),
+                       (m.get("hash") or "")[:8]]
+                      for i, m in enumerate(lines)]}
+
+
 def _coarse_map(rkey0, block=12):
     """L1 vision at one point: the containing 12x12 SPATIAL super-cell.
     Answers with a MAP ONLY — fine-cell addresses that hold lines, each
@@ -747,6 +785,18 @@ def _demo_body():
     assert expect >= 1 and sum(cm["fine_cells"].values()) == expect, "map counts exactly the lines in this super-cell"
     assert all(_in_block(k, bw, br) for k in cm["fine_cells"]), "every address in the map lies inside the square"
     assert all(isinstance(k, int) for k in cm["fine_cells"]), "map is addresses only — no content"
+    # bonds + timeline as plane data: every edge places both ends itself
+    edges = all_bonds()
+    assert len(edges) == 1 and edges[0]["rel"] == "produces", "all_bonds gives every live edge"
+    src_line = next(m for m in tail(1000) if m["hash"] == edges[0]["src"])
+    assert edges[0]["src_rkey"] == src_line["rkey"], "edge resolves src to the rkey it lives in"
+    assert edges[0]["dst_rkey"] == next(m for m in tail(1000) if m["hash"] == edges[0]["dst"])["rkey"], "edge resolves dst too — both ends place themselves"
+    assert edges[0]["dst8"] == edges[0]["dst"][:8] and len(edges[0]["dst"]) == 64, "edge carries short hashes for display"
+    tl = timeline()
+    assert tl["unit"] == "seq" and tl["count"] == len(tail(1000)), "timeline counts every line the reader can see"
+    assert [r[0] for r in tl["lines"]] == list(range(tl["count"])), "ticks are dense ordinals in append order"
+    assert tl["lines"][-1][2] == tail(1)[0]["rkey"], "the last tick is the newest line"
+    assert tl["lines"][-1][4] == tail(1)[0]["hash"][:8], "each tick carries its line's short hash"
     # living memory bridge (dry run — no db write in demo)
     append("opencode", "chat", "DECISION: pool stays file-first, server optional")
     lifted = memory_bridge(dry_run=True)

@@ -148,7 +148,10 @@ materialized view ที่สร้างใหม่ได้จาก log —
    - ความจุต่อเซลล์ = 144^d × VISION_BUDGET → d=1 = 9,216 lines, d=2 = 1.33M
    - อ่านทางเดียว: `pool.open_pointer(rkey, level=0|1|2)` /
      `GET /neighbors?rkey=&level=0|1|2` (เกิน budget = มาพร้อม `stacked` เอง)
-   - **map = address ล้วน = visibility-neutral** (ไม่มีความลับในแผนที่) จึงไม่ต้อง
+   - **เวลา = ลำดับการเขียน (`seq`) ไม่ใช่ wall clock** — ระนาบที่ tick หนึ่งสร้างจาก
+  การนับ line ตามลำดับ append เท่านั้น (กฎเหล็กข้อ 7) กด scrub กลับไปที่ tick เดิม
+  ได้ระนาบเดิมทุกครั้ง · `t` ถูกส่งไปด้วยเพื่อ"อ่านให้คนดู"เท่านั้น ไม่ใช่ตัวคำนวณ
+- **map = address ล้วน = visibility-neutral** (ไม่มีความลับในแผนที่) จึงไม่ต้อง
      กรอง `as_app`; เฉพาะเนื้อหา L0 ที่ต้องกรอง
 
 ## 6. ตัวอย่างการอ่านแบบ pointer (จากโค้ดจริงวันนี้)
@@ -167,6 +170,8 @@ pool.open_pointer(r0, level=1, app="codex", record=True)  # + ประกาศ
 pool.pointers_at(r0)                                      # ใครอ่านจุดนี้ล่าสุด
 pool.sub_map(r0, depth=1)                                 # แตกเซลล์ที่แน่นเกิน
 pool.open_pointer(r0, level=0, path=(1, 42))               # เดินลงทีละแกน ไม่กระโดดชั้น
+pool.all_bonds()                  # ทุก edge พร้อม rkey ของทั้งสองปลาย (วาดบนระนาบได้เลย)
+pool.timeline()                   # tick = ลำดับการเขียน (seq) — ไม่ใช่ wall clock
 
 # bond: edge คือ line
 h1, h2 = pool.tail(2)[0]["hash"], pool.tail(1)[0]["hash"]
@@ -194,7 +199,12 @@ pool.unbind(bond_hash)                       # tombstone — ของเดิ�
 - **แก้ L1**: เดิมนับ 144 address ติดกันเป็น "บล็อก 12×12" ซึ่งไม่ใช่สี่เหลี่ยมจริง
   (พาดข้ามแถว) — เจอตอนวาด heatmap แล้วแก้เป็นสี่เหลี่ยม (wedge, ring) + เทสต์กันไว้
   (บทเรียนเดียวกับตอน demo ลบ log: ของที่ดู "น่าจะถูก" ต้องมีเทสต์จับ)
-- heatmap ยืนยันจากหน้าเว็บจริง: 27 เซลล์/28 lines บนระนาบ · คลิกช่อง = pointer ใหม่
+- heatmap ยืนยันจากหน้าเว็บจริง: 28 เซลล์/29 lines บนระนาบ · คลิกช่อง = pointer ใหม่
   · ซูม L1 block ได้ · sub-grid 144 ช่อง + เจาะลงชั้นได้ (`path` ถูกส่งจริง)
+- **bonds บนระนาบ**: edge 1 เส้น (`6755d917 —produces→ 1e39b4ed`) วาดจาก rkey 19450 ไป
+  446 · เลือกจุดไหน = edge ที่แตะจุดนั้นเปลี่ยนเป็นสีส้ม + คลิกปลายทางเดินต่อได้ (walk จริง)
+- **scrubber (tick)**: ลากไป tick 10 → ระนาบเหลือ 11 lines และ **edge หายไป**
+  (bond ถูกเขียนที่ tick 22) · tick 25 → edge กลับมา · กด replay แล้วจบที่ 29/29
+  · ระนาบที่คำนวณจาก timeline ตรงกับ map ที่ server ตอบเป๊ะ (cross-check แล้ว)
 - 2026-09-17: crashed demo เคยลบ log จริง → กู้จาก pool.db chunk + re-append ที่รู้เนื้อหา,
   demo ถูก isolation ใน temp dir ตั้งแต่นั้น (ของจริงแตะไม่ได้แม้ demo พัง)
