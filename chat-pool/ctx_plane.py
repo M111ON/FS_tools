@@ -228,6 +228,55 @@ def _sub_map(rkey0, depth, path=(), index=INDEX, src=CTX, budget=None):
             "sub_cells": dict(sorted(cells.items()))}
 
 
+def links(src=CTX, lines=None):
+    """Cross-system edges between the log and the memory plane — DERIVED,
+    not new data. The memory bridge already writes a lifted line as
+    "[chat-pool/<app>] <text>", so a memory row and the chat line it came
+    from are the two ends of one real relationship. Nothing anywhere says
+    so; it is recomputed from the same convention the bridge writes, which
+    means no schema change and no new line kind.
+
+    Both ends land in the SAME 144x144 plane, so an edge that crosses from
+    chat into memory is just an edge — the radius walk crosses systems for
+    free. `lines` overrides the log read (tests pass their own)."""
+    db = _ro(src)
+    try:
+        rows = db.execute(
+            "SELECT rowid, content FROM %s WHERE content LIKE ?"
+            % TABLE, ("[chat-pool/%",)).fetchall()
+    finally:
+        db.close()
+    by_content = {content: rid for rid, content in rows}
+    out = []
+    for m in (pool.tail(1000) if lines is None else lines):
+        text = (m.get("text") or "").strip()
+        if not pool.BRIDGE_RE.match(text):     # only what the bridge would lift
+            continue
+        content = "[chat-pool/%s] %s" % (m.get("app", "?"), text)
+        rid = by_content.get(content)
+        if rid is None:                        # not lifted yet (flush pending)
+            continue
+        out.append({"kind": "lifted", "src": m["hash"], "src8": m["hash"][:8],
+                    "src_rkey": m.get("rkey"), "dst_rowid": rid,
+                    "dst_rkey": pool.rkey(content.encode("utf-8")),
+                    "app": m.get("app"), "t": m.get("t")})
+    return out
+
+
+def cross_stats(src=CTX, index=INDEX):
+    """What the two planes actually share: cells held by both systems."""
+    idb = sqlite3.connect(index)
+    try:
+        mem_cells = {r[0] for r in idb.execute("SELECT DISTINCT rkey FROM rows")}
+    finally:
+        idb.close()
+    pool_cells = {m["rkey"] for m in pool.tail(1000) if m.get("rkey") is not None}
+    return {"memory_cells": len(mem_cells), "pool_cells": len(pool_cells),
+            "shared_cells": sorted(mem_cells & pool_cells),
+            "shared_count": len(mem_cells & pool_cells),
+            "links": len(links(src))}
+
+
 def stats(index=INDEX, src=CTX, top=8):
     """How the memories actually land on the shared plane."""
     idb = sqlite3.connect(index)
@@ -324,6 +373,26 @@ def demo():
         assert l2["rows"] == 300, "L2 accounts for every captured row"
         assert all(isinstance(k, int) for k in l2["fine_cells"]), "maps carry addresses, never content"
         assert not any("memory body" in str(v) for v in l2["fine_cells"].values()), "no content crosses a map"
+
+        # cross-system: a lifted memory is one real edge between the two planes.
+        # The demo supplies its own log lines — nothing here may touch the
+        # live log (an earlier draft of this test appended to it; never again).
+        text = "DECISION: fixture decision"
+        fake = {"hash": "a" * 64, "rkey": 777, "app": "tester", "kind": "chat",
+                "text": text, "t": 1}
+        assert not links(src=src, lines=[fake]), "no lift exists yet — the edge is derived, never assumed"
+        db2 = sqlite3.connect(src)
+        db2.execute("INSERT INTO memories(category, content, project_path, created_at)"
+                    " VALUES(?,?,?,?)",
+                    ("DECISION", "[chat-pool/tester] " + text, "p", 1))
+        db2.commit()
+        db2.close()
+        lk = links(src=src, lines=[fake])
+        assert len(lk) == 1, "a bridge-written memory and its chat line are one edge"
+        assert lk[0]["src"] == fake["hash"] and lk[0]["src_rkey"] == 777, "the edge starts at the line that was lifted"
+        assert lk[0]["dst_rkey"] == pool.rkey(("[chat-pool/tester] " + text).encode("utf-8")), "the far end is placed by its own content"
+        assert links(src=src, lines=[{"hash": "b" * 64, "rkey": 1, "app": "tester",
+                                     "kind": "chat", "text": "just chat", "t": 1}]) == [], "only lifted lines form a cross edge"
 
         # stacking: same axis rule as pool, chosen lazily, walked by path
         st = stats(index=idx, src=src)

@@ -265,6 +265,15 @@ button.send:hover{filter:brightness(1.1)}
     </div>
     <div id="plane-bar">
       <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> bonds</label>
+      <label class="clabel"><input type="checkbox" id="pv-ctx" style="accent-color:var(--acc2)"> memory</label>
+      <select id="pv-style" title="วิธีวาด edge" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
+        <option value="auto">อัตโนมัติ (วัดแล้ว)</option>
+        <option value="density">จางตามความแน่น</option>
+        <option value="flat">เส้นตรง</option>
+        <option value="bundle">bundle (คู่เซลล์เดียวกัน)</option>
+        <option value="hub">hub เท่านั้น (top 12)</option>
+        <option value="degree">degree ring (ไม่วาดเส้น)</option>
+      </select>
       <span id="pv-when">ทุกบรรทัด</span>
       <input type="range" id="pv-seq" min="0" max="0" value="0">
       <button class="pbtn" id="pv-play">▶ replay</button>
@@ -283,7 +292,7 @@ button.send:hover{filter:brightness(1.1)}
         <div id="plane-tip"></div>
         <div id="plane-pop"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นส้ม = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span></div></div>
+      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นส้ม = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ จุดฟ้า = memory ของ magic-context · เส้นม่วงประ = edge ข้ามระบบ (บรรทัดที่ถูกยกเข้า memory)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span></div></div>
     </div>
   </div>
 </div>
@@ -433,7 +442,9 @@ listen();
    later reads at a coarser point — nothing here is cached state. */
 const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
-          bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0};
+          bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
+          style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
+          autoAt:120,hubK:12};   // measured: past ~120 edges a full draw is mostly ink
 const pcv=$('#plane-cv');
 const pstep=()=>PV.n===144?3:36;
 
@@ -454,10 +465,15 @@ function pvLiveBonds(){
 // Radius mask: bonds join LINES but the plane only sees CELLS, so a walk
 // happens at cell level and a bond inside one cell is a self-loop.
 // Returns null when the mask is off (= show everything).
+function pvGraphEdges(){
+  let e=pvLiveBonds().map(b=>({...b,kind:'bond'}));
+  if(PV.ctxOn)e=e.concat((PV.crossEdges||[]).filter(x=>x.seq==null||PV.seq===null||x.seq<=PV.seq));
+  return e;                                     // one graph, two systems
+}
 function pvKeep(){
   if(!PV.focus||PV.sel==null)return null;
   const adj={};
-  pvLiveBonds().forEach(b=>{
+  pvGraphEdges().forEach(b=>{
     if(b.src_rkey==null||b.dst_rkey==null)return;
     (adj[b.src_rkey]=adj[b.src_rkey]||[]).push(b.dst_rkey);
     (adj[b.dst_rkey]=adj[b.dst_rkey]||[]).push(b.src_rkey);
@@ -496,6 +512,139 @@ function pvCenter(rk){
   const step=pstep();
   return[x*step+step/2,y*step+step/2];
 }
+function pvDegrees(edges){
+  const d={};
+  edges.forEach(e=>{
+    if(e.src_rkey==null||e.dst_rkey==null)return;
+    d[e.src_rkey]=(d[e.src_rkey]||0)+1;
+    if(e.dst_rkey!==e.src_rkey)d[e.dst_rkey]=(d[e.dst_rkey]||0)+1;
+  });
+  return d;
+}
+// Edges -> strokes. Style decides which strokes exist and how they read, and
+// nothing else, so measuring a style measures the real renderer.
+//   flat    : every edge the same weight
+//   density : alpha falls with the busiest end's degree, so hubs do not blot out
+//   bundle  : one stroke per cell PAIR (width by how many edges share it)
+function pvEdgeStrokes(keep){
+  const step=pstep(),edges=pvGraphEdges();
+  const deg=pvDegrees(edges);   // degree is needed by three of the styles
+  // Above a few hundred edges the plane is mostly ink and no alpha fixes that
+  // (measured: 600 edges cover 67% either way) — so those styles cut STROKES
+  // instead: hub shows only the busiest cells' edges, degree draws no lines at
+  // all and encodes each cell's edge count as a ring.
+  // auto picks from the measurements: every line while that is cheap, the
+  // hub view once a full draw would be mostly ink (constant cost instead)
+  const hubMode=PV.style==='hub'||(PV.style==='auto'&&edges.length>PV.autoAt);
+  if(PV.style==='degree'){
+    const mx=Math.max(1,...Object.values(deg)),out=[];
+    Object.keys(deg).forEach(rk=>{
+      const ctr=pvCenter(+rk);if(!ctr)return;
+      const a=0.15+0.85*Math.sqrt(deg[rk]/mx);
+      out.push({x1:ctr[0],y1:ctr[1],loop:true,radius:step*0.95,width:1,
+                alpha:a,hot:false,step,css:'rgba(121,192,255,'+a.toFixed(3)+')'});
+    });
+    return out;
+  }
+  if(hubMode){
+    const top=Object.keys(deg).map(Number).sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK);
+    const set=new Set(top);
+    return pvEdgeStrokesOf(edges.filter(e=>set.has(e.src_rkey)||set.has(e.dst_rkey)),keep,'density');
+  }
+  if(PV.style==='auto')return pvEdgeStrokesOf(edges,keep,'density');
+  return pvEdgeStrokesOf(edges,keep,PV.style);
+}
+function pvEdgeStrokesOf(edges,keep,style){
+  const step=pstep();
+  const deg=style==='density'?pvDegrees(edges):{};
+  const hot=e=>PV.sel!=null&&(e.src_rkey===PV.sel||e.dst_rkey===PV.sel);
+  const out=[],groups={};
+  const push=(e,a,z,alpha,width)=>{
+    const h=hot(e);
+    out.push({x1:a[0],y1:a[1],x2:z[0],y2:z[1],
+              width:h?Math.max(width,2):width,alpha:h?1:alpha,hot:h,step,
+              loop:a[0]===z[0]&&a[1]===z[1],
+              dash:e.kind==='lifted'?[3,2]:null,
+              css:h?'#ffa657':'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+','+alpha.toFixed(3)+')'});
+  };
+  edges.forEach(e=>{
+    const a=pvCenter(e.src_rkey),z=pvCenter(e.dst_rkey);
+    if(!a||!z)return;                          // only edges fully inside this view
+    let alpha=0.5;
+    if(keep){
+      const s=keep.has(e.src_rkey),d=keep.has(e.dst_rkey);
+      if(!s&&!d)return;
+      if(!s||!d)alpha=0.16;                    // half-way out: hint that it continues
+    }
+    if(style==='bundle'&&e.src_rkey!==e.dst_rkey&&!hot(e)){
+      const k=e.src_rkey<e.dst_rkey?e.src_rkey+':'+e.dst_rkey:e.dst_rkey+':'+e.src_rkey;
+      const g=groups[k]||(groups[k]={e,a,z,n:0,alpha});
+      g.n++;g.alpha=Math.min(g.alpha,alpha);
+      return;
+    }
+    if(style==='density'&&!hot(e))
+      alpha=Math.min(alpha,Math.max(0.08,0.5/Math.sqrt(Math.max(deg[e.src_rkey]||1,deg[e.dst_rkey]||1))));
+    push(e,a,z,alpha,1);
+  });
+  Object.values(groups).forEach(g=>push(g.e,g.a,g.z,Math.min(0.42,g.alpha),1+Math.min(3,Math.log2(g.n))));
+  out.sort((p,q)=>(p.hot?1:0)-(q.hot?1:0));     // the selected cell's edges read last = on top
+  return out;
+}
+function pvStroke(c,s,alphaOverride){
+  c.save();
+  if(s.dash){c.setLineDash(s.dash);c.lineDashOffset=Math.round(s.step*2)}
+  c.strokeStyle=alphaOverride!=null?('rgba(0,0,0,'+alphaOverride+')'):s.css;
+  c.lineWidth=s.width;
+  c.beginPath();
+  if(s.loop)c.arc(s.x1,s.y1,s.radius||(s.step*1.6+2),0,7);   // bond inside ONE cell
+  else{c.moveTo(s.x1,s.y1);c.lineTo(s.x2,s.y2)}
+  c.stroke();
+  if(alphaOverride==null&&(s.step>6||s.width>1)){
+    c.fillStyle=s.css;c.beginPath();c.arc(s.x1,s.y1,1.8,0,7);c.fill();
+  }
+  c.restore();
+}
+function pvMemoryPass(c,step,keep){
+  for(const k in PV.ctxCells){
+    const [x,y]=pvXY(+k);if(x<0||y<0||x>=PV.n||y>=PV.n)continue;
+    const near=!keep||keep.has(+k),m=Math.max(2,Math.round(step*0.45));
+    c.fillStyle='rgba(121,192,255,'+(near?0.9:0.10)+')';
+    c.fillRect(x*step+(step-m)/2,y*step+(step-m)/2,m,m);
+  }
+}
+// Measure the three styles on the real renderer, on a synthetic plane with
+// hubs (what a busy graph actually looks like). Returns strokes + ink = how
+// much of the plane the edges cover, overlap = how many strokes land on the
+// same pixel, hot = share of edge pixels that 3+ edges are fighting over.
+function pvBench(N,hubCount,hubDeg){
+  N=N||200;hubCount=hubCount||8;hubDeg=hubDeg||12;
+  const W=432,rnd=()=>Math.floor(Math.random()*20736),edges=[];
+  for(let i=0;i<hubCount;i++){const h=rnd();for(let j=0;j<hubDeg;j++)edges.push({src_rkey:h,dst_rkey:rnd(),kind:'bond'})}
+  while(edges.length<N)edges.push({src_rkey:rnd(),dst_rkey:rnd(),kind:'bond'});
+  const saved={style:PV.style,sel:PV.sel,focus:PV.focus,bonds:PV.bonds,ctxOn:PV.ctxOn,mode:PV.mode,timeline:PV.timeline,seq:PV.seq};
+  PV.bonds=edges;PV.sel=null;PV.focus=0;PV.ctxOn=false;PV.timeline=[];PV.seq=null;PV.mode='plane';
+  const res={};
+  ['flat','density','bundle','hub','degree'].forEach(mode=>{
+    PV.style=mode;
+    const strokes=pvEdgeStrokes(null);
+    const vis=document.createElement('canvas'),acc=document.createElement('canvas');
+    vis.width=vis.height=acc.width=acc.height=W;
+    const vc=vis.getContext('2d'),ac=acc.getContext('2d');
+    vc.fillStyle='#000000';vc.fillRect(0,0,W,W);
+    strokes.forEach(s=>{pvStroke(vc,s);pvStroke(ac,s,0.05)});
+    const vd=vc.getImageData(0,0,W,W).data,ad=ac.getImageData(0,0,W,W).data;
+    let ink=0,hotPx=0,sum=0;
+    for(let i=0;i<vd.length;i+=4){
+      if(vd[i]+vd[i+1]+vd[i+2]>24){ink++;const n=Math.round(ad[i+3]/13);sum+=n;if(n>=3)hotPx++}
+    }
+    res[mode]={strokes:strokes.length,inkPct:+(ink/(W*W)*100).toFixed(2),
+               meanOverlap:ink?+(sum/ink).toFixed(2):0,
+               hotPct:ink?+(hotPx/ink*100).toFixed(1):0};
+  });
+  Object.assign(PV,saved);pvMode();
+  return {edges:N,hubs:hubCount+'x'+hubDeg,planeCells:20736,result:res};
+}
+window.pvBench=pvBench;
 function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
   if(PV.mode==='blocks')return[Math.floor((rk%144)/12),Math.floor(rk/144/12)];
@@ -534,29 +683,8 @@ function pvDraw(){
   });
   // edges are drawn from the addresses of their two ends — a bond line
   // carries the meaning, the plane only shows where both ends sit
-  if(PV.showBonds){
-    pvLiveBonds().forEach(b=>{
-      const a=pvCenter(b.src_rkey),z=pvCenter(b.dst_rkey);
-      if(!a||!z)return;                       // only edges fully inside this view
-      const hot=PV.sel!=null&&(b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
-      // mask: an edge is dropped when neither end is in the radius; an edge
-      // half-way out stays as a faint hint that the graph continues
-      let alpha=0.5;
-      if(keep){
-        const s=keep.has(b.src_rkey),d=keep.has(b.dst_rkey);
-        if(!s&&!d)return;
-        if(!s||!d)alpha=0.16;
-      }
-      if(a[0]===z[0]&&a[1]===z[1]){           // self-loop: same cell, ring it
-        c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,'+alpha+')';c.lineWidth=hot?2:1;
-        c.beginPath();c.arc(a[0],a[1],step*1.6+2,0,7);c.stroke();return;
-      }
-      c.strokeStyle=hot?'#ffa657':'rgba(121,192,255,'+alpha+')';
-      c.lineWidth=hot?2:1;
-      c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(z[0],z[1]);c.stroke();
-      if(step>6||hot)[a,z].forEach(p=>{c.fillStyle=hot?'#ffa657':'#79c0ff';c.beginPath();c.arc(p[0],p[1],hot?2.5:1.8,0,7);c.fill()});
-    });
-  }
+  if(PV.showBonds)pvEdgeStrokes(keep).forEach(s=>pvStroke(c,s));
+  if(PV.ctxOn)pvMemoryPass(c,step,keep);
   if(PV.sel!=null){
     const [x,y]=pvXY(PV.sel);
     if(x>=0&&y>=0&&x<n&&y<n){c.strokeStyle='#ffa657';c.lineWidth=2;c.strokeRect(x*step+1,y*step+1,step-2,step-2)}
@@ -572,14 +700,15 @@ function pvPop(){
   const pop=$('#plane-pop'),d=PV.lines;
   if(PV.sel==null||!d){pop.style.display='none';return}
   const keep=pvKeep();
-  const mine=PV.bonds.filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
+  const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
   let h='<div style="color:var(--warn)">point '+d.point+' · '+d.count+' line(s)</div>';
   (d.lines||[]).slice(0,2).forEach(m=>{
     h+='<div class="pp">'+esc(m.app||'?')+' '+(m.kind&&m.kind!=='chat'?esc(m.kind)+' ':'')+esc((m.text||'').slice(0,90))+'</div>';
   });
   mine.slice(0,4).forEach(b=>{
     const out=b.src_rkey===PV.sel;
-    h+='<div class="pp" style="color:var(--acc2)">'+esc(b.rel)+' '+(out?'→ ':'← ')+(out?b.dst8:b.src8)+'</div>';
+    h+='<div class="pp" style="color:'+(b.kind==='lifted'?'#bc8cff':'var(--acc2)')+'">'+esc(b.rel||'lifted')+' '
+      +(out?'→ ':'← ')+(out?(b.dst8||('#row'+b.dst_rowid)):b.src8)+'</div>';
   });
   if(keep)h+='<div class="pp">รัศมี '+PV.focus+' hop → '+keep.size+' เซลล์</div>';
   h+='<div class="prow"><button class="pbtn" id="pop-focus">'+(PV.focus?'ปิดรัศมี':'โฟกัส 1 hop')+'</button>'
@@ -602,13 +731,35 @@ function setFocus(h){
 function pvFocusBtns(){
   for(let i=0;i<4;i++)$('#pv-f'+i).classList.toggle('on',PV.focus===i);
 }
+// A style that shows fewer edges must SAY so — a picture that quietly drops
+// half the graph would be worse than a cluttered one.
+function pvEdgeDisclosure(){
+  const edges=pvGraphEdges();
+  if(PV.style==='degree')
+    return ' · โหมด degree: ไม่วาดเส้น ('+edges.length+' edges) — เลือกจุดหรือกด 1 hop เพื่อดูเส้นจริง';
+  if(PV.style==='hub'||(PV.style==='auto'&&edges.length>PV.autoAt)){
+    const deg=pvDegrees(edges),top=new Set(Object.keys(deg).map(Number)
+      .sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK));
+    const shown=edges.filter(e=>top.has(e.src_rkey)||top.has(e.dst_rkey)).length;
+    if(shown<edges.length)
+      return ' · hub: แสดง '+shown+'/'+edges.length+' เส้น (ที่เหลือซ่อน — คลิกจุดหรือกดรัศมีเพื่อดูของมัน)';
+  }
+  return '';
+}
 function pvInfo(){
   const src=(PV.seq===null||PV.seq>=PV.seqMax-1)?PV.plane:pvCellsUpTo(PV.seq);
   const tot=Object.values(src).reduce((a,b)=>a+b,0);
   $('#plane-info').textContent='• เซลล์ '+Object.keys(src).length+'/'+20736+' · '+tot+' lines'
     +' · budget '+PV.budget+(PV.over.length?' · ต้องแตกชั้น '+PV.over.length+' เซลล์':'')
     +' · edges '+pvLiveBonds().length+' · sightings '+PV.sights.length
-    +(()=>{const k=pvKeep();return k?(' · รัศมี '+PV.focus+' hop = '+k.size+' เซลล์ (บังที่เหลือ)'):''})();
+    +(()=>{const k=pvKeep();return k?(' · รัศมี '+PV.focus+' hop = '+k.size+' เซลล์ (บังที่เหลือ)'):''})()
+    +pvEdgeDisclosure()
+    +(()=>{
+      if(!PV.ctxOn)return '';
+      const mem=Object.keys(PV.ctxCells).length;
+      const shared=Object.keys(PV.ctxCells).filter(k=>PV.plane[k]).length;
+      return ' · memory '+mem+' เซลล์ · ทับกัน '+shared+' · ข้ามระบบ '+PV.crossEdges.length+' เส้น';
+    })();
 }
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
@@ -633,8 +784,22 @@ async function loadPlane(){
     PV.bonds=(b.edges||[]).map(e=>({...e,seq:seqOf[e.hash.slice(0,8)]}));
     const sl=$('#pv-seq');sl.max=Math.max(PV.seqMax-1,0);
     if(PV.seq===null)sl.value=sl.max;
+    if(PV.ctxOn)await loadCtx();
     pvMode();pvWhen();
   }catch(e){$('#plane-info').textContent='โหลดระนาบไม่ได้ ('+e+')'}
+}
+async function loadCtx(){
+  if(!PV.ctxOn){PV.ctxCells={};PV.crossEdges=[];return}
+  try{
+    const [m,l]=await Promise.all([
+      fetch('/ctx/at?rkey=0&level=2',{headers:H}).then(r=>r.json()),
+      fetch('/ctx/links',{headers:H}).then(r=>r.json())
+    ]);
+    PV.ctxCells=m.fine_cells||{};
+    const seqOf={};PV.timeline.forEach(r=>{seqOf[r[4]]=r[0]});
+    // a lift happens at flush time, but the edge exists as soon as its line does
+    PV.crossEdges=(l.links||[]).map(e=>({...e,seq:seqOf[e.src8]}));
+  }catch(e){toast('ctx plane: '+e);PV.ctxCells={};PV.crossEdges=[]}
 }
 function pvWhen(){
   const S=PV.seq===null?PV.seqMax-1:PV.seq;
@@ -677,15 +842,16 @@ function pvDetail(){
     }
     h+='</div>';
   }
-  const mine=PV.bonds.filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
+  const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
   if(mine.length){
-    h+='<div style="color:var(--acc2);margin-top:8px">bonds ที่แตะจุดนี้ ('+mine.length+') — คลิกปลายทางเพื่อเดินต่อ</div>';
+    h+='<div style="color:var(--acc2);margin-top:8px">edges ที่แตะจุดนี้ ('+mine.length+') — คลิกปลายทางเพื่อเดินต่อ</div>';
     h+=mine.map(b=>{
-      const out=b.src_rkey===PV.sel,other=out?b.dst8:b.src8,ork=out?b.dst_rkey:b.src_rkey;
-      return '<div class="pline" style="border-color:var(--acc2)"><span class="badge">'+esc(b.app||'?')
-        +'</span> '+(out?'→':'←')+' <b style="color:var(--acc2)">'+esc(b.rel)+'</b> '
+      const out=b.src_rkey===PV.sel,other=out?(b.dst8||('#row'+b.dst_rowid)):b.src8;
+      const ork=out?b.dst_rkey:b.src_rkey,lift=b.kind==='lifted';
+      return '<div class="pline" style="border-color:'+(lift?'#bc8cff':'var(--acc2)')+'"><span class="badge">'+esc(b.app||'?')
+        +'</span> '+(out?'→':'←')+' <b style="color:'+(lift?'#bc8cff':'var(--acc2)')+'">'+esc(b.rel||'lifted')+'</b> '
         +'<span class="ph" title="walk ไปปลายอีกด้าน" onclick="openPoint('+(ork==null?'null':ork)+')">'
-        +other+(ork==null?' (ไม่เห็นปลายทาง)':'')+'</span></div>';
+        +other+(ork==null?' (ไม่เห็นปลายทาง)'+(lift?' · row '+b.dst_rowid:''):'')+'</span></div>';
     }).join('');
   }
   const ls=d.lines||[];
@@ -739,6 +905,11 @@ $('#pv-block').onclick=()=>{
   pvZoomBlock(PV.sel);
 };
 $('#pv-bonds').onchange=e=>{PV.showBonds=e.target.checked;pvDraw()};
+$('#pv-ctx').onchange=async e=>{
+  PV.ctxOn=e.target.checked;await loadCtx();pvMode();
+  if(PV.ctxOn)toast('memory plane: '+Object.keys(PV.ctxCells).length+' เซลล์ · ข้ามระบบ '+PV.crossEdges.length+' เส้น');
+};
+$('#pv-style').onchange=e=>{PV.style=e.target.value;pvMode()};
 $('#pv-f0').onclick=()=>setFocus(0);
 $('#pv-f1').onclick=()=>setFocus(1);
 $('#pv-f2').onclick=()=>setFocus(2);
@@ -952,6 +1123,13 @@ class PoolHandler(BaseHTTPRequestHandler):
             try:
                 if parsed.path == "/ctx/stats":
                     self._json(200, ctx_plane.stats())
+                    return
+                if parsed.path == "/ctx/links":
+                    # cross-system edges, derived from what the bridge already
+                    # wrote — both ends sit in the same 144x144 plane
+                    with _lock:
+                        self._json(200, {"links": ctx_plane.links(),
+                                         "cross": ctx_plane.cross_stats()})
                     return
                 rk = int(qs.get("rkey", [""])[0])
                 lv = int(qs.get("level", ["0"])[0])
