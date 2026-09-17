@@ -96,23 +96,26 @@ button.send:hover{filter:brightness(1.1)}
   <div id="feed"></div>
   <aside>
     <section>
-      <h2>Search</h2>
-      <input id="q" placeholder="กรองข้อความ…">
-    </section>
-    <section>
-      <h2>Apps</h2>
-      <div class="apps" id="apps"></div>
-    </section>
-    <section>
-      <h2>View as</h2>
-      <div class="apps" id="identities"></div>
-      <div id="inboxbox" style="margin-top:9px;display:none">
-        <h2>Inbox (<span id="ib-count">0</span>)</h2>
-        <div id="ib-list" style="font:11px var(--mono);color:var(--dim);max-height:180px;overflow-y:auto;white-space:pre-wrap"></div>
+      <div style="display:flex;gap:8px">
+        <input id="q" placeholder="กรองข้อความ…" style="flex:1">
+        <select id="apps-sel" title="กรองตามแอป" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 6px;max-width:110px">
+          <option value="">ทุกแอป</option>
+        </select>
       </div>
     </section>
     <section>
-      <h2>Status</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font:10px var(--mono);color:var(--dim)">มุมมอง</span>
+        <select id="id-sel" title="View as" style="flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:4px 6px">
+          <option value="admin">admin (เห็นหมด)</option>
+        </select>
+      </div>
+      <div id="inboxbox" style="margin-top:9px;display:none">
+        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">inbox <b id="ib-count" style="color:var(--acc)">0</b></div>
+        <div id="ib-list" style="font:11px var(--mono);color:var(--dim);max-height:150px;overflow-y:auto;white-space:pre-wrap;padding-top:4px"></div>
+      </div>
+    </section>
+    <section>
       <div class="stat"><span>lines</span><b id="st-lines">–</b></div>
       <div class="stat"><span>last append</span><b id="st-last">–</b></div>
       <div class="stat">
@@ -122,13 +125,13 @@ button.send:hover{filter:brightness(1.1)}
       <div class="cloudwrap" id="cloudwrap"><div id="cloudout" style="font:11px var(--mono);color:var(--dim);white-space:pre-wrap;padding-top:6px">…</div></div>
     </section>
     <div id="composer">
-      <textarea id="msg-in" placeholder="พิมพ์ข้อความ… (Enter ส่ง)"></textarea>
+      <textarea id="msg-in" placeholder="พิมพ์ข้อความ… @ชื่อ=tag (Enter ส่ง)"></textarea>
       <button class="send" id="send">ส่ง</button>
-      <select id="to-sel" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 8px">
+      <select id="to-sel" title="ผู้รับ" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 6px">
         <option value="all">→ all</option>
       </select>
     </div>
-    <div id="flushtip">hourly flush อัตโนมัติอยู่แล้ว · <a href="#" id="flushnow" style="color:var(--acc2)">flush เดี๋ยวนี้</a></div>
+    <div id="flushtip">flush ทุกชม.อัตโนมัติ · <a href="#" id="flushnow" style="color:var(--acc2)">flush เดี๋ยวนี้</a> = สำเนาขึ้น pool.db ให้ค้นได้</div>
   </aside>
 </main>
 <div class="toast" id="toast"></div>
@@ -152,19 +155,22 @@ function render(){
     const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
     return `<div class="msg"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}${arrow}<span class="time">${fmt(m.t)}</span><span class="hash" title="คลิกเพื่อ copy" onclick="navigator.clipboard.writeText('${m.hash||''}');toast('copied '+ '${hash8(m.hash)}')">${hash8(m.hash)}</span></div><div class="text">${esc(m.text||'')}</div></div>`;
   }).join('')||'<div style="color:var(--dim);text-align:center;padding:40px">ไม่มีข้อความ</div>';
-  // app chips + identity switch + to-select
+  // populate selects (apps filter, view-as, to)
   const apps={};msgs.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
-  $('#apps').innerHTML=Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>
-    `<span class="appbtn ${filterApps.has(a)?'on':''}" onclick="toggleApp('${esc(a)}')">${esc(a)} ${n}</span>`).join('');
-  const known=[...new Set([...Object.keys(apps),'hermes','codex','dashboard'])];
-  $('#identities').innerHTML=['admin',...known.sort()].map(a=>
-    `<span class="appbtn ${identity===a?'on':''}" onclick="setIdentity('${esc(a)}')">${esc(a)}</span>`).join('');
+  const known=[...new Set([...Object.keys(apps),'hermes','codex','dashboard'])].sort();
+  const asel=$('#apps-sel');const acur=asel.value;
+  asel.innerHTML='<option value="">ทุกแอป</option>'+Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>`<option value="${esc(a)}">${esc(a)} (${n})</option>`).join('');
+  if([...asel.options].some(o=>o.value===acur))asel.value=acur;
+  const isel=$('#id-sel');const icur=isel.value;
+  isel.innerHTML='<option value="admin">admin (เห็นหมด)</option>'+known.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
+  if([...isel.options].some(o=>o.value===icur))isel.value=icur;
   const sel=$('#to-sel');const cur=sel.value;
   sel.innerHTML='<option value="all">→ all</option>'+known.filter(a=>a!=='dashboard').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
   if([...sel.options].some(o=>o.value===cur))sel.value=cur;
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
 }
+window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
 window.setIdentity=async a=>{identity=a;refresh();await registerIdentity();loadInbox()};
 
 async function loadInbox(mark){
@@ -176,10 +182,11 @@ async function loadInbox(mark){
   $('#ib-count').textContent=r.length;
   $('#ib-list').innerHTML=r.length?r.map(m=>`[${fmt(m.t)}] ${esc(m.app)}: ${esc(m.text).slice(0,90)}`).join('\n'):'(ว่าง — ไม่มี mention/DM ใหม่)';
 }
-window.toggleApp=a=>{filterApps.has(a)?filterApps.delete(a):filterApps.add(a);render()};
 window.toast=t=>{const el=$('#toast');el.textContent=t;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
 
 $('#q').oninput=e=>{filterQ=e.target.value.toLowerCase();render()};
+$('#apps-sel').onchange=e=>{filterApps=new Set(e.target.value?[e.target.value]:[]);render()};
+$('#id-sel').onchange=e=>setIdentity(e.target.value);
 $('#cloudck').onchange=async e=>{
   $('#cloudwrap').classList.toggle('open',e.target.checked);
   if(e.checked){const r=await fetch('/view?n=6&cloud=1').then(r=>r.json());
