@@ -35,6 +35,58 @@ def _get_token():
             f.write(tok)
     return open(TOKEN_FILE, encoding="utf-8").read().strip()
 
+
+def _lan_ips():
+    """Real LAN addresses (skip loopback + RFC1918 172.16/12 virtuals)."""
+    import socket
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            if ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31:
+                continue  # WSL/Hyper-V virtual adapters
+            ips.add(ip)
+    except Exception:
+        pass
+    return sorted(ips)
+
+
+def _qr_svg(url):
+    """QR as inline SVG string — no image files, no JS lib needed."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1, box_size=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        m = qr.get_matrix()
+        n = len(m)
+        cells = "".join(
+            f"<rect x='{x}' y='{y}' width='1' height='1'/>"
+            for y, row in enumerate(m) for x, on in enumerate(row) if on)
+        return (f"<svg viewBox='0 0 {n} {n}' shape-rendering='crispEdges'"
+                f" style='width:130px;height:130px;background:#fff'>"
+                f"<g fill='#0d1117'>{cells}</g></svg>")
+    except Exception:
+        return ""
+
+
+def _qr_panel():
+    ips = _lan_ips()
+    tok = _get_token()
+    if not ips:
+        return ""
+    links = "".join(
+        f"<div style='margin:4px 0'><a href='http://{ip}:{PORT}' "
+        f"style='color:var(--acc2);font:11px var(--mono)'>http://{ip}:{PORT}</a></div>"
+        for ip in ips)
+    qr = _qr_svg(f"http://{ips[0]}:{PORT}/#token={tok}")
+    hint = ("<div style='font:10px var(--mono);color:var(--dim);padding-top:4px'>"
+            "สแกนแล้วเบราว์เซอร์จะเก็บ token ให้อัตโนมัติ</div>")
+    return ("<div style='display:flex;gap:10px;align-items:flex-start;padding-top:6px'>"
+            f"{qr}<div>{links}{hint}</div></div>")
+
 DASHBOARD = r"""<!DOCTYPE html>
 <html lang="th">
 <head>
@@ -157,7 +209,7 @@ button.send:hover{filter:brightness(1.1)}
 const $=s=>document.querySelector(s);
 let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
 // LAN access: token prompt (localhost skips auth server-side, this is harmless there)
-const TOKEN=(()=>{let t=localStorage.getItem('pool_token');if(!t){t=prompt('pool token (จาก I:/tools/chat-pool/.pool_token — เว้นว่างถ้าเปิดจากเครื่องนี้)')||'';localStorage.setItem('pool_token',t)}return t})();
+const TOKEN=(()=>{const m=location.hash.match(/token=([0-9a-f]+)/);if(m){localStorage.setItem('pool_token',m[1]);history.replaceState(null,'',location.pathname);return m[1]}return localStorage.getItem('pool_token')||''})();
 const H=TOKEN?{'Authorization':'Bearer '+TOKEN}:{'x-noauth':'1'};
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -300,17 +352,52 @@ class PoolHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if not self._authorized():
+            if parsed.path in ("/", "/qr", "/index.html"):
+                # first LAN visit: show the QR/token page instead of JSON error
+                html = ("<html><head><meta charset='utf-8'><title>chat-pool — connect</title></head>"
+                        "<body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;"
+                        "display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px'>"
+                        "<h2 style='margin:0'>📱 สแกน/เปิดลิงก์นี้จากอุปกรณ์ที่เชื่อม token แล้ว</h2>"
+                        + _qr_panel() +
+                        "<div style='font:11px var(--mono);color:var(--dim);max-width:420px;text-align:center'>"
+                        "หรือเปิดจากเครื่องหลัก (localhost) แล้วกดแชร์ token — token อยู่ที่ "
+                        "I:/tools/chat-pool/.pool_token</div></body></html>").encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
             self._json(401, {"error": "token required — see .pool_token on the server",
                              "howto": {"header": "Authorization: Bearer <token>"}})
             return
 
         if parsed.path == "/" or parsed.path == "/index.html":
             body = DASHBOARD.encode("utf-8")
+            # LAN clients open the page without token in URL? their fetches
+            # will 401 and prompt; the QR panel below carries the token link.
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                body = body.replace(b"</body>",
+                                    (_qr_panel() + "</body>").encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif parsed.path == "/qr":
+            # always-available QR page (no auth needed to see the QR panel;
+            # the token is inside the QR itself — LAN-only threat model)
+            html = ("<html><head><meta charset='utf-8'><title>pool QR</title></head>"
+                    "<body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;"
+                    "display:flex;flex-direction:column;align-items:center;gap:12px;padding:30px'>"
+                    "<h2 style='margin:0'>chat-pool</h2>" + _qr_panel() +
+                    "</body></html>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
 
         elif parsed.path == "/health":
             lines = 0
