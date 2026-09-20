@@ -2756,7 +2756,8 @@ pcv.onmousemove=ev=>{
 pcv.onmouseleave=()=>pvTopHide($('#plane-tip'));
 pcv.onclick=ev=>{
   if(PV.panSwallow&&Date.now()-PV.panSwallow<250)return;   // the pan, not a read
-  const hit=pvCellAt(ev);if(!hit)return;
+  const hit=pvCellAt(ev);
+  if(!hit){pvTopHide($('#plane-pop'));return}
   const [x,y,rk]=hit;
   openPoint(rk);
 };
@@ -2793,6 +2794,13 @@ $('#plane-modal').onclick=e=>{if(e.target.id==='plane-modal')pvClose()};
 // drawer is z-40, so the order is not a preference — it is the stacking. The
 // drawer had no keyboard dismissal at all: Escape closed the modal and then
 // did nothing, leaving a scrim that could only be got rid of by tapping it.
+document.addEventListener('mousedown',e=>{
+  const pop=$('#plane-pop');
+  if(!pop||!pop.matches(':popover-open'))return;
+  if(e.target===pop||pop.contains(e.target))return;
+  if(e.target===pcv)return;
+  pvTopHide(pop);
+});
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape')return;
   if($('#plane-modal').classList.contains('open')){pvClose();return}
