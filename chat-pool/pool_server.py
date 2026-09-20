@@ -175,9 +175,8 @@ main{flex:1;display:flex;min-height:0}
 .badge{font:10px var(--mono);padding:1px 8px;border-radius:9px;background:var(--panel);color:var(--acc2);border:1px solid var(--line);white-space:nowrap}
 .badge.kind{color:var(--warn)}
 .time{font:10px var(--mono);color:var(--dim)}
-.meta{font:10px var(--mono);color:var(--dim);margin-left:auto}
-.hash{font:10px var(--mono);color:var(--dim);cursor:pointer}
-.hash:hover{color:var(--acc2)}
+.meta{font:10px var(--mono);color:var(--dim);margin-left:auto;cursor:pointer}
+.meta:hover{color:var(--acc2)}
 .text{white-space:pre-wrap;word-break:break-word}
 .more{margin-top:5px;font:11px var(--mono);background:none;border:1px dashed var(--line);color:var(--acc2);border-radius:8px;padding:3px 9px;cursor:pointer}
 .more:hover{border-color:var(--acc2)}
@@ -660,8 +659,7 @@ function card(m){
   if(kind==='block'){
     const bd=parseBlockText(full);
     if(bd)return `<div class="msg" data-m="${esc(m.hash||'')}"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}`
-      +`<span class="time">${fmt(m.t)}</span><span class="meta">#${m.seq==null?'–':m.seq}</span>`
-      +`<span class="hash" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอกรหัสเต็มของบรรทัดนี้">${hash8(m.hash)}</span></div>`
+      +`<span class="time">${fmt(m.t)}</span><span class="meta" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอก">#${m.seq==null?'–':m.seq}</span></div>`
       +`<div class="text"><b>▣ ${esc(bd.slug)}</b> <span style="color:var(--dim)">แก้ครั้งที่ ${bd.rev} · ${blkStatusTh(bd.status)}</span><br>${esc(bd.title)}</div>`
       +`<button class="more" data-blk="${esc(bd.slug)}">▣ เปิดในแผงก้อน — เรื่อง · วิธีการ · หลักฐาน</button></div>`;
   }
@@ -678,8 +676,7 @@ function card(m){
   const rbadge=quiet?`<span class="badge quiet" title="ตัวกรองขยะซ่อนบรรทัดนี้ไว้เพราะเข้าข่ายเหล่านี้ · ตัวเลขคือคะแนนความน่าเบื่อ ยิ่งสูงยิ่งถูกซ่อน">🧹 ${esc((m.cur.r||[]).map(ruleTh).join(' + '))} ${m.cur.s}</span>`:'';
   return `<div class="msg${quiet?' quiet':''}" data-m="${esc(m.hash||'')}"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}${arrow}${rbadge}`
     +`<span class="time">${fmt(m.t)}</span>`
-    +`<span class="meta" title="ลำดับที่บรรทัดนี้ถูกเขียนลง log">#${m.seq==null?'–':m.seq}</span>`
-    +`<span class="hash" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอกรหัสเต็มของบรรทัดนี้">${hash8(m.hash)}</span>`
+    +`<span class="meta" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอก">#${m.seq==null?'–':m.seq}</span>`
     +`</div><div class="text">${esc(body)}${long&&!open?'…':''}</div>${more}</div>`;
 }
 
@@ -867,7 +864,7 @@ $('#feed').onclick=e=>{
   }
   const head=e.target.closest('.thead');
   if(head){toggleTick(+head.parentElement.dataset.tick);return}
-  const hash=e.target.closest('.hash');
+  const hash=e.target.closest('.meta[data-h]');
   if(hash){const h=hash.dataset.h||'';
     if(navigator.clipboard)navigator.clipboard.writeText(h).catch(()=>{});
     toast('คัดลอกแล้ว · '+hash8(h))}
