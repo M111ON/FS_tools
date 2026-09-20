@@ -2758,8 +2758,13 @@ pcv.onclick=ev=>{
   if(PV.panSwallow&&Date.now()-PV.panSwallow<250)return;   // the pan, not a read
   const hit=pvCellAt(ev);if(!hit)return;
   const [x,y,rk]=hit;
-  if(PV.mode==='blocks'){pvZoomBlock(rk);return}   // zoom = another read, finer
   openPoint(rk);
+};
+pcv.ondblclick=ev=>{
+  const hit=pvCellAt(ev);if(!hit)return;
+  const [x,y,rk]=hit;
+  if(PV.mode==='blocks'){pvZoomBlock(rk)}
+  else if(PV.mode==='plane')pvZoomBlock(rk);
 };
 $('#open-plane').onclick=()=>{
   $('#plane-modal').classList.add('open');
