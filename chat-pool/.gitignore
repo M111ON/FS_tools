@@ -1,5 +1,6 @@
 # chat-pool: runtime data never committed
 log.jsonl
+log.jsonl.bak*
 .flush_state.json
 towers/
 outbox/
@@ -17,3 +18,20 @@ log.jsonl.lock
 .cloud_push_state.json
 ctx_plane.db
 ctx_plane.db.tmp
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# graft init output (agent configs — local only)
+.claude/
+.cursor/
+.gemini/
+.windsurf/
+AGENTS.md
+GEMINI.md
+opencode.json
+.ignore
+
+# server runtime logs
+.server*.log
+.server.err

@@ -118,7 +118,40 @@ def scan(index=INDEX, src=CTX, table=TABLE, force=False):
             "source_unchanged": True}
 
 
+def _index_has_rows(index):
+    """Is the index CACHE built? This module's own rule is that the index is a
+    cache and never the truth, so 'no table yet' is a legitimate state — a
+    fresh checkout, or a scan that has not run. Every cross-system read has to
+    answer THROUGH that state rather than raise on it: a reader on a new
+    install should get a truthful zero, not a 500."""
+    if not os.path.exists(index):
+        return False
+    idb = sqlite3.connect(index)
+    try:
+        idb.execute("SELECT 1 FROM rows LIMIT 1").fetchone()
+        return True
+    except sqlite3.OperationalError:       # table absent: index never built
+        return False
+    finally:
+        idb.close()
+
+
+def _index_cells(index):
+    """Every address the memory side occupies — empty before the index exists,
+    so the shared-plane answer degrades to 'nothing shared yet' instead of to
+    an exception."""
+    if not _index_has_rows(index):
+        return set()
+    idb = sqlite3.connect(index)
+    try:
+        return {r[0] for r in idb.execute("SELECT DISTINCT rkey FROM rows")}
+    finally:
+        idb.close()
+
+
 def _index_rows(index, where="", args=()):
+    if not _index_has_rows(index):
+        return []
     idb = sqlite3.connect(index)
     try:
         return idb.execute("SELECT rowid, rkey, wedge, ring, category, clen FROM rows "
@@ -228,7 +261,7 @@ def _sub_map(rkey0, depth, path=(), index=INDEX, src=CTX, budget=None):
             "sub_cells": dict(sorted(cells.items()))}
 
 
-def links(src=CTX, lines=None):
+def links(src=CTX, lines=None, raw=False):
     """Cross-system edges between the log and the memory plane — DERIVED,
     not new data. The memory bridge already writes a lifted line as
     "[chat-pool/<app>] <text>", so a memory row and the chat line it came
@@ -238,7 +271,13 @@ def links(src=CTX, lines=None):
 
     Both ends land in the SAME 144x144 plane, so an edge that crosses from
     chat into memory is just an edge — the radius walk crosses systems for
-    free. `lines` overrides the log read (tests pass their own)."""
+    free. `lines` overrides the log read (tests pass their own).
+
+    One end of a lifted edge lives in the LOG, so it can be pruned: the
+    bridge lifted a line that the curator's rules call noise. This module
+    never writes, so the memory row stays; the edge is marked `dangling` and
+    held back by default, because drawing it would join the plane to an
+    address the log no longer shows. `raw=True` returns it with the mark."""
     db = _ro(src)
     try:
         rows = db.execute(
@@ -247,6 +286,9 @@ def links(src=CTX, lines=None):
     finally:
         db.close()
     by_content = {content: rid for rid, content in rows}
+    # the log end of each edge, judged by the same prune the plane uses. A
+    # caller reading its OWN lines (tests) simply finds none of them here.
+    pruned = pool.derived().get("pruned_hashes") or ()
     out = []
     for m in (pool.tail(1000) if lines is None else lines):
         text = (m.get("text") or "").strip()
@@ -259,17 +301,17 @@ def links(src=CTX, lines=None):
         out.append({"kind": "lifted", "src": m["hash"], "src8": m["hash"][:8],
                     "src_rkey": m.get("rkey"), "dst_rowid": rid,
                     "dst_rkey": pool.rkey(content.encode("utf-8")),
-                    "app": m.get("app"), "t": m.get("t")})
-    return out
+                    "app": m.get("app"), "t": m.get("t"),
+                    "dangling": m["hash"] in pruned})
+    return out if raw else [e for e in out if not e["dangling"]]
 
 
 def cross_stats(src=CTX, index=INDEX):
-    """What the two planes actually share: cells held by both systems."""
-    idb = sqlite3.connect(index)
-    try:
-        mem_cells = {r[0] for r in idb.execute("SELECT DISTINCT rkey FROM rows")}
-    finally:
-        idb.close()
+    """What the two planes actually share: cells held by both systems.
+
+    Safe before the index exists: the memory side simply reads as empty, so
+    a fresh install gets "nothing shared yet" instead of an error."""
+    mem_cells = _index_cells(index)
     pool_cells = {m["rkey"] for m in pool.tail(1000) if m.get("rkey") is not None}
     return {"memory_cells": len(mem_cells), "pool_cells": len(pool_cells),
             "shared_cells": sorted(mem_cells & pool_cells),
@@ -278,25 +320,26 @@ def cross_stats(src=CTX, index=INDEX):
 
 
 def stats(index=INDEX, src=CTX, top=8):
-    """How the memories actually land on the shared plane."""
-    idb = sqlite3.connect(index)
-    try:
-        total = idb.execute("SELECT count(*) FROM rows").fetchone()[0]
-        cells = idb.execute("SELECT count(DISTINCT rkey) FROM rows").fetchone()[0]
-        over = idb.execute("SELECT count(*) FROM (SELECT rkey FROM rows GROUP BY rkey"
-                           " HAVING count(*)>?)", (pool.VISION_BUDGET,)).fetchone()[0]
-        busiest = idb.execute("SELECT rkey, count(*) AS n FROM rows GROUP BY rkey"
-                              " ORDER BY n DESC LIMIT ?", (top,)).fetchall()
-        blocks = idb.execute("SELECT count(DISTINCT (wedge/12)||':'||(ring/12)) FROM rows").fetchone()[0]
-    finally:
-        idb.close()
+    """How the memories actually land on the shared plane.
+
+    Unbuilt index reads as an empty memory side (see _index_has_rows) — the
+    numbers are then honest zeros rather than a traceback."""
+    total = cells = over = blocks = 0
+    busiest = []
+    if _index_has_rows(index):
+        idb = sqlite3.connect(index)
+        try:
+            total = idb.execute("SELECT count(*) FROM rows").fetchone()[0]
+            cells = idb.execute("SELECT count(DISTINCT rkey) FROM rows").fetchone()[0]
+            over = idb.execute("SELECT count(*) FROM (SELECT rkey FROM rows GROUP BY rkey"
+                               " HAVING count(*)>?)", (pool.VISION_BUDGET,)).fetchone()[0]
+            busiest = idb.execute("SELECT rkey, count(*) AS n FROM rows GROUP BY rkey"
+                                  " ORDER BY n DESC LIMIT ?", (top,)).fetchall()
+            blocks = idb.execute("SELECT count(DISTINCT (wedge/12)||':'||(ring/12)) FROM rows").fetchone()[0]
+        finally:
+            idb.close()
     pool_cells = {m["rkey"] for m in pool.tail(1000) if m.get("rkey") is not None}
-    ctx_cells = set()
-    idb = sqlite3.connect(index)
-    try:
-        ctx_cells = {r[0] for r in idb.execute("SELECT DISTINCT rkey FROM rows")}
-    finally:
-        idb.close()
+    ctx_cells = _index_cells(index)
     shared = sorted(pool_cells & ctx_cells)
     frac = (cells / 20736.0 * 100) if total else 0.0
     return {"source": src, "table": TABLE, "rows": total, "occupied_cells": cells,
@@ -393,6 +436,21 @@ def demo():
         assert lk[0]["dst_rkey"] == pool.rkey(("[chat-pool/tester] " + text).encode("utf-8")), "the far end is placed by its own content"
         assert links(src=src, lines=[{"hash": "b" * 64, "rkey": 1, "app": "tester",
                                      "kind": "chat", "text": "just chat", "t": 1}]) == [], "only lifted lines form a cross edge"
+
+        # prune crosses systems: one end of a lifted edge is a LOG line, so it
+        # can be pruned. The memory row survives (this module never writes), so
+        # the edge is stranded — held back by default, marked when asked raw.
+        # Stubbed, because the point is the convention, not the live log.
+        _real = pool.derived
+        try:
+            pool.derived = lambda: {"pruned_hashes": {fake["hash"]}}
+            stray = links(src=src, lines=[fake], raw=True)
+            assert len(stray) == 1 and stray[0]["dangling"] is True, "a pruned log end marks the cross edge dangling"
+            assert links(src=src, lines=[fake]) == [], "and a stranded edge is not drawn by default"
+            pool.derived = lambda: {"pruned_hashes": {"other" * 5}}
+            assert len(links(src=src, lines=[fake])) == 1, "pruning something else leaves this edge alone"
+        finally:
+            pool.derived = _real
 
         # stacking: same axis rule as pool, chosen lazily, walked by path
         st = stats(index=idx, src=src)

@@ -4,6 +4,7 @@ GET  /tail?n=10                    → [messages...]
 GET  /view?n=20&cloud=0            → rendered chat log (pool.view)
 GET  /stream?n=5  (SSE)            → real-time new messages
 POST /flush                        → flush_emit + push_outbox now
+POST /session-end {app, force?}    → auto-write a block on session close
 GET  /health                       → {ok, lines}
 GET  /                             → dashboard (single file, no CDN)
 """
@@ -20,6 +21,11 @@ import pool
 
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
+
+# A query parameter that could not be read as a number: the 400 answer is
+# already written when these come back, so the caller only has to return.
+_REFUSED = object()
+_THRESHOLD_ERR = "?hide=<int> / ?at=<int>"
 
 # LAN access: bearer token required for non-loopback clients.
 # Token file lives next to the log (0600-ish perms on NTFS via profile);
@@ -97,7 +103,7 @@ def _qr_panel():
     # invisible to the server — a query param survives both
     qr = _qr_svg(f"http://{ips[0]}:{PORT}/?token={tok}")
     hint = ("<div style='font:10px var(--mono);color:var(--dim);padding-top:4px'>"
-            "สแกนแล้วเบราว์เซอร์จะเก็บ token ให้อัตโนมัติ</div>")
+            "สแกนแล้วเบราว์เซอร์จะจำรหัสเข้าใช้ให้เอง ไม่ต้องพิมพ์</div>")
     return ("<div style='display:flex;gap:10px;align-items:flex-start;padding-top:6px'>"
             f"{qr}<div>{links}{hint}</div></div>")
 
@@ -116,49 +122,108 @@ DASHBOARD = r"""<!DOCTYPE html>
   --mono:'Cascadia Code',Consolas,'Courier New',monospace;
 }
 *{box-sizing:border-box;margin:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,'Segoe UI',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
-header h1{font-size:15px;font-weight:600;letter-spacing:.4px}
+html{height:100%}
+/* portrait app: header · tabs · tick rail · feed · composer, top to bottom.
+   The feed is the only thing that scrolls, and the composer never leaves the
+   bottom of the screen — on a phone that is the whole point. */
+body{background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,'Segoe UI',system-ui,sans-serif;height:100dvh;display:flex;flex-direction:column;overflow:hidden;-webkit-text-size-adjust:100%}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap;flex:0 0 auto}
+header h1{font-size:14px;font-weight:600;letter-spacing:.4px}
 header h1 b{color:var(--acc)}
-.dot{width:9px;height:9px;border-radius:50%;background:#f85149;transition:.3s}
+.dot{width:9px;height:9px;border-radius:50%;background:#f85149;transition:.3s;flex:0 0 auto}
 .dot.on{background:var(--acc);box-shadow:0 0 8px var(--acc)}
 #chain{font:11px var(--mono);color:var(--dim)}
 #chain.ok{color:var(--acc)}
+/* one tab per writer: a long session reads alone without hiding the rest */
+#tabs{display:flex;gap:6px;padding:7px 12px;border-bottom:1px solid var(--line);background:var(--panel);overflow-x:auto;flex:0 0 auto;scrollbar-width:none}
+#tabs::-webkit-scrollbar{display:none}
+.tab{font:12px var(--mono);padding:5px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);cursor:pointer;white-space:nowrap;flex:0 0 auto}
+.tab.on{background:var(--acc);border-color:var(--acc);color:#0d1117;font-weight:700}
+.tab .n{opacity:.65}
+/* the tick rail is the chunk layer's scrollbar: a tick counts LINES in append
+   order, so jumping to tick 12 lands on the same lines every time */
+#tickbar{display:flex;align-items:center;gap:7px;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--bg);flex:0 0 auto;flex-wrap:wrap}
+#tick-label{font:10px var(--mono);color:var(--dim);white-space:nowrap}
+#tick-range{flex:1;min-width:88px;accent-color:var(--acc)}
 main{flex:1;display:flex;min-height:0}
-#feed{flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:8px;min-width:0}
-@media (max-width:720px){
-  main{flex-direction:column}
-  aside{width:100%;border-left:none;border-top:1px solid var(--line);flex-direction:row;flex-wrap:wrap}
-  aside section{flex:1 1 46%;border-bottom:none}
-  #composer{width:100%;margin-top:0}
-  #flushtip{width:100%}
-}
+#feed{flex:1;overflow-y:auto;padding:10px 12px 16px;display:flex;flex-direction:column;gap:9px;min-width:0;overscroll-behavior:contain}
 #feed::-webkit-scrollbar{width:8px}#feed::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
-.msg{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 13px;max-width:72ch;animation:in .25s ease}
-@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
-.msg .top{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
-.badge{font:10px var(--mono);padding:1px 8px;border-radius:9px;background:var(--panel2);color:var(--acc2);border:1px solid var(--line)}
+.empty{color:var(--dim);text-align:center;padding:40px 12px;flex:0 0 auto}
+/* a tick chunk: closed it is one scannable line, open it is the lines itself */
+/* flex:0 0 auto is load-bearing. #feed is a flex column, and an item whose
+   overflow is hidden has an automatic minimum size of ZERO — so every chunk
+   was being shrunk to fit the viewport instead of overflowing it. Result: no
+   scrollbar, and expanding a card clipped its own text (416px of content in a
+   320px box) with no way to scroll to it. Never shrink a chunk here. */
+.tick{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;flex:0 0 auto}
+.tick.open{border-color:#3b4657}
+/* one row, always: the header is the scanning surface, so it truncates
+   rather than wrapping to look like another message */
+.thead{display:flex;align-items:center;gap:8px;padding:8px 11px;cursor:pointer;user-select:none;overflow:hidden}
+.thead:hover{background:var(--panel2)}
+.tno{font:11px var(--mono);color:var(--acc);font-weight:600;white-space:nowrap;flex:0 0 auto}
+.tmeta{font:10px var(--mono);color:var(--dim);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tapps{flex:0 1 auto;display:flex;gap:4px;overflow:hidden;justify-content:flex-end;min-width:0}
+.tchip{font:10px var(--mono);padding:1px 7px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--acc2);white-space:nowrap}
+.chev{color:var(--dim);font:11px var(--mono);flex:0 0 auto}
+.tbody{display:none;flex-direction:column;gap:7px;padding:0 9px 10px}
+.tick.open .tbody{display:flex}
+.msg{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 11px;max-width:78ch;animation:in .2s ease}
+@media (max-width:900px){.msg{max-width:100%}}
+@keyframes in{from{opacity:0;transform:translateY(5px)}to{opacity:1}}
+.msg .top{display:flex;gap:7px;align-items:baseline;margin-bottom:3px;flex-wrap:wrap}
+.badge{font:10px var(--mono);padding:1px 8px;border-radius:9px;background:var(--panel);color:var(--acc2);border:1px solid var(--line);white-space:nowrap}
 .badge.kind{color:var(--warn)}
 .time{font:10px var(--mono);color:var(--dim)}
-.hash{font:10px var(--mono);color:var(--dim);margin-left:auto;cursor:pointer}
+.meta{font:10px var(--mono);color:var(--dim);margin-left:auto}
+.hash{font:10px var(--mono);color:var(--dim);cursor:pointer}
 .hash:hover{color:var(--acc2)}
 .text{white-space:pre-wrap;word-break:break-word}
-aside{width:300px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
-aside section{padding:13px 15px;border-bottom:1px solid var(--line)}
+.more{margin-top:5px;font:11px var(--mono);background:none;border:1px dashed var(--line);color:var(--acc2);border-radius:8px;padding:3px 9px;cursor:pointer}
+.more:hover{border-color:var(--acc2)}
+/* noise the curator kept out of the way: dimmed and dashed when revealed, so a
+   line you chose to see still reads as one the feed would not have shown */
+.msg.quiet{opacity:.6;border-style:dashed}
+.badge.quiet{color:var(--warn);border-color:var(--line)}
+.tclean{font:10px var(--mono);color:var(--warn);cursor:pointer;border:1px dashed var(--warn);border-radius:9px;padding:1px 7px;white-space:nowrap;flex:0 0 auto}
+.tclean:hover{background:var(--warn);color:#0d1117}
+.tclean.on{background:var(--warn);color:#0d1117}
+#btn-cur.on{color:var(--warn);border-color:var(--warn)}
+.curbar{font:11px var(--mono);color:var(--dim);line-height:1.75;white-space:pre-wrap}
+.curchip{display:inline-block;padding:1px 7px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--warn);margin:2px 4px 0 0}
+.curex{border-left:2px solid var(--line);padding-left:6px;margin:6px 0;color:var(--dim)}
+aside{width:302px;flex:0 0 302px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;overflow-y:auto}
+aside section{padding:12px 14px;border-bottom:1px solid var(--line)}
 aside h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:9px}
-#q{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 11px;font-size:13px;outline:none}
+#q{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:9px 11px;font-size:15px;outline:none}
 #q:focus{border-color:var(--acc2)}
-.apps{display:flex;flex-wrap:wrap;gap:6px}
-.appbtn{font:11px var(--mono);padding:3px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);cursor:pointer}
-.appbtn.on{color:var(--acc);border-color:var(--acc)}
 .stat{font:11px var(--mono);color:var(--dim);display:flex;justify-content:space-between;padding:2px 0}
 .stat b{color:var(--fg)}
-#composer{display:flex;gap:8px;padding:12px 15px;border-top:1px solid var(--line);margin-top:auto}
-#msg-in{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 11px;font:13px var(--mono);outline:none;resize:none;height:38px}
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:39;display:none}
+#scrim.on{display:block}
+#hint{display:flex;align-items:center;gap:8px;padding:5px 12px;border-top:1px solid var(--line);background:var(--panel);font:10px var(--mono);color:var(--dim);flex:0 0 auto;overflow:hidden}
+#flushtip{margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;text-align:right}
+#to-sel{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:3px 6px;max-width:130px;flex:0 0 auto}
+#composer{display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px));background:var(--panel);flex:0 0 auto}
+#msg-in{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:12px;padding:11px 13px;font:15px/1.45 var(--mono);outline:none;resize:none;height:46px;max-height:32dvh;overflow-y:hidden}
 #msg-in:focus{border-color:var(--acc)}
-button.send{background:var(--acc);color:#0d1117;border:none;border-radius:8px;padding:0 16px;font-weight:600;cursor:pointer}
-button.send:hover{filter:brightness(1.1)}
-#flushtip{font:10px var(--mono);color:var(--dim);text-align:center;padding:6px}
+button.send{background:var(--acc);color:#0d1117;border:none;border-radius:12px;padding:0 18px;font-weight:700;font-size:15px;cursor:pointer;height:46px;min-width:68px}
+button.send:hover{filter:brightness(1.08)}
+button.send:disabled{opacity:.55;cursor:progress}
+/* phone: the panels become a drawer so the feed keeps the full width, and every
+   control grows to a thumb — 16px input text or iOS zooms the page on focus */
+@media (max-width:900px){
+  #msg-in{font-size:16px}
+  #q{padding:11px}
+  header{padding:7px 10px}
+  #tabs{padding:6px 9px}
+  #tickbar{padding:6px 9px}
+  #feed{padding:8px 9px 14px}
+  .pbtn{min-height:34px}
+  aside{position:fixed;top:0;right:0;bottom:0;width:min(88vw,340px);border-left:1px solid var(--line);z-index:40;transform:translateX(102%);transition:transform .22s ease;box-shadow:-14px 0 34px rgba(0,0,0,.5)}
+  aside.open{transform:none}
+}
+@media (min-width:901px){#btn-side{display:none}#side-close{display:none}}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--acc);color:var(--acc);font:12px var(--mono);padding:8px 18px;border-radius:9px;opacity:0;transition:.3s;pointer-events:none}
 .toast.show{opacity:1}
 .cloudwrap{max-height:0;overflow:hidden;transition:max-height .3s}
@@ -171,135 +236,386 @@ button.send:hover{filter:brightness(1.1)}
 #plane-modal{position:fixed;inset:0;background:rgba(0,0,0,.74);display:none;align-items:center;justify-content:center;z-index:50;padding:14px}
 #plane-modal.open{display:flex}
 #plane-box{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:min(1080px,100%);height:min(780px,100%);display:flex;flex-direction:column;overflow:hidden}
-#plane-head{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#plane-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 #plane-bar{display:flex;align-items:center;gap:12px;padding:8px 15px;border-bottom:1px solid var(--line);font:10px var(--mono);color:var(--dim);flex-wrap:wrap}
-#pv-seq{flex:1;min-width:150px;accent-color:var(--acc)}
-#pv-when{min-width:220px}
-#plane-pop{position:absolute;display:none;z-index:6;background:var(--panel2);border:1px solid var(--acc);border-radius:10px;padding:9px 11px;font:11px var(--mono);color:var(--fg);max-width:330px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#pv-seq{flex:1;min-width:86px;accent-color:var(--acc)}
+#pv-when{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* The popup and the tooltip live in the TOP LAYER (popover), not inside the
+   canvas box. That box is overflow:hidden on a phone and only ~165px tall, so
+   anything positioned inside it is clipped BY CONSTRUCTION: measured, the popup
+   (164px tall) sat at top=4px in a 165px box and its bottom row of buttons was
+   cut off. The old clamp could not fix it — when the popup is taller than its
+   container `wr.height - popH - 10` goes NEGATIVE, and `Math.max(4,·)` puts it
+   straight back inside. A popup can never be taller than the VIEWPORT, so the
+   top layer is the one place the problem does not exist. It also means the
+   popup cannot be painted under the side panel or over the map by accident. */
+#plane-pop{position:fixed;z-index:6;background:var(--panel2);border:1px solid var(--acc);border-radius:10px;padding:9px 11px;font:11px var(--mono);color:var(--fg);max-width:min(330px,calc(100vw - 24px));max-height:calc(100dvh - 24px);overflow:auto;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 #plane-pop .pp{color:var(--dim);white-space:pre-wrap;margin-top:4px}
 #plane-pop .prow{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 #plane-body{flex:1;display:flex;min-height:0}
 #plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:auto}
-#plane-cv{background:var(--bg);border:1px solid var(--line);border-radius:8px;cursor:crosshair;image-rendering:pixelated}
+#plane-cv{background:#0a0e14;border:1px solid var(--line);border-radius:10px;cursor:crosshair;image-rendering:pixelated;box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.02)}
+/* the timeline strip: one bar per tick (or per bucket of ticks), coloured by who
+   was writing — the tick layer with its "when" and "who" both visible at once */
+#plane-ribbon{display:flex;align-items:center;gap:9px;padding:7px 12px 0;flex:0 0 auto}
+#pv-ribbon{flex:1 1 130px;height:42px;min-width:90px;background:#0a0e14;border:1px solid var(--line);border-radius:9px;cursor:ew-resize}
+/* No longer 349px of label: a wrapping row decides its line from the BASIS sum,
+   so a label that is as wide as its content pushes everything after it onto a
+   second row — which is how the strip and its own scrubber ended up in two
+   different rows. Fixed basis, ellipsis, full text in the tooltip. */
+#pv-ribbon-info{flex:0 1 118px;min-width:0;overflow:hidden;text-overflow:ellipsis;font:10px var(--mono);color:var(--dim);white-space:nowrap;text-align:right}
+/* the scrubber belongs beside the strip it scrubs, not in another row */
+#pv-time{display:flex;align-items:center;gap:6px;flex:1 1 222px;min-width:0}
+#pv-legend{display:flex;align-items:center;gap:10px;font:10px var(--mono);color:var(--dim);flex-wrap:wrap}
+.pvgrad{width:78px;height:8px;border-radius:5px;border:1px solid var(--line);display:inline-block}
+#pv-colour{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px}
+#plane-empty{color:var(--dim);font:12px var(--mono);text-align:center;padding:30px 12px}
 #plane-side{width:360px;border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#pv-lensinfo{display:none;color:var(--warn);font:10px var(--mono);white-space:nowrap}
+#pv-lensinfo.on{display:inline}
+/* ── 🔍 the zoom cluster ───────────────────────────────────────────────────
+   Big enough to hit with a thumb, and always in the SAME place: over the thing
+   it zooms. The two zoom buttons used to be 10px text in the header row — which
+   is where "ซูมเข้าออกมัน struggle" starts on the UI side even once the frame
+   cost is zero. Three buttons and a level readout, in that order, because the
+   level is the feedback for the two buttons above it. */
+#pv-zoom{position:absolute;right:10px;bottom:10px;z-index:3;display:flex;
+  flex-direction:column;gap:5px;align-items:center;
+  background:rgba(13,17,23,.88);border:1px solid var(--line);border-radius:13px;
+  padding:6px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+#pv-zoom button{width:46px;height:46px;border-radius:10px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--fg);font:22px/1 var(--mono);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;padding:0;flex:0 0 auto}
+#pv-zoom button:hover{border-color:var(--acc);color:var(--acc)}
+#pv-zoom button:disabled{opacity:.35;cursor:default}
+#pv-zoom button:disabled:hover{border-color:var(--line);color:var(--fg)}
+#pv-zoom #pv-zreset{font-size:17px;height:38px}
+#pv-zoom .zlvl{font:10px var(--mono);color:var(--acc);text-align:center;white-space:nowrap;min-width:46px}
+/* The drawing options are worth having and not worth SHOWING: 14 controls in a
+   wrapping row measured 115px, above a canvas that then had 175px left — and
+   the row held the scrubber too, which belonged with the strip. One button
+   away, and the button says what is behind it. */
+#plane-bar.off{display:none}
+#pv-opt.on{color:var(--acc);border-color:var(--acc)}
 #plane-detail{flex:1;overflow-y:auto;padding:12px 15px;font:11px var(--mono);color:var(--dim);line-height:1.6}
-#plane-tip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 8px;font:10px var(--mono);color:var(--fg);display:none;white-space:nowrap}
+/* the tooltip WRAPS: `white-space:nowrap` with no max-width made a 350px box
+   that was cut off whenever the pointer was near the right edge (measured:
+   left=430, right=780, canvas box=540) */
+#plane-tip{position:fixed;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 8px;font:10px var(--mono);color:var(--fg);max-width:min(340px,calc(100vw - 24px))}
 #subgrid{display:grid;grid-template-columns:repeat(12,1fr);gap:2px;margin-top:7px}
 #subgrid div{aspect-ratio:1;border-radius:2px;background:var(--panel2);cursor:pointer}
 #subgrid div:hover{outline:1px solid var(--fg)}
 .pline{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:6px 8px;margin:6px 0;color:var(--fg)}
 .pline .ph{color:var(--dim);cursor:pointer}
 .pline .ph:hover{color:var(--acc2)}
-@media (max-width:860px){
+/* ── 🧭 walk: what this leads to, what cites it, and what shape it is ──────
+   The shape badge is the FIRST thing in the panel because it reframes every-
+   thing under it: a line with in=273 is not read the same way as a line with
+   in=1, and the two look identical as a bare list of edges. */
+.shape{display:inline-flex;align-items:center;gap:5px;font:11px var(--mono);
+  padding:2px 9px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);white-space:nowrap}
+.shape b{font-size:12px}
+.swhy{color:var(--dim);font-size:10px;line-height:1.5;margin-top:4px}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:0 0 8px}
+.crumb{font:10px var(--mono);padding:2px 7px;border-radius:8px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--acc2);cursor:pointer;max-width:150px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.crumb.here{color:var(--warn);border-color:var(--warn)}
+.crumb.x{color:var(--dim)}
+.hopsec{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
+.hophead{display:flex;align-items:center;gap:6px;color:var(--fg);font-size:11px;cursor:pointer}
+.hophead .n{color:var(--dim);font-weight:400}
+.hoplevel{color:var(--dim);font-size:10px;margin:7px 0 3px}
+.hop{display:flex;gap:6px;align-items:flex-start;padding:5px 7px;margin:3px 0;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel2);cursor:pointer}
+.hop:hover{border-color:var(--acc2)}
+.hop .deg{color:var(--dim);font:9px var(--mono);white-space:nowrap;margin-left:auto;padding-left:6px}
+.hop .tx{color:var(--fg);font-size:10px;line-height:1.45;overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.relchip{font:9px var(--mono);padding:1px 6px;border-radius:7px;border:1px solid var(--line);color:var(--dim)}
+/* census: proportions have to be SEEN, because "3,001 islands" next to
+   "13,572 edges" reads as comparable numbers when they are not */
+.cen{margin-top:8px}
+.cenrow{display:grid;grid-template-columns:16px 78px 1fr 46px;gap:6px;align-items:center;margin:4px 0}
+.cenbar{height:9px;border-radius:5px;background:var(--panel2);overflow:hidden}
+.cenbar i{display:block;height:100%;border-radius:5px;background:var(--acc2)}
+.cennum{color:var(--dim);font:10px var(--mono);text-align:right}
+.cenhub{display:flex;gap:6px;align-items:flex-start;padding:5px 7px;margin:4px 0;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel2);cursor:pointer}
+.cenhub:hover{border-color:var(--warn)}
+@media (max-width:900px){
+  #plane-modal{padding:0}
+  #plane-box{width:100%;height:100%;max-height:100dvh;border-radius:0;border:none}
   #plane-body{flex-direction:column}
-  #plane-side{width:100%;border-left:none;border-top:1px solid var(--line)}
+  /* Both halves share the remaining height with min-height:0, and the canvas
+     box CLIPS instead of growing. That matters more than it looks: pstep()
+     sizes cells from the box's clientHeight, so a box that also GROWS to fit
+     the canvas it just sized is a feedback loop — it settles wherever it
+     starts, which is how a canvas ends up 156px tall after a toolbar row is
+     added. A real height every frame means every frame agrees. */
+  #plane-canvaswrap{flex:1 1 40%;min-height:0;overflow:hidden;
+    align-items:center;justify-content:center;padding:8px}
+  #plane-side{width:100%;flex:1 1 60%;min-height:0;border-left:none;
+    border-top:1px solid var(--line)}
+  #plane-head,#plane-bar{gap:5px;padding:6px 9px}
+  /* a 170px-tall column beside a 235px canvas is a control that takes over the
+     thing it controls. On a phone the cluster lies down instead: 58px tall,
+     still thumb-sized, still out of the way. */
+  #pv-zoom{flex-direction:row;align-items:center}
+  #pv-zoom .zlvl{min-width:34px}
+  #plane-head .pbtn,#plane-bar .pbtn{font-size:10px;padding:3px 7px}
 }
+/* ▣ ก้อนเรื่องราว — the story/method layer. Cards, not a table, for the same
+   reason the feed is cards: a fixed meta line plus wrapped values means a phone
+   shows the whole shelf without a sideways scroll, and the six fields of a
+   block stay folded until someone asks for them. */
+#blocks{display:flex;flex-direction:column;gap:9px;padding:10px 14px;border-bottom:1px solid var(--line);max-height:46dvh;overflow-y:auto}
+#blk-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);padding-bottom:6px;z-index:2}
+#blk-bar b{font-size:13px;color:var(--acc)}
+#blk-q{flex:1;min-width:140px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:9px;font:12px var(--mono);padding:5px 7px}
+#blk-status{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:9px;font:11px var(--mono);padding:5px 6px}
+.blk{border:1px solid var(--line);border-radius:11px;padding:9px 10px}
+.blk[data-open="1"]{border-color:var(--acc)}
+.blk-h{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap}
+.blk-h b{font:12px var(--mono);color:var(--acc)}
+.blk-m{font:10px var(--mono);color:var(--dim)}
+.blk-t{font-size:13px;line-height:1.35;margin-top:5px}
+.blk-v{font:11px/1.45 var(--mono);margin-top:6px;white-space:pre-wrap;word-break:break-word}
+.blk-v i{color:var(--dim);font-style:normal;display:inline-block;min-width:66px}
+.blk-more{cursor:pointer;color:var(--acc2);font:11px var(--mono);margin-top:6px;user-select:none}
+.blk-rev{border-left:2px solid var(--line);padding-left:8px;margin-top:5px}
+
+/* ── ⏱ session-block timeline ──────────────────────────────────────── */
+#tl-panel{display:flex;flex-direction:column;gap:0;padding:0;border-bottom:1px solid var(--line);max-height:50dvh;overflow-y:auto;background:var(--bg)}
+#tl-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);padding:8px 14px 6px;z-index:2;border-bottom:1px solid var(--line)}
+#tl-bar b{font-size:13px;color:var(--acc2)}
+#tl-body{padding:10px 14px;position:relative}
+.tl-row{display:flex;align-items:stretch;gap:0;position:relative;min-height:56px}
+.tl-rail{width:28px;flex:0 0 28px;display:flex;flex-direction:column;align-items:center;position:relative}
+.tl-dot{width:11px;height:11px;border-radius:50%;border:2px solid var(--acc2);background:var(--bg);z-index:1;flex:0 0 auto;margin-top:14px}
+.tl-dot.dup{border-color:var(--warn);background:var(--warn);width:9px;height:9px}
+.tl-line{width:2px;flex:1;background:var(--line);min-height:20px}
+.tl-card{flex:1;padding:6px 10px 8px;border:1px solid var(--line);border-radius:10px;margin:4px 0;background:var(--panel);min-width:0}
+.tl-card:hover{border-color:var(--acc2)}
+.tl-card.hi{border-color:var(--warn);background:var(--panel2)}
+.tl-h{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;font:11px var(--mono)}
+.tl-h .app{color:var(--acc);font-weight:600}
+.tl-h .ts{color:var(--dim)}
+.tl-h .rev{color:var(--dim)}
+.tl-h .st{color:var(--warn);border:1px dashed var(--warn);border-radius:7px;padding:0 5px;font-size:9px}
+.tl-title{font-size:13px;line-height:1.3;margin-top:3px;color:var(--fg)}
+.tl-ev{font:10px var(--mono);color:var(--dim);margin-top:2px}
+.tl-link{display:inline-block;font:9px var(--mono);color:var(--acc2);border:1px dashed var(--acc2);border-radius:7px;padding:1px 6px;margin-top:3px;cursor:pointer;text-decoration:none}
+.tl-link:hover{background:var(--acc2);color:var(--bg)}
+.tl-link .sim{opacity:.7}
+.tl-empty{color:var(--dim);text-align:center;padding:30px 12px;font:13px var(--mono)}
 </style>
 </head>
 <body>
 <header>
   <span class="dot" id="dot"></span>
   <h1>chat<b>-pool</b></h1>
-  <span id="chain">chain…</span>
-  <button class="pbtn" id="open-plane" title="มองระนาบ RDH 144×144 — เปิด pointer ที่จุดที่คลิก">▦ ระนาบ</button>
+  <span id="chain">กำลังตรวจ…</span>
+  <button class="pbtn" id="btn-side" title="แผงจัดการ — ค้นข้อความ · ดูว่าแอปไหนเชื่อมต่ออยู่ · ข้อความที่ส่งถึงคุณ · สถิติ">☰ แผง</button>
+  <button class="pbtn" id="btn-cur" title="ตัวกรองขยะ: ซ่อนข้อความไร้สาระ/ข้อความทดสอบออกจากฟีด — กดเพื่อปิดตัวกรองและเห็นทุกบรรทัด (ไฟล์ log ไม่ถูกแตะ)">🧹 …</button>
+  <button class="pbtn" id="open-plane" title="แผนที่ที่อยู่ 144×144 ช่อง — ทุกบรรทัดมีที่อยู่ของตัวเอง คลิกช่องเพื่อเปิดดูว่ามีอะไรอยู่ตรงนั้น">▦ แผนที่</button>
+  <button class="pbtn" id="btn-blk" title="ความจำที่บันทึกไว้ — เรื่องราว + วิธีการ + หลักฐาน ที่ทุกแอปอ่านเข้าใจตรงกัน และตรวจย้อนกับประวัติได้">▣ ความจำ</button>
+  <button class="pbtn" id="btn-tl" title="เส้นเวลา — ดูว่าแอปไหนทำงานเสร็จเมื่อไร และความจำชิ้นไหนเชื่อมกับชิ้นไหน">⏱ เส้นเวลา</button>
   <span style="margin-left:auto;font:10px var(--mono);color:var(--dim)" id="clock"></span>
 </header>
+<div id="tabs"></div>
+<div id="tickbar">
+  <span id="tick-label">ช่วง…</span>
+  <input type="range" id="tick-range" min="0" max="0" value="0" title="ลากเพื่อข้ามไปช่วงนั้น">
+  <button class="pbtn" id="tk-prev" title="ช่วงก่อนหน้า">◀</button>
+  <button class="pbtn" id="tk-next" title="ช่วงถัดไป">▶</button>
+  <button class="pbtn" id="tk-open" title="กางทุกช่วงที่โหลดมา">กาง</button>
+  <button class="pbtn" id="tk-close" title="พับทุกช่วง — อ่านภาพรวมยาว ๆ">พับ</button>
+</div>
+<div id="blocks" hidden>
+  <div id="blk-bar">
+    <b>▣ ความจำที่บันทึกไว้</b>
+    <input id="blk-q" placeholder="ค้นในความจำที่บันทึกไว้ (Enter)">
+    <select id="blk-status"><option value="">ทุกสถานะ</option><option value="open">กำลังทำ</option><option value="closed">จบแล้ว</option><option value="parked">พักไว้</option></select>
+    <span class="blk-m" id="blk-count">–</span>
+    <button class="pbtn" id="blk-close" title="ปิดแผง">✕</button>
+  </div>
+  <div id="blk-list">…</div>
+</div>
+<div id="tl-panel" hidden>
+  <div id="tl-bar">
+    <b>⏱ เส้นเวลา</b>
+    <span class="blk-m" id="tl-count">–</span>
+    <button class="pbtn" id="tl-close" title="ปิดเส้นเวลา">✕</button>
+  </div>
+  <div id="tl-body">…</div>
+</div>
 <main>
   <div id="feed"></div>
-  <aside>
+  <aside id="side">
     <section>
-      <div style="display:flex;gap:8px">
-        <input id="q" placeholder="กรองข้อความ…" style="flex:1">
-        <select id="apps-sel" title="กรองตามแอป" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 6px;max-width:110px">
-          <option value="">ทุกแอป</option>
-        </select>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:9px">
+        <h2 style="margin:0;flex:1">แผงจัดการ</h2>
+        <button class="pbtn" id="side-close">ปิด ✕</button>
       </div>
+      <input id="q" placeholder="กรองข้อความ…">
+      <select id="apps-sel" title="กรองตามแอป" style="width:100%;margin-top:8px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:9px;font:12px var(--mono);padding:6px 7px">
+        <option value="">ทุกแอป</option>
+      </select>
     </section>
     <section>
       <div style="display:flex;gap:8px;align-items:center">
         <span style="font:10px var(--mono);color:var(--dim)">มุมมอง</span>
-        <select id="id-sel" title="View as" style="flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:4px 6px">
-          <option value="admin">admin (เห็นหมด)</option>
+        <select id="id-sel" title="ดูในมุมของใคร — เลือกแล้วฟีดจะเหลือเฉพาะบรรทัดของคนนั้น" style="flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:4px 6px">
+          <option value="admin">ผู้ดูแล (เห็นทุกอย่าง)</option>
         </select>
       </div>
       <div id="regbox" style="margin-top:9px;display:none">
-        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">registry</div>
+        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">แอปที่เชื่อมต่ออยู่</div>
         <div id="reg-list" style="font:11px var(--mono);color:var(--dim);max-height:130px;overflow-y:auto;white-space:pre-wrap;padding-top:4px"></div>
       </div>
       <div id="inboxbox" style="margin-top:9px;display:none">
-        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">inbox <b id="ib-count" style="color:var(--acc)">0</b></div>
+        <div style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">ข้อความถึงคุณ <b id="ib-count" style="color:var(--acc)">0</b></div>
         <div id="ib-list" style="font:11px var(--mono);color:var(--dim);max-height:150px;overflow-y:auto;white-space:pre-wrap;padding-top:4px"></div>
       </div>
     </section>
     <section>
-      <div class="stat"><span>lines</span><b id="st-lines">–</b></div>
-      <div class="stat"><span>last append</span><b id="st-last">–</b></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font:10px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px">ตัวกรองขยะ</span>
+        <button class="pbtn" id="cur-toggle" style="margin-left:auto">เปิด/ปิด</button>
+      </div>
+      <div class="curbar" id="cur-out" style="padding-top:6px">…</div>
+    </section>
+    <section>
+      <div class="stat"><span>บรรทัดทั้งหมด</span><b id="st-lines">–</b></div>
+      <div class="stat"><span>เขียนล่าสุด</span><b id="st-last">–</b></div>
       <div class="stat">
-        <span>cloud (pool.db)</span>
-        <label class="clabel"><input type="checkbox" id="cloudck" style="accent-color:var(--acc)"> show</label>
+        <span>สำเนาที่ค้นได้</span>
+        <label class="clabel"><input type="checkbox" id="cloudck" style="accent-color:var(--acc)"> แสดง</label>
       </div>
       <div class="cloudwrap" id="cloudwrap"><div id="cloudout" style="font:11px var(--mono);color:var(--dim);white-space:pre-wrap;padding-top:6px">…</div></div>
     </section>
-    <div id="composer">
-      <textarea id="msg-in" placeholder="พิมพ์ข้อความ… @ชื่อ=tag (Enter ส่ง)"></textarea>
-      <button class="send" id="send">ส่ง</button>
-      <select id="to-sel" title="ผู้รับ" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:0 6px">
-        <option value="all">→ all</option>
-      </select>
-    </div>
-    <div id="flushtip">flush ทุกชม.อัตโนมัติ · <a href="#" id="flushnow" style="color:var(--acc2)">flush เดี๋ยวนี้</a> = สำเนาขึ้น pool.db ให้ค้นได้</div>
   </aside>
 </main>
+<div id="scrim"></div>
+<div id="hint">
+  <span>ส่งถึง</span>
+  <select id="to-sel" title="ส่งถึงใคร — ทุกคน หรือเฉพาะแอปเดียว"><option value="all">→ ทุกคน</option></select>
+  <span id="flushtip" style="margin-left:auto" title="ทุกชั่วโมงระบบจะคัดลอกข้อความใหม่ไปไว้ในสำเนาที่ค้นหาได้เอง โดยไม่ต้องกดอะไร">สำเนาทุกชม. · <a href="#" id="flushnow" style="color:var(--acc2)">สำเนาเดี๋ยวนี้</a></span>
+</div>
+<div id="composer">
+  <textarea id="msg-in" rows="1" placeholder="พิมพ์ข้อความ… (Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่) · @ชื่อ=ติดป้ายให้คนนั้น"></textarea>
+  <button class="send" id="send">ส่ง</button>
+</div>
 <div class="toast" id="toast"></div>
 <div id="plane-modal">
   <div id="plane-box">
     <div id="plane-head">
-      <b style="font-size:13px;color:var(--acc)">ระนาบ RDH 144×144</b>
+      <b style="font-size:13px;color:var(--acc)">แผนที่ที่อยู่ 144×144 ช่อง</b>
       <span id="plane-info" style="font:10px var(--mono);color:var(--dim)"></span>
       <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
-        <button class="pbtn on" id="pv-plane" title="L2 — ทั้งระนาบเป็นแผนที่ (address+count เท่านั้น)">L2 ระนาบ</button>
-        <button class="pbtn" id="pv-blocks" title="L1 — ย่อเป็นบล็อก 12×12">L1 บล็อก</button>
-        <button class="pbtn" id="pv-block" title="ซูมเข้าบล็อก 12×12 ที่จุดที่เลือก">ซูมบล็อก</button>
+        <button class="pbtn on" id="pv-plane" title="มองทั้งแผนที่ — เห็นแค่ว่าช่องไหนมีบรรทัดอยู่กี่บรรทัด ไม่มีเนื้อหา">▦ ทั้งแผนที่</button>
+        <button class="pbtn" id="pv-blocks" title="ย่อแผนที่เหลือตาราง 12×12 — หนึ่งช่องแทน 12×12 ช่องของแผนที่">▩ ย่อ 12×12</button>
+        <button class="pbtn" id="pv-block" title="เปิดกรอบเลื่อนบนแผนที่ — ลากกรอบหรือกดลูกศร วนรอบไม่รู้จบ">▢ กรอบเลื่อน</button>
+        <select id="pv-win" title="ขนาดกรอบเลื่อน (หน่วย = ช่องบนแผนที่)" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
+          <option value="12">12×12</option>
+          <option value="24">24×24</option>
+          <option value="36">36×36</option>
+          <option value="48">48×48</option>
+          <option value="72">72×72</option>
+        </select>
+        <button class="pbtn" id="pv-lens" title="🔍 แว่นขยาย — ถือไว้แล้วลากไปทั่วแผนที่ ช่องใต้แว่นจะขยาย (ลาก = เลื่อนแว่น · ล้อ/ปุ่มมุมขวาล่าง = ซูม · ลูกศร = ขยับทีละช่อง · Enter/คลิก = อ่านช่องนั้น) ขยายได้ถึงความละเอียดจริงเท่านั้น: 1 ช่องเต็มแว่นแล้วหยุด">🔍 แว่นขยาย</button>
+        <button class="pbtn" id="pv-opt" title="ตัวเลือกการวาด: ตัดขยะ · เส้นเชื่อม · ความจำ · สีของช่อง · วิธีวาดเส้น · รัศมี · แพทเทิน">⚙ ตัวเลือก</button>
+        <button class="pbtn" id="pv-png2" title="บันทึกภาพแผนที่ตรงนี้เป็นไฟล์ PNG">⤓ png</button>
         <button class="pbtn" id="plane-close">ปิด ✕</button>
       </span>
     </div>
-    <div id="plane-bar">
-      <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> bonds</label>
-      <label class="clabel"><input type="checkbox" id="pv-ctx" style="accent-color:var(--acc2)"> memory</label>
-      <label class="clabel" title="ให้สีตามความหมายของ edge (uses/produces/...) — สีประจำ rel ไม่เปลี่ยนระหว่างการวาด"><input type="checkbox" id="pv-rel" checked style="accent-color:var(--acc2)"> สีตาม rel</label>
-      <select id="pv-style" title="วิธีวาด edge" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
+    <div id="plane-bar" class="off">
+      <label class="clabel" title="ตัดขยะ: บรรทัดที่ระบบตัดสินว่าเป็นข้อความทดสอบ/สัญญาณรบกวน จะไม่กินที่อยู่บนแผนที่ — ช่องที่อยู่ได้เพราะขยะล้วนจะหายไป และเส้นที่ชี้ไปที่นั้นก็ไม่ถูกวาด · ปิด = เห็นแผนที่ดิบก่อนตัด"><input type="checkbox" id="pv-prune" checked style="accent-color:var(--acc2)"> 🧹 ตัดขยะ</label>
+      <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> เส้นเชื่อม</label>
+      <label class="clabel"><input type="checkbox" id="pv-ctx" style="accent-color:var(--acc2)"> ความจำ</label>
+      <label class="clabel" title="ให้สีตามความหมายของเส้น (uses/produces/...) — สีประจำความหมายไม่เปลี่ยนระหว่างการวาด"><input type="checkbox" id="pv-rel" checked style="accent-color:var(--acc2)"> สีตามความหมาย</label>
+      <select id="pv-colour" title="สีของช่อง = ข้อมูลที่กำลังดูอยู่ (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)">
+        <option value="density">สี: จำนวนบรรทัด</option>
+        <option value="heat">สี: ความร้อน</option>
+        <option value="writer">สี: ใครเขียนล่าสุด</option>
+        <option value="recent">สี: ล่าสุดเมื่อไร</option>
+      </select>
+      <select id="pv-style" title="วิธีวาดเส้นเชื่อม" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
         <option value="auto">อัตโนมัติ (วัดแล้ว)</option>
         <option value="density">จางตามความแน่น</option>
         <option value="flat">เส้นตรง</option>
-        <option value="bundle">bundle (คู่เซลล์เดียวกัน)</option>
-        <option value="hub">hub เท่านั้น (top 12)</option>
-        <option value="degree">degree ring (ไม่วาดเส้น)</option>
+        <option value="bundle">รวมเส้น (คู่เดียวกัน)</option>
+        <option value="hub">เฉพาะจุดรวม (N แรก)</option>
+        <option value="degree">วงตามจำนวนเส้น (ไม่วาดเส้น)</option>
       </select>
-      <span id="pv-when">ทุกบรรทัด</span>
-      <input type="range" id="pv-seq" min="0" max="0" value="0">
-      <button class="pbtn" id="pv-play">▶ replay</button>
-      <button class="pbtn" id="pv-last">ล่าสุด</button>
+      <select id="pv-hubk" title="กี่ช่องที่ถือว่าเป็นจุดรวม — ยิ่งมาก ยิ่งเห็นเส้นมาก (ก่อนจะกลายเป็นหมึกท่วม)" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
+        <option value="12">จุดรวม 12</option>
+        <option value="30">จุดรวม 30</option>
+        <option value="60">จุดรวม 60</option>
+        <option value="120">จุดรวม 120</option>
+      </select>
+      <span id="pv-wininfo" style="color:var(--dim);font:10px var(--mono)"></span>
+      <span id="pv-lensinfo" title="ระดับที่กำลังขยายอยู่ · × = ขยายกี่เท่า · L = ความละเอียดจริงของข้อมูล"></span>
       <span style="display:flex;gap:4px;align-items:center;margin-left:auto">
-        <span style="color:var(--dim)">รัศมี</span>
-        <button class="pbtn on" id="pv-f0" title="เห็นทั้งระนาบ">ปิด</button>
-        <button class="pbtn" id="pv-f1" title="บังทุกอย่างที่ไม่เกี่ยวข้อง — เหลือเฉพาะที่ต่อจากจุดที่เลือก 1 ช่วง">1 hop</button>
-        <button class="pbtn" id="pv-f2">2 hop</button>
-        <button class="pbtn" id="pv-f3">3 hop</button>
+        <button class="pbtn" id="pv-census" title="รูปร่างของกราฟทั้งแผนที่: กี่บรรทัดเป็นเกาะ/ต้นน้ำ/กลางสาย/ปลายน้ำ และบรรทัดไหนที่มีคนอ้างถึงมากสุด">📊 แพทเทิน</button>
+        <span style="color:var(--dim)" title="รัศมี = แสดงเฉพาะช่องที่เชื่อมกับจุดที่เลือกภายใน N ทอด — 1 ทอด คือมีเส้นตรงถึงกัน 1 เส้น (ต้องเลือกจุดบนแผนที่ก่อน)">รัศมี</span>
+        <button class="pbtn on" id="pv-f0" title="เห็นทั้งแผนที่ ไม่กรองอะไร">ปิด</button>
+        <button class="pbtn" id="pv-f1" title="เหลือเฉพาะช่องที่ต่อจากจุดที่เลือก 1 ทอด (มีเส้นตรงถึงกัน 1 เส้น)">1 ทอด</button>
+        <button class="pbtn" id="pv-f2" title="เหลือเฉพาะช่องที่ต่อจากจุดที่เลือกภายใน 2 ทอด">2 ทอด</button>
+        <button class="pbtn" id="pv-f3" title="เหลือเฉพาะช่องที่ต่อจากจุดที่เลือกภายใน 3 ทอด">3 ทอด</button>
+      </span>
+    </div>
+    <!-- one row for "when": the coloured strip AND the scrubber it corresponds
+         to. They used to sit in two different rows — the strip here, the slider
+         and replay down in the options bar — which is the half of "controls
+         piled on controls" that was not just clutter: two controls for one axis
+         in two places reads as two axes. -->
+    <div id="plane-ribbon">
+      <canvas id="pv-ribbon" title="แถบเวลา: หนึ่งแท่ง = หนึ่งช่วง 8 บรรทัด สูงตามจำนวนบรรทัด สีตามคนที่เขียนมากสุด · ลากเพื่อเลื่อนเวลา"></canvas>
+      <span id="pv-ribbon-info">…</span>
+      <span id="pv-time">
+        <span id="pv-when">ทุกบรรทัด</span>
+        <input type="range" id="pv-seq" min="0" max="0" value="0" title="ลากเพื่อข้ามไปบรรทัดนั้น — ปลายขวาสุด = สภาพตอนนี้">
+        <button class="pbtn" id="pv-play" title="เล่นย้อนลำดับการเขียนทีละบรรทัด">▶ เล่นย้อน</button>
+        <button class="pbtn" id="pv-last" title="กลับไปสถานะตอนนี้ (แผนที่สด)">ล่าสุด</button>
       </span>
     </div>
     <div id="plane-body">
       <div id="plane-canvaswrap">
         <canvas id="plane-cv"></canvas>
-        <div id="plane-tip"></div>
-        <div id="plane-pop"></div>
+        <!-- the +/− start disabled because the magnifier starts OFF: there is
+             nothing to zoom until there is a glass to zoom. pvLensInfo owns
+             their state from the moment it runs. -->
+        <div id="pv-zoom">
+          <button id="pv-lens-zin" disabled title="ซูมเข้า — เห็นช่องเล็กลง (หยุดที่ความละเอียดจริง)">+</button>
+          <span class="zlvl" id="pv-zlvl">×1</span>
+          <button id="pv-lens-zout" disabled title="ซูมออก — เห็นช่องใหญ่ขึ้น">−</button>
+          <button id="pv-zreset" title="รีเซ็ตมุมมอง — กลับไปทั้งแผนที่และความละเอียด ×1 พร้อมวางแว่นที่จุดที่เลือก">⟲</button>
+        </div>
+        <div id="plane-tip" popover="manual"></div>
+        <div id="plane-pop" popover="manual"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail">คลิกช่องบนระนาบเพื่อเปิด pointer ที่จุดนั้น<br><br><span style="color:var(--dim)">◌ เขียว = เซลล์ที่มีข้อมูล (เข้ม = แน่นกว่า)<br>◌ วงฟ้า = จุดที่มีคนประกาศว่าอ่าน (sighting)<br>◌ เส้นฟ้า = bond ระหว่างบรรทัด · เส้นขาว = bond ที่แตะจุดที่เลือก (blast radius)<br>◌ จุดฟ้า = memory ของ magic-context · เส้นม่วงประ = edge ข้ามระบบ (บรรทัดที่ถูกยกเข้า memory)<br>◌ ลากแถบ tick เพื่อย้อนดูว่าระนาบค่อย ๆ ติดทีละบรรทัด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
+      <div id="plane-side"><div id="plane-detail"><div id="pv-legend"></div><b style="color:var(--fg)">แผนที่นี้คือที่อยู่ของทุกบรรทัด</b> — หนึ่งช่อง = หนึ่งที่อยู่ ตัวเลขในช่อง = มีกี่บรรทัดอยู่ตรงนั้น<br><br>▸ <b>คลิกช่อง</b> = ดูว่ามีอะไรอยู่ตรงนั้น<br>▸ <b>🔍 แว่นขยาย</b> = ถือไปดูใกล้ ๆ (ลาก = เลื่อนแว่น)<br>▸ ปุ่ม <b>+ −</b> มุมขวาล่าง = ซูมเข้า/ออก · <b>⟲</b> = กลับไปทั้งแผนที่<br>▸ <b>⚙ ตัวเลือก</b> ด้านบน = เปิดตัวกรอง (ตัดขยะ · เส้นเชื่อม · ความจำ · รัศมี · แพทเทิน)<br><br><span style="color:var(--dim)">◌ สีของช่อง = ข้อมูลที่เลือกไว้ด้านบน (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)<br>◌ วงฟ้า = ช่องที่มีคนบันทึกไว้ว่าอ่านแล้ว<br>◌ เส้นฟ้า = เส้นเชื่อมระหว่างบรรทัด · เส้นขาว = เส้นที่แตะจุดที่เลือกไว้<br>◌ จุดฟ้า = ความจำกลางที่แชร์ไว้ · เส้นม่วงประ = เส้นที่เชื่อมข้ามระบบ<br>◌ แถบเวลาด้านบน = ใครเขียนเมื่อไร · ลากที่แถบหรือลากสไลเดอร์เพื่อย้อนดูแผนที่ค่อย ๆ ประกอบ<br>◌ คีย์บอร์ด: ← → เลื่อนทีละบรรทัด · space เล่น/หยุด · Esc ปิด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
     </div>
   </div>
 </div>
 <script>
 const $=s=>document.querySelector(s);
+// ── display budget ───────────────────────────────────────────────────────────
+// CHUNK: how many lines make one tick. A tick is a POSITION in append order —
+// the same number the plane scrubs with, never a wall clock — so a chunk keeps
+// its number however much the log grows after it, and the newest tick is always
+// the last one. CLAMP: how much of one line a card shows while it is closed. A
+// handoff that used to fill the screen is now one scannable card, and the rest
+// is one tap away.
+const CHUNK=8, CLAMP=260;
 let msgs=[], filterQ='', filterApps=new Set(), identity='admin', myInbox=[];
+let expanded=new Set(), openTicks=new Set(), autoOpen=true, stick=true;
+// curator state lives on the client: every line arrives with its verdict (see
+// pool.stamp_cur), so 🧹 is a re-render, not a refetch — and the log itself is
+// never modified, only what this feed chooses to render
+let curatorOn=true, revealTicks=new Set(), curatorRep=null;
 // LAN access: token prompt (localhost skips auth server-side, this is harmless there)
 const TOKEN=(()=>{const m=location.hash.match(/token=([0-9a-f]+)/);const q=new URLSearchParams(location.search).get('token');const t=m?m[1]:q;if(t){localStorage.setItem('pool_token',t);history.replaceState(null,'',location.pathname)}return t||localStorage.getItem('pool_token')||''})();
 const H=TOKEN?{'Authorization':'Bearer '+TOKEN}:{'x-noauth':'1'};
@@ -307,35 +623,349 @@ const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&qu
 
 function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
 function hash8(h){return h?h.slice(0,8):''}
+function tickOf(m){return m.seq==null?null:Math.floor(m.seq/CHUNK)}
+// what the filters admit, before the curator is consulted
+function inScope(m){
+  return (!filterQ||(m.text||'').toLowerCase().includes(filterQ))&&
+         (filterApps.size===0||filterApps.has(m.app));
+}
+// a line the curator would keep out. `revealTicks` is the human overruling it
+// for ONE tick — the curator never gets to hide something permanently
+function trimmed(m){
+  return curatorOn && !!(m.cur&&m.cur.h) && !revealTicks.has(tickOf(m));
+}
+function visible(){return msgs.filter(m=>inScope(m)&&!trimmed(m))}
+// one line, clamped: label row + as much of the text as fits a glance
+// the browser reads the SAME canonical text the CLI prints (no second format on
+// the wire): a block line in the feed is six lines of payload, so it collapses to
+// one line here and the panel shows the rest — the feed is for the conversation,
+// not for re-printing a memory in full.
+function parseBlockText(t){
+  if(!t||!t.startsWith('⟦block⟧'))return null;   /* the marker is 7 chars, not 9 */
+  const head=t.split('\n')[0].match(/^⟦block⟧ slug=([^ ]+) rev=(\d+)$/);
+  if(!head)return null;
+  const d={slug:head[1],rev:+head[2],status:'open'};
+  ['title','story','method','evidence','refs','status'].forEach(k=>{
+    const ln=t.split('\n').find(x=>x.indexOf(k+':')===0);
+    if(ln)d[k]=ln.slice(k.length+1).trim()||d[k];
+  });
+  return d.title?d:null;
+}
+function card(m){
+  const kind=m.kind||'chat';
+  const kbadge=kind==='chat'?'':`<span class="badge kind">${esc(kind)}</span>`;
+  const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
+  const quiet=!!(m.cur&&m.cur.h);
+  const full=String(m.text==null?'':m.text);
+  if(kind==='block'){
+    const bd=parseBlockText(full);
+    if(bd)return `<div class="msg" data-m="${esc(m.hash||'')}"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}`
+      +`<span class="time">${fmt(m.t)}</span><span class="meta">#${m.seq==null?'–':m.seq}</span>`
+      +`<span class="hash" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอกรหัสเต็มของบรรทัดนี้">${hash8(m.hash)}</span></div>`
+      +`<div class="text"><b>▣ ${esc(bd.slug)}</b> <span style="color:var(--dim)">แก้ครั้งที่ ${bd.rev} · ${blkStatusTh(bd.status)}</span><br>${esc(bd.title)}</div>`
+      +`<button class="more" data-blk="${esc(bd.slug)}">▣ เปิดในแผงก้อน — เรื่อง · วิธีการ · หลักฐาน</button></div>`;
+  }
+  const lines=full.split('\n').length;
+  // a card only earns a clamp if there is something worth hiding: a text that
+  // barely crosses the budget reads in full instead of offering +6 ตัวอักษร
+  const long=full.length>CLAMP+60, open=expanded.has(m.hash);
+  const body=(open||!long)?full:full.slice(0,CLAMP);
+  const more=(long&&!open)
+    ?`<button class="more" data-h="${esc(m.hash||'')}">▸ อ่านต่อ (อีก ${full.length-CLAMP} ตัวอักษร${lines>1?` · ${lines} บรรทัด`:''})</button>`
+    :'';
+  // a revealed line says WHY it was kept out, in the line itself: a filter you
+  // cannot audit is one you end up not believing
+  const rbadge=quiet?`<span class="badge quiet" title="ตัวกรองขยะซ่อนบรรทัดนี้ไว้เพราะเข้าข่ายเหล่านี้ · ตัวเลขคือคะแนนความน่าเบื่อ ยิ่งสูงยิ่งถูกซ่อน">🧹 ${esc((m.cur.r||[]).map(ruleTh).join(' + '))} ${m.cur.s}</span>`:'';
+  return `<div class="msg${quiet?' quiet':''}" data-m="${esc(m.hash||'')}"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}${arrow}${rbadge}`
+    +`<span class="time">${fmt(m.t)}</span>`
+    +`<span class="meta" title="ลำดับที่บรรทัดนี้ถูกเขียนลง log">#${m.seq==null?'–':m.seq}</span>`
+    +`<span class="hash" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอกรหัสเต็มของบรรทัดนี้">${hash8(m.hash)}</span>`
+    +`</div><div class="text">${esc(body)}${long&&!open?'…':''}</div>${more}</div>`;
+}
 
 function render(){
   const feed=$('#feed');
-  const list=msgs.filter(m=>
-    (!filterQ||(m.text||'').toLowerCase().includes(filterQ))&&
-    (filterApps.size===0||filterApps.has(m.app))
-  );
-  feed.innerHTML=list.map(m=>{
-    const kind=m.kind||'chat';
-    const kbadge=kind==='chat'?'':`<span class="badge kind">${esc(kind)}</span>`;
-    const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
-    return `<div class="msg"><div class="top"><span class="badge">${esc(m.app||'?')}</span>${kbadge}${arrow}<span class="time">${fmt(m.t)}</span><span class="hash" title="คลิกเพื่อ copy" onclick="navigator.clipboard.writeText('${m.hash||''}');toast('copied '+ '${hash8(m.hash)}')">${hash8(m.hash)}</span></div><div class="text">${esc(m.text||'')}</div></div>`;
-  }).join('')||'<div style="color:var(--dim);text-align:center;padding:40px">ไม่มีข้อความ</div>';
-  // populate selects (apps filter, view-as, to)
+  // groups are built from what the FILTERS admit, not from what the curator
+  // left: a chunk whose every line is noise still keeps its tick in the rail,
+  // because a timeline that renumbers itself when you flip 🧹 is not a timeline
+  const list=msgs.filter(inScope);
+  if(!list.length){
+    feed.innerHTML=`<div class="empty">ไม่มีข้อความ${(filterQ||filterApps.size)?' ที่ตรงกับตัวกรอง':''}</div>`;
+    paintPickers();paintTicks([]);paintCurator();return;
+  }
+  // chunk the window by tick: lines are numbered by their own ordinal, so a
+  // boundary falls in the same place whether one line arrived or a hundred
+  const groups=[];
+  list.forEach(m=>{
+    const t=tickOf(m);
+    if(!groups.length||groups[groups.length-1].tick!==t)groups.push({tick:t,msgs:[]});
+    groups[groups.length-1].msgs.push(m);
+  });
+  if(autoOpen)openTicks.add(groups[groups.length-1].tick);   // the newest tick breathes
+  feed.innerHTML=groups.map(g=>{
+    const open=openTicks.has(g.tick);
+    const shown=g.msgs.filter(m=>!trimmed(m));
+    // how many of these lines the curator judges noise, regardless of whether
+    // this tick is currently revealing them — the chip has to stay a button in
+    // both directions, or revealing a tick would throw away the way back
+    const noise=g.msgs.filter(m=>m.cur&&m.cur.h).length;
+    const cut=g.msgs.length-shown.length;
+    const apps={};shown.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
+    const ent=Object.entries(apps).sort((a,b)=>b[1]-a[1]);
+    // three writers named, the rest counted: a header that clips its own tail
+    // would hide who is actually in the chunk
+    const chips=ent.slice(0,3).map(([a,n])=>`<span class="tchip">${esc(a)}${n>1?' ×'+n:''}</span>`).join('')
+      +(ent.length>3?`<span class="tchip">+${ent.length-3}</span>`:'');
+    const span=g.msgs[0].seq==null?'':`บรรทัด ${g.msgs[0].seq}–${g.msgs[g.msgs.length-1].seq} · `;
+    // the count in the header is what you see; the 🧹 chip is the rest, and it
+    // is a button in both directions (hide for this tick / show for this tick)
+    const rev=revealTicks.has(g.tick);
+    const clean=noise?`<span class="tclean${rev?' on':''}" data-rev="${g.tick}" title="ตัวกรองขยะซ่อนไว้ ${noise} บรรทัดในช่วงนี้ — กดเพื่อดู/ซ่อนเฉพาะช่วงนี้">🧹 ${rev?(noise+' แสดง'):cut}</span>`:'';
+    const body=shown.length?shown.map(card).join('')
+      :`<div class="empty" style="padding:12px 6px">ช่วงนี้ถูกซ่อนไว้ทั้งช่วง (${cut} บรรทัด)</div>`;
+    return `<div class="tick${open?' open':''}" data-tick="${g.tick}">`
+      +`<div class="thead"><span class="tno">ช่วงที่ ${g.tick==null?'–':g.tick}</span>`
+      +`<span class="tmeta">${span}${fmt(g.msgs[0].t)} – ${fmt(g.msgs[g.msgs.length-1].t)} · ${shown.length} บรรทัด</span>`
+      +`<span class="tapps">${chips}${clean}</span><span class="chev">${open?'▾':'▸'}</span></div>`
+      +`<div class="tbody">${body}</div></div>`;
+  }).join('');
+  paintPickers();paintTicks(groups);paintCurator();
+  if(stick)feed.scrollTop=feed.scrollHeight;
+}
+
+// The curator panel: what it would hide, by rule, with examples — the thing you
+// read before trusting it. Counts come from the server (the report over the
+// same window), so they do not depend on what this tab happens to be showing.
+function paintCurator(){
+  const n=msgs.filter(m=>m.cur&&m.cur.h).length;
+  const rep=curatorRep||{};
+  const btn=$('#btn-cur');
+  btn.textContent=curatorOn?`🧹 ซ่อน ${n}`:'🧹 ปิด';
+  btn.title=curatorOn
+    ? `ตัวกรองขยะกำลังซ่อน ${n} บรรทัดออกจากฟีด — กดเพื่อปิดและเห็นทุกบรรทัด`
+    : 'ตัวกรองขยะปิดอยู่ — เห็นทุกบรรทัด กดเพื่อเปิด';
+  btn.classList.toggle('on',curatorOn);
+  const tog=$('#cur-toggle');
+  tog.textContent=curatorOn?'ปิด 🧹':'เปิด 🧹';
+  tog.classList.toggle('on',curatorOn);
+  const chips=Object.entries(rep.by_rule||{}).slice(0,6)
+    .map(([r,c])=>`<span class="curchip">${esc(ruleTh(r))} ${c}</span>`).join('');
+  const prot=Object.entries(rep.protected||{}).map(([k,v])=>`${protectTh(k)} ${v}`).join(' · ');
+  const ex=(rep.examples||[]).slice(0,3).map(e=>
+    `<div class="curex">[${e.score}] ${esc(e.app)} (${esc((e.rules||[]).map(ruleTh).join(' + '))}) ${esc(e.text)}</div>`).join('');
+  $('#cur-out').innerHTML=(curatorOn?'':'<b style="color:var(--warn)">ตัวกรองปิดอยู่ — เห็นทุกบรรทัด</b><br>')
+    +`อ่านมา ${rep.lines==null?msgs.length:rep.lines} บรรทัด · ซ่อน ${rep.hidden==null?n:rep.hidden}`
+    +` · เหลือ ${rep.kept==null?(msgs.length-n):rep.kept} · ตัดเมื่อคะแนน ≥${rep.hide_at==null?'?':rep.hide_at}<br>`
+    +(chips?`<div style="margin-top:4px">${chips}</div>`:'')
+    +(prot?`<div style="margin-top:4px">ยกเว้นไว้: ${esc(prot)}</div>`:'')
+    +(ex?`<div style="margin-top:6px">ตัวอย่างที่ถูกซ่อน:</div>${ex}`:'')
+    +`<div style="margin-top:6px;color:var(--dim)">ซ่อนแค่บนจอ — ในไฟล์ log ยังมีครบทุกบรรทัด</div>`
+    // the plane answers the SAME question with a different consequence:
+    // hide dims a line on the feed, prune stops it occupying an address.
+    // Both numbers come from the same rules, so show them side by side.
+    +(()=>{
+      const p=rep.plane;
+      if(!p)return '';
+      const pr=Object.entries(p.by_rule||{}).slice(0,6)
+        .map(([r,c])=>`<span class="curchip">${esc(ruleTh(r))} ${c}</span>`).join('');
+      // prune reaches past the map: an edge or a sighting can lose the end
+      // it points at while its own line stays intact. Say so, or "pruned 3
+      // lines" reads like nothing else moved.
+      const dang=(p.dangling_bonds||0)+(p.dangling_sightings||0);
+      return `<div style="margin-top:8px;border-top:1px dashed var(--line);padding-top:6px">`
+        +`<b>▦ แผนที่ — การตัดขยะจริง</b> · ช่องที่หายไป ${p.cells_pruned}`
+        +` · ตัดออก ${p.pruned} บรรทัด · ตัดเมื่อคะแนน ≥${p.prune_at}`
+        +(pr?`<div style="margin-top:4px">${pr}</div>`:'')
+        +(dang?`<div style="margin-top:4px">🪢 เส้นที่ชี้ไปยังที่ที่ถูกตัด: เส้นเชื่อม ${p.dangling_bonds} · รอยอ่าน ${p.dangling_sightings}</div>`:'')
+        +`<div style="margin-top:6px;color:var(--dim)">บรรทัดที่ถูกตัดจะไม่กินที่อยู่ — และเส้น/รอยอ่านที่ชี้ไปที่นั่นก็ไม่ถูกวาด (ใน log ยังมีครบ)</div></div>`;
+    })();
+}
+function paintPickers(){
+  // populate selects (apps filter, view-as, to) + the app tabs
   const apps={};msgs.forEach(m=>apps[m.app||'?']=(apps[m.app||'?']||0)+1);
   const known=[...new Set([...Object.keys(apps),'hermes','codex','human'])].sort();
   const asel=$('#apps-sel');const acur=asel.value;
   asel.innerHTML='<option value="">ทุกแอป</option>'+Object.entries(apps).sort((a,b)=>b[1]-a[1]).map(([a,n])=>`<option value="${esc(a)}">${esc(a)} (${n})</option>`).join('');
   if([...asel.options].some(o=>o.value===acur))asel.value=acur;
-  const isel=$('#id-sel');const icur=isel.value;
-  isel.innerHTML='<option value="admin">admin (เห็นหมด)</option>'+known.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
-  if([...isel.options].some(o=>o.value===icur))isel.value=icur;
+  // `identity` is the value the WHOLE page is filtered by, so the control that
+  // picks it must (a) contain it and (b) display it. The options are rebuilt
+  // from the loaded window, which dropped any identity with no lines in it —
+  // the select fell back to "admin" while the view was still filtered as
+  // someone else, and picking from it then compared against the wrong value.
+  // A picker that disagrees with the thing it picks is worse than no picker.
+  const idOpts=[...new Set([...known,identity])].filter(Boolean).sort();
+  const isel=$('#id-sel');
+  isel.innerHTML='<option value="admin">ผู้ดูแล (เห็นทุกอย่าง)</option>'
+    +idOpts.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
+  isel.value=identity;
   const sel=$('#to-sel');const cur=sel.value;
-  sel.innerHTML='<option value="all">→ all</option>'+known.filter(a=>a!=='human').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
+  sel.innerHTML='<option value="all">→ ทุกคน</option>'+known.filter(a=>a!=='human').map(a=>`<option value="${esc(a)}">→ ${esc(a)}</option>`).join('');
   if([...sel.options].some(o=>o.value===cur))sel.value=cur;
   $('#st-lines').textContent=msgs.length;
   $('#st-last').textContent=msgs.length?fmt(msgs[msgs.length-1].t):'–';
+  $('#tabs').innerHTML=`<button class="tab${filterApps.size?'':' on'}" data-app="">ทั้งหมด <span class="n">${msgs.length}</span></button>`
+    +Object.entries(apps).sort((a,b)=>b[1]-a[1])
+      .map(([a,n])=>`<button class="tab${filterApps.has(a)?' on':''}" data-app="${esc(a)}">${esc(a)} <span class="n">${n}</span></button>`).join('');
 }
-window.setIdentity=async a=>{identity=a;refresh().catch(()=>{});await registerIdentity();loadInbox().catch(()=>{})};
+// the rail says what the loaded window really holds: ticks are numbered from the
+// start of the log, so the label can never claim more history than it read
+function paintTicks(groups){
+  const r=$('#tick-range'),label=$('#tick-label');
+  const ticks=groups.map(g=>g.tick).filter(t=>t!=null);
+  if(!ticks.length){r.min=r.max=0;r.value=0;r.disabled=true;label.textContent='ช่วง —';return}
+  r.disabled=false;r.min=Math.min(...ticks);r.max=Math.max(...ticks);r.value=r.max;
+  const lines=groups.reduce((a,g)=>a+g.msgs.length,0);
+  label.textContent=`ช่วงที่ ${r.min}–${r.max} · ${ticks.length} ช่วง · โหลดมา ${lines} บรรทัด`;
+}
+// opening a chunk is a view change, not a read: the lines are already here and
+// toggling a class keeps the scroll exactly where the finger left it
+function toggleTick(t,on){
+  const node=$('#feed').querySelector(`.tick[data-tick="${t}"]`);
+  if(!node)return;
+  const open=on==null?!node.classList.contains('open'):on;
+  node.classList.toggle('open',open);
+  const chev=node.querySelector('.chev');if(chev)chev.textContent=open?'▾':'▸';
+  if(open)openTicks.add(t);else{openTicks.delete(t);autoOpen=false}
+}
+$('#tabs').onclick=e=>{
+  const b=e.target.closest('.tab');if(!b)return;
+  const a=b.dataset.app;
+  filterApps=(!a||filterApps.has(a))?new Set():new Set([a]);
+  stick=true;render();
+};
+$('#feed').onclick=e=>{
+  // reveal/hide the noise inside ONE tick: the curator's verdict is per line,
+  // but the human's override is per chunk — that is the unit they are reading
+  const rev=e.target.closest('.tclean');
+  if(rev){
+    const t=+rev.dataset.rev;
+    revealTicks.has(t)?revealTicks.delete(t):revealTicks.add(t);
+    stick=false;render();
+    $('#feed').querySelector(`.tick[data-tick="${t}"]`)?.scrollIntoView({block:'nearest'});
+    return;
+  }
+  const blk=e.target.closest('[data-blk]');
+  if(blk){
+    // a block in the feed is a pointer to the panel, not a copy of it: one card,
+    // one shelf, one place where the story lives
+    const slug=blk.dataset.blk;
+    blocksOn=true;$('#blocks').hidden=false;blkOpen.add(slug);
+    loadBlocks().then(()=>$('#blk-list').querySelector(`.blk[data-slug="${slug}"]`)?.scrollIntoView({block:'nearest'}));
+    return;
+  }
+  const more=e.target.closest('.more');
+  if(more&&more.dataset.h){
+    const h=more.dataset.h,box=more.closest('.msg'),top=box?box.getBoundingClientRect().top:null;
+    expanded.has(h)?expanded.delete(h):expanded.add(h);
+    // expanding grows the card under the finger: render() rebuilds the feed, so
+    // re-anchor THIS card's top edge where it was instead of jumping (stick
+    // would drag the reader to the bottom of the newest tick instead)
+    stick=false;render();
+    const node=$('#feed').querySelector(`.msg[data-m="${h}"]`);
+    if(node&&top!=null)$('#feed').scrollTop+=node.getBoundingClientRect().top-top;
+    return;
+  }
+  const head=e.target.closest('.thead');
+  if(head){toggleTick(+head.parentElement.dataset.tick);return}
+  const hash=e.target.closest('.hash');
+  if(hash){const h=hash.dataset.h||'';
+    if(navigator.clipboard)navigator.clipboard.writeText(h).catch(()=>{});
+    toast('คัดลอกแล้ว · '+hash8(h))}
+};
+$('#feed').onscroll=()=>{const f=$('#feed');stick=(f.scrollHeight-f.scrollTop-f.clientHeight)<70};
+$('#tick-range').oninput=e=>{
+  const t=+e.target.value,node=$('#feed').querySelector(`.tick[data-tick="${t}"]`);
+  if(!node)return;
+  toggleTick(t,true);stick=false;
+  node.scrollIntoView({block:'start',behavior:'smooth'});
+};
+function stepTick(d){
+  const r=$('#tick-range');if(r.disabled)return;
+  r.value=Math.max(+r.min,Math.min(+r.max,+r.value+d));
+  r.oninput({target:r});
+}
+$('#tk-prev').onclick=()=>stepTick(-1);
+$('#tk-next').onclick=()=>stepTick(1);
+$('#tk-open').onclick=()=>$('#feed').querySelectorAll('.tick').forEach(n=>toggleTick(+n.dataset.tick,true));
+$('#tk-close').onclick=()=>$('#feed').querySelectorAll('.tick').forEach(n=>toggleTick(+n.dataset.tick,false));
+// the panels are a drawer, so the feed keeps the full width on a phone
+function sideOpen(on){
+  const s=$('#side');
+  const open=on==null?!s.classList.contains('open'):on;
+  s.classList.toggle('open',open);$('#scrim').classList.toggle('on',open);
+}
+const curatorFlip=()=>{
+  curatorOn=!curatorOn;revealTicks.clear();render();
+  toast(curatorOn?'🧹 ซ่อนข้อความไร้สาระแล้ว — ในไฟล์ log ยังมีครบ'
+                :'🧹 ปิดตัวกรอง — เห็นทุกบรรทัดรวมข้อความทดสอบ');
+};
+$('#btn-cur').onclick=curatorFlip;
+$('#cur-toggle').onclick=curatorFlip;
+
+// ── ▣ ก้อนเรื่องราว: the story/method layer ─────────────────────────────────
+// Same source as the CLI (GET /blocks), so a human reading the CLI, a browser
+// and an agent posting JSON all see byte-identical text — the format is
+// canonical, this is only a renderer. A closed card is meta+title; the rest is
+// one tap away, because six unfolded blocks would be a wall of text on a phone.
+let blocksOn=false, blkRep=[], blkOpen=new Set(), blkHist=new Map();
+function blkCard(r){
+  const open=blkOpen.has(r.slug);
+  const vals=['story','method','evidence','refs'].filter(k=>r[k])
+    .map(k=>`<div class="blk-v"><i>${k}</i>${esc(r[k])}</div>`).join('');
+  const hist=(blkHist.get(r.slug)||[]).map(h=>
+    `<div class="blk-rev blk-m">แก้ครั้งที่ ${h.rev} · ${esc(h.app||'?')} · ${fmt(h.t)} · ${hash8(h.hash)}</div>`).join('');
+  return `<div class="blk" data-open="${open?1:0}" data-slug="${esc(r.slug)}">
+    <div class="blk-h"><b>▣ ${esc(r.slug)}</b><span class="blk-m">แก้ครั้งที่ ${r.rev}${r.revs>1?' (แก้มา '+r.revs+' ครั้ง)':''} · ${blkStatusTh(r.status)} · ${esc((r.apps||[]).join(','))} · ${fmt(r.t)} · ที่อยู่ ${r.rkey}/${r.enc}</span></div>
+    <div class="blk-t">${esc(r.title)}</div>
+    ${open?vals:''}
+    <div class="blk-more">${open?'▾ ซ่อน':'▸ กาง'} รายละเอียด${open?` · <span data-hist="${esc(r.slug)}" style="color:var(--acc2)">ประวัติการแก้</span>`:''}</div>
+    ${open?hist:''}
+  </div>`;
+}
+function paintBlocks(){
+  $('#blk-list').innerHTML=blkRep.map(blkCard).join('')||
+    '<div class="empty" style="padding:10px 4px">ยังไม่มีความจำที่บันทึกไว้ — เขียนด้วย <code>python pool.py block &lt;slug&gt; --title "…"</code> หรือ POST /block</div>';
+  $('#blk-count').textContent=blkRep.length+' ชิ้น';
+}
+async function loadBlocks(){
+  const q=$('#blk-q').value.trim(), st=$('#blk-status').value;
+  const url='/blocks'+(q?'?q='+encodeURIComponent(q):'')+(st?(q?'&':'?')+'status='+encodeURIComponent(st):'');
+  try{ blkRep=await fetch(url,{headers:H}).then(r=>r.json()); }catch(e){ blkRep=[]; }
+  blkHist.clear(); paintBlocks();
+}
+$('#blk-list').onclick=async ev=>{
+  const hb=ev.target.closest('[data-hist]');
+  if(hb){
+    const slug=hb.getAttribute('data-hist');
+    const row=await fetch('/blocks?slug='+encodeURIComponent(slug)+'&revs=1',{headers:H}).then(r=>r.json()).catch(()=>null);
+    if(row&&row.history){ blkHist.set(slug,row.history); paintBlocks(); }
+    return;
+  }
+  const card=ev.target.closest('.blk'); if(!card) return;
+  const slug=card.getAttribute('data-slug');
+  blkOpen.has(slug)?blkOpen.delete(slug):blkOpen.add(slug);
+  paintBlocks();
+};
+$('#btn-blk').onclick=()=>{ blocksOn=!blocksOn; $('#blocks').hidden=!blocksOn; if(blocksOn) loadBlocks(); };
+$('#blk-close').onclick=()=>{ blocksOn=false; $('#blocks').hidden=true; };
+$('#blk-q').onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); loadBlocks(); } };
+$('#blk-status').onchange=loadBlocks;
+setInterval(()=>{ if(blocksOn&&!document.hidden) loadBlocks(); },20000);
+$('#btn-side').onclick=()=>sideOpen();
+$('#side-close').onclick=()=>sideOpen(false);
+$('#scrim').onclick=()=>sideOpen(false);
+window.setIdentity=async a=>{
+  identity=a;
+  // the stream carries the identity in its own `as=` filter, so switching the
+  // view has to rebuild it. Without this the header said "hermes" while the
+  // live stream kept sending admin's EVERY line — measured: stream.url stayed
+  // /stream?n=200 with no `as=`. Re-reading once (refresh) only fixes the past;
+  // listen() is what fixes the next line.
+  listen();
+  refresh().catch(()=>{});
+  await registerIdentity();
+  loadInbox().catch(()=>{});
+};
 
 async function loadInbox(mark){
   const regbox=$('#regbox'), inboxbox=$('#inboxbox');
@@ -345,18 +975,111 @@ async function loadInbox(mark){
     $('#reg-list').innerHTML=reg.map(a=>{
       const seen=new Date(a.last_seen*1000);
       const live=(Date.now()-seen.getTime())<120000;
-      return `${live?'🟢':'⚪'} ${esc(a.app)} · ${seen.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})}`;
-    }).join('\n')||'(ยังไม่มีใคร register)';
-  }catch{regbox.style.display='none'}
+      // only the live one earns a word: two dozen rows of "gone" is noise, and
+      // the section already says the list is who is connected — the grey dot
+      // carries the rest
+      return (live?`🟢 กำลังเชื่อมต่อ · `:'⚪ ')+esc(a.app)
+        +` · เห็นล่าสุด ${seen.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})}`;
+    }).join('\n')||'(ยังไม่มีแอปที่เชื่อมต่ออยู่)';
+  }catch(e){
+    // a failed registry read used to just hide the section, so "cannot reach
+    // the server" and "nobody is registered" looked identical — the panel
+    // silently disappeared instead of saying why it was empty.
+    regbox.style.display='block';
+    const rb=$('#reg-list');
+    rb.textContent='⚠ โหลดรายชื่อแอปไม่ได้ — ต่อเซิร์ฟเวอร์ไม่ติด';
+    rb.title='ข้อความจากเบราว์เซอร์: '+(e&&e.message||e);
+  }
   if(identity==='admin'){inboxbox.style.display='none';return}
   inboxbox.style.display='block';
-  const r=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':''),{headers:H}).then(r=>r.json());
-  if(r.error){$('#ib-list').textContent='⚠ '+r.error;$('#ib-count').textContent='?';return}
+  const res=await fetch('/inbox?app='+identity+(mark===false?'&mark=0':''),{headers:H});
+  const r=await res.json().catch(()=>({}));
+  if(r.error){
+    const box=$('#ib-list');
+    box.textContent='⚠ '+sayError(r,res.status);
+    box.title=sayRaw(r,res.status);
+    $('#ib-count').textContent='?';return
+  }
   myInbox=r;
   $('#ib-count').textContent=r.length;
-  $('#ib-list').innerHTML=r.length?r.map(m=>`[${fmt(m.t)}] ${esc(m.app)}: ${esc(m.text).slice(0,90)}`).join('\n'):'(ว่าง — ไม่มี mention/DM ใหม่)';
+  $('#ib-list').innerHTML=r.length?r.map(m=>`[${fmt(m.t)}] ${esc(m.app)}: ${esc(m.text).slice(0,90)}`).join('\n'):'(ว่าง — ไม่มีข้อความใหม่ถึงคุณ)';
 }
-window.toast=t=>{const el=$('#toast');el.textContent=t;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
+// ── errors in words a person can act on ─────────────────────────────────────
+// The wire keeps its English label: the CLI prints it, `stream_check` asserts
+// on it, and an operator greps for it. So the translation lives HERE — at the
+// only place a human ever reads it. An error we do not recognise falls back to
+// what its status code means, and the original wording is never thrown away:
+// it goes into the toast's tooltip, one hover away from whoever needs it.
+const SAY_STATUS={
+  400:'ส่งข้อมูลไปไม่ครบหรือรูปแบบไม่ถูกต้อง — ยังไม่มีอะไรถูกบันทึก',
+  401:'ยังไม่ได้เข้าสู่ระบบ — ต้องสแกน QR ใหม่จากหน้าจอเซิร์ฟเวอร์',
+  403:'แอปนี้ยังไม่ได้ลงทะเบียนไว้กับพูล — ต้องลงทะเบียนก่อนจึงจะเขียนได้',
+  404:'ไม่พบสิ่งที่ขอ — อาจถูกลบไปแล้ว หรือที่อยู่ผิด',
+  500:'เซิร์ฟเวอร์ทำงานผิดพลาด — ลองอีกครั้ง ถ้ายังไม่หายให้ดู log ที่เซิร์ฟเวอร์',
+  503:'ส่วนนี้ยังไม่พร้อมใช้งาน'
+};
+// Ordered, and the order is load-bearing: a pattern that claims a CAUSE has to
+// come before one that only recognises a shape. `?rkey=… and optional ?level=`
+// matches both, and "you did not give me an address" is the useful sentence.
+// The last line is the widest for the same reason it is the last.
+//
+// Every entry here was reached by a real request — `error_check.py` drives all
+// 39 malformed probes at a live server and fails if any error falls back to its
+// HTTP status instead of a sentence of its own.
+const SAY_ERRORS=[
+  // ── what the request was missing
+  [/\bapp=?\s+required/, ()=>'ไม่ได้ระบุชื่อแอป'],
+  [/^text required/, ()=>'ไม่มีข้อความให้บันทึก'],
+  [/body must be a JSON object/, ()=>'ข้อมูลที่ส่งไปอ่านไม่ได้ — ข้อความนี้ยังไม่ถูกบันทึก'],
+  [/\?n=/, ()=>'จำนวนบรรทัดที่ขอไม่ถูกต้อง — ต้องเป็นจำนวนเต็ม'],
+  [/\?hide=/, ()=>'คะแนนเกณฑ์ไม่ถูกต้อง — ต้องเป็นจำนวนเต็ม'],
+  [/\?rkey=/, ()=>'ไม่ได้ระบุที่อยู่บนแผนที่'],
+  [/\?level=/, ()=>'ตัวเลือกระดับความละเอียดไม่ถูกต้อง'],
+  [/\?path=/, ()=>'เส้นทางช่องย่อยไม่ถูกต้อง — ต้องเป็นตัวเลขคั่นด้วยจุลภาค'],
+  [/\?hops=/, ()=>'จำนวนทอดไม่ถูกต้อง (ต้อง 1–4)'],
+  [/\?hash=/, ()=>'ต้องระบุบรรทัดที่จะเปิด'],
+  // ── what was named, and whether it exists or is allowed
+  [/^no such block: (\S+)/, m=>`ไม่พบบันทึกความจำชื่อ “${m[1]}”`],
+  [/^(\S+) not registered/, m=>`แอป “${m[1]}” ยังไม่ได้ลงทะเบียนไว้กับพูล — ลงทะเบียนก่อนจึงจะเขียนได้`],
+  [/^invalid app name/, ()=>'ชื่อแอปใช้ไม่ได้ — ใช้ได้เฉพาะ a–z 0–9 _ - ยาว 1–32 ตัว'],
+  [/^slug must be/, ()=>'ชื่อความจำ (slug) ใช้ไม่ได้ — ต้องขึ้นต้นด้วย a–z หรือ 0–9 แล้วตามด้วย a–z 0–9 . _ - ไม่เกิน 48 ตัว'],
+  [/^status must be one of/, ()=>'สถานะไม่ถูกต้อง — ใช้ได้แค่ กำลังทำ / จบแล้ว / พักไว้'],
+  [/^title required/, ()=>'ต้องมีชื่อเรื่อง — เป็นบรรทัดแรกที่คนอื่นจะอ่าน'],
+  [/is not a hash prefix/, ()=>'รหัสอ้างอิงไม่ถูกต้อง — ต้องเป็น hex 6–64 ตัว'],
+  [/^src\/dst must be/, ()=>'ต้องอ้างถึงบรรทัดด้วยรหัสเต็ม 64 ตัว'],
+  [/^rel must be one of/, ()=>'ความหมายของเส้นไม่ถูกต้อง'],
+  [/^bond_hash must be/, ()=>'ต้องระบุรหัสเส้นเต็ม 64 ตัว'],
+  // ── what the server itself could not read
+  [/no ctx index/, ()=>'ยังไม่มีข้อมูลความจำกลาง — ต้องรันตัวสแกนที่เซิร์ฟเวอร์ก่อน'],
+  [/^ctx_plane unavailable/, ()=>'อ่านข้อมูลความจำกลางไม่ได้ — ลองรันตัวสแกนใหม่ที่เซิร์ฟเวอร์'],
+  [/token required/, ()=>'ยังไม่ได้เข้าสู่ระบบ — สแกน QR ใหม่จากหน้าจอเซิร์ฟเวอร์'],
+  [/^not found/, ()=>'ไม่พบสิ่งที่ขอ']
+];
+// r = the server's JSON body, st = its HTTP status (either may be missing)
+function sayError(r,st){
+  const raw=(r&&r.error)?String(r.error):'';
+  for(const [re,f] of SAY_ERRORS){const m=raw.match(re);if(m)return f(m)}
+  if(st&&SAY_STATUS[st])return SAY_STATUS[st];
+  return raw?'เซิร์ฟเวอร์ปฏิเสธคำขอนี้':'ต่อเซิร์ฟเวอร์ไม่ติด';
+}
+function sayRaw(r,st){                  // the exact wording, for hovering over
+  const raw=(r&&r.error)?String(r.error):'';
+  return raw?('ข้อความจากเซิร์ฟเวอร์: '+raw+(st?(' · HTTP '+st):'')):'';
+}
+// a memory's status is a wire value (open/closed/parked); a person reads a word
+const BLK_STATUS={open:'กำลังทำ',closed:'จบแล้ว',parked:'พักไว้'};
+const blkStatusTh=s=>BLK_STATUS[s]||s||'?';
+// the noise filter names its reasons in code (test-word, hex-blob, …). Those
+// names are the AUDIT TRAIL — they stay on the wire and in the report — but the
+// screen is read by a person, so the words change here and nowhere else.
+const RULE_TH={'test-word':'คำทดสอบ','test-probe':'คำทดสอบ','stub':'สั้นเกินไป',
+  'ack':'คำรับทราบ','sess-id':'รหัสรอบทำงาน','hex-blob':'ชุดรหัส','b64-blob':'ชุดรหัส',
+  'punct-soup':'เครื่องหมายล้วน','loud':'ตัวอักษรซ้ำมาก','repeat':'ข้อความซ้ำ'};
+const ruleTh=r=>RULE_TH[r]||r;
+const PROTECT_TH={kind:'ไม่ใช่ข้อความคุย (เป็นข้อมูลของระบบ)',dm:'ส่งถึงคนเดียว',
+  mention:'มีการเรียกชื่อ',long:'ข้อความยาว',marker:'มีคำสำคัญอย่าง สรุป/ตัดสิน'};
+const protectTh=p=>PROTECT_TH[p]||p;
+window.toast=(t,detail)=>{const el=$('#toast');el.textContent=t;el.title=detail||'';el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
 
 $('#q').oninput=e=>{filterQ=e.target.value.toLowerCase();render()};
 $('#apps-sel').onchange=e=>{filterApps=new Set(e.target.value?[e.target.value]:[]);render()};
@@ -364,62 +1087,122 @@ $('#id-sel').onchange=e=>setIdentity(e.target.value);
 $('#cloudck').onchange=async e=>{
   $('#cloudwrap').classList.toggle('open',e.target.checked);
   if(e.checked){const r=await fetch('/view?n=6&cloud=1',{headers:H}).then(r=>r.json());
-    $('#cloudout').textContent=r.lines?.join('\n')||'(empty)';}
+    $('#cloudout').textContent=r.lines?.join('\n')||'(ยังไม่มีอะไรถูกคัดลอก)';}
 };
+// ── the input path: one append in flight, and the draft is dropped only once
+// the line is IN the chain. Clearing the box first — what this used to do —
+// means any failed send destroys what someone typed (server restarting, phone
+// off the LAN, a rejected token) with no toast and an unhandled rejection to
+// prove it: measured, the box came back empty and silent. A message that could
+// not be sent is recoverable; a message that was erased is not.
+let sending=false;
 async function send(){
-  const el=$('#msg-in');const text=el.value.trim();if(!text)return;
-  el.value='';el.style.height='38px';
-  const r=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json',...H},body:JSON.stringify({app:'human',kind:'chat',text,to:$('#to-sel').value})}).then(r=>r.json());
-  if(r.ok)toast('sent '+r.hash.slice(0,8));else toast('error: '+(r.error||''));
+  const el=$('#msg-in'),btn=$('#send');
+  const text=el.value.trim();
+  if(!text||sending)return;            // Enter held down is still ONE append
+  sending=true;btn.disabled=true;      // and the button says so
+  try{
+    // the STATUS matters for the message: the body says which field was wrong,
+    // the code says whether it is worth trying again, and a person needs both
+    const res=await fetch('/append',{method:'POST',headers:{'Content-Type':'application/json',...H},
+      body:JSON.stringify({app:'human',kind:'chat',text,to:$('#to-sel').value})});
+    const r=await res.json().catch(()=>({}));
+    if(r.ok){
+      el.value='';el.style.height='46px';el.style.overflowY='hidden';stick=true;
+      toast('ส่งแล้ว · '+hash8(r.hash));
+    }else{
+      el.focus();
+      toast('ยังไม่ส่ง — '+sayError(r,res.status)+' · ข้อความยังอยู่ในช่อง', sayRaw(r,res.status));
+    }
+  }catch(e){
+    // the server refused, or never answered — either way the draft stays put
+    el.focus();
+    toast('ส่งไม่ถึงเซิร์ฟเวอร์ — ข้อความยังอยู่ในช่อง (กด Enter อีกครั้ง)');
+  }finally{
+    sending=false;btn.disabled=false;
+  }
 }
 
 async function registerIdentity(){
   if(identity==='admin')return;
   const r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:identity})}).then(r=>r.json());
-  if(r.error)toast('register fail: '+r.error);else toast(r.created?('registered '+identity):identity+' ok');
+  if(r.error)toast('ลงทะเบียนไม่ผ่าน — '+sayError(r), sayRaw(r));
+  else toast(r.created?('ลงทะเบียน “'+identity+'” แล้ว'):('“'+identity+'” ลงทะเบียนไว้ก่อนแล้ว'));
 }
 $('#send').onclick=send;
 $('#msg-in').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
-$('#msg-in').oninput=e=>{e.target.style.height='38px';e.target.style.height=Math.min(e.target.scrollHeight,140)+'px'};
-$('#flushnow').onclick=async e=>{e.preventDefault();const r=await fetch('/flush',{method:'POST',headers:H}).then(r=>r.json());toast(r.pushed?`flush ok: ${r.pushed.length} pushed`:(r.emitted?'flush ok':'nothing to flush'));refresh()};
+// grow with the draft, up to a third of the screen, and only then hand the
+// scrolling back to the textarea (a permanent scrollbar on a 46px box is just
+// noise, and this is the control the whole UI exists to serve)
+$('#msg-in').oninput=e=>{
+  const el=e.target,cap=Math.round(window.innerHeight*0.32);
+  el.style.height='auto';
+  el.style.height=Math.min(Math.max(el.scrollHeight,46),cap)+'px';
+  el.style.overflowY=(el.scrollHeight>cap)?'auto':'hidden';
+};
+$('#flushnow').onclick=async e=>{
+  e.preventDefault();
+  // same rule as the composer: an action that fails must SAY so. This is the
+  // one button whose whole job is "did it reach the cloud", so silence here is
+  // the least acceptable silence on the page.
+  try{
+    const res=await fetch('/flush',{method:'POST',headers:H});
+    const r=await res.json().catch(()=>({}));
+    if(r.error){toast('คัดลอกสำเนาไม่ผ่าน — '+sayError(r,res.status), sayRaw(r,res.status));return}
+    toast(r.pushed?`คัดลอกสำเนาแล้ว ${r.pushed.length} บรรทัด`:(r.emitted?'คัดลอกสำเนาเรียบร้อย':'ไม่มีอะไรใหม่ให้คัดลอก'));
+    refresh();
+  }catch(err){toast('คัดลอกสำเนาไม่ผ่าน — เซิร์ฟเวอร์ไม่ตอบ', 'ข้อความจากเบราว์เซอร์: '+(err&&err.message||err))}
+};
 
-async function refresh(){
-  const as=identity==='admin'?'':'&as='+identity;
-  const [tail,h]=await Promise.all([
-    fetch('/tail?n=200'+as,{headers:H}).then(r=>r.json()),
-    fetch('/view?n=500'+as,{headers:H}).then(r=>r.json())
-  ]);
-  msgs=tail;
-  render();
-  const links=Math.max(h.hashes.length-1,0);
-  const el=$('#chain');
-  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
-  el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
-}
 setInterval(()=>$('#clock').textContent=new Date().toLocaleTimeString('th-TH'),1000);
 async function refresh(){
   const as=identity==='admin'?'':'&as='+identity;
-  const [tail,h]=await Promise.all([
+  const [tail,h,cur]=await Promise.all([
     fetch('/tail?n=200'+as,{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
-    fetch('/view?n=500'+as,{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()})
+    fetch('/view?n=500'+as,{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
+    fetch('/curator?n=200',{headers:H}).then(r=>r.json()).catch(()=>null)
   ]).catch(()=>{document.getElementById('qrpanel')?.style.setProperty('display','block');throw 'auth'});
+  curatorRep=cur;
   document.getElementById('qrpanel')?.style.setProperty('display','none');
   msgs=tail;
   render();
   paintChain(h);
 }
+let stream=null,streamRetry=0,streamTimer=null;
 function listen(){
   const as=identity==='admin'?'':'&as='+identity;
-  const es=new EventSource('/stream?n=200'+as+(TOKEN?'&token='+TOKEN:''));
-  es.onopen=()=>$('#dot').classList.add('on');
-  es.onerror=()=>{$('#dot').classList.remove('on');es.close();setTimeout(listen,3000)};
-  es.onmessage=ev=>{const m=JSON.parse(ev.data);
-    if(!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render();syncChain()}};
+  if(streamTimer){clearTimeout(streamTimer);streamTimer=null}
+  if(stream)stream.close();
+  stream=new EventSource('/stream?n=200'+as+(TOKEN?'&token='+TOKEN:''));
+  // the stream sends no backlog (it starts at the line that was newest when we
+  // connected), so re-reading once on open is what closes a reconnect gap —
+  // exactly, instead of guessing a bigger window
+  stream.onopen=()=>{streamRetry=0;$('#dot').classList.add('on');refresh().catch(()=>{})};
+  stream.onerror=async()=>{
+    $('#dot').classList.remove('on');stream.close();
+    // EventSource never says WHY it failed, so a rejected token looks exactly
+    // like a dropped connection — and the old code retried every 3s forever,
+    // so a phone with a stale QR link sat there reconnecting in silence with
+    // no QR panel and no error. Ask an endpoint that CAN say 401 before
+    // deciding: a refusal is permanent, a drop is not.
+    let unauth=false;
+    try{unauth=(await fetch('/health',{headers:H})).status===401}catch(e){}
+    if(unauth){document.getElementById('qrpanel')?.style.setProperty('display','block');return}
+    streamRetry=Math.min(streamRetry+1,4);          // 3s → 6 → 12 → 24 → 24 …
+    streamTimer=setTimeout(listen,3000*Math.pow(2,streamRetry-1));
+  };
+  stream.onmessage=ev=>{
+    let m;try{m=JSON.parse(ev.data)}catch(e){return}   // one torn frame ≠ dead feed
+    if(m&&m.hash&&!msgs.find(x=>x.hash===m.hash)){msgs.push(m);render();syncChain()}
+  };
 }
 function paintChain(h){
   const links=Math.max(h.hashes.length-1,0);
   const el=$('#chain');
-  el.textContent=h.chain_ok?`chain ✓ ${links} links`:'chain ✗ BROKEN';
+  el.textContent=h.chain_ok?`✓ ประวัติครบ · ${links} ข้อต่อ`:'✗ ประวัติถูกแก้';
+  el.title=h.chain_ok
+    ? `ทุกบรรทัดผูกกับบรรทัดก่อนหน้าด้วยรหัส — ${links} ข้อต่อเรียงกันครบ ไม่มีใครแก้ย้อนหลัง`
+    : 'รหัสไม่ต่อกัน — มีบรรทัดถูกแก้หรือถูกสลับที่หลังเขียนลงไป';
   el.className=h.chain_ok?'ok':'';$('#dot').classList.toggle('on',h.chain_ok);
 }
 // SSE carries new lines but not the chain count, so a line arriving after
@@ -430,7 +1213,11 @@ function syncChain(){
   chainT=setTimeout(async()=>{
     try{
       const as=identity==='admin'?'':'&as='+identity;
-      paintChain(await fetch('/view?n=500'+as,{headers:H}).then(r=>r.json()));
+      const [v,c]=await Promise.all([
+        fetch('/view?n=500'+as,{headers:H}).then(r=>r.json()),
+        fetch('/curator?n=200',{headers:H}).then(r=>r.json()).catch(()=>null)]);
+      paintChain(v);
+      if(c){curatorRep=c;paintCurator()}
     }catch{}
   },1200);
 }
@@ -445,9 +1232,41 @@ const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
           bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
           style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
-          autoAt:120,hubK:12,relColour:true};   // measured: past ~120 edges a full draw is mostly ink
+          autoAt:120,hubK:12,relColour:true,   // measured: past ~120 edges a full draw is mostly ink
+          colour:'density',cellApp:{},cellSeq:{},cellSeqMax:0,metaOn:false,rib:null,
+          // prune: the PLANE drops the keeper's noise instead of dimming it, so
+          // a cell that lived on nothing but tests leaves the map. Off = the
+          // honest raw plane, refetched with &raw=1, for judging the rules.
+          prune:true,pruned:0,prunedCells:0,
+          // the wrapping window: PV.win cells across, origin in plane cells
+          win:48,panDrag:null,
+          // walk: the trail is the reader's OWN path, kept client-side and
+          // never written to the pool — exploring is not a sighting (a
+          // sighting says "someone read here"; a trail says "I got lost here"
+          // and would drown the real ones)
+          walk:null,census:null,showCensus:false,trail:[],
+          // 🔍 the magnifier: a lens you CARRY over the plane, not another
+          // plane scale you switch to. It is an overlay for two reasons — the
+          // base view keeps its landmarks (so you can see WHICH patch is
+          // magnified), and the glass reads the SAME PV.cells map, so what is
+          // under it can never disagree with the map around it.
+          lens:{on:false,wedge:0,ring:0,z:4,drag:null,moved:false}};
 const pcv=$('#plane-cv');
-const pstep=()=>PV.n===144?3:36;
+// Cell size adapts to the space the panel actually has: a 12x12 map drawn at a
+// fixed 36px used a quarter of the canvas and looked broken on a laptop, while
+// the same map on a phone needs the cells to be thumb-sized. Everything that
+// places a stroke asks this one function, so the picture always agrees with
+// itself.
+function pstep(){
+  const n=PV.n,wrap=$('#plane-canvaswrap');
+  const avail=(wrap&&wrap.clientWidth)
+    ?Math.min(wrap.clientWidth-26,Math.max(wrap.clientHeight-26,160)):520;
+  // the canvas should fill the space it has at whatever cell count the view
+  // needs: 144 cells at 3px and 12 cells at 36px are the same picture at
+  // different magnifications, so the size is DERIVED, never hardcoded per mode
+  const lo=n===144?2:8,hi=n===144?8:84;
+  return Math.max(lo,Math.min(hi,Math.floor(avail/n)));
+}
 
 // the plane at tick S: every line whose append ordinal is <= S, counted
 // straight from the log's own order — no wall clock is consulted anywhere
@@ -466,13 +1285,34 @@ function pvLiveBonds(){
 // Radius mask: bonds join LINES but the plane only sees CELLS, so a walk
 // happens at cell level and a bond inside one cell is a self-loop.
 // Returns null when the mask is off (= show everything).
+let _geKey=null,_geArr=null;
 function pvGraphEdges(){
+  // Memoised: this MAPS every bond into a fresh object, and on this corpus that
+  // is 13,572 allocations per call. The lens calls it once per wrapped copy of
+  // the glass, so a single drag frame was allocating tens of thousands of
+  // objects for an array that had not changed since the last frame — measured
+  // as the remaining 12.8ms/frame after the base layer was cached.
+  const key=[PV.seq,PV.showBonds,PV.ctxOn,PV.prune,
+    _idOf(PV.bonds),_idOf(PV.crossEdges)].join('|');
+  if(key===_geKey&&_geArr)return _geArr;
+  _geKey=key;
   let e=pvLiveBonds().map(b=>({...b,kind:'bond'}));
   if(PV.ctxOn)e=e.concat((PV.crossEdges||[]).filter(x=>x.seq==null||PV.seq===null||x.seq<=PV.seq));
+  _geArr=e;
   return e;                                     // one graph, two systems
 }
+let _keepKey=null,_keepSet=null;
 function pvKeep(){
+  // Memoised, keyed on the inputs it reads. This walks every edge to build an
+  // adjacency map, and pvLensOne calls it once per wrapped copy of the glass —
+  // up to four complete walks per frame, for an answer that cannot change
+  // between them. The glass redraws on every drag frame, so this was not a
+  // corner: it was the per-frame floor.
   if(!PV.focus||PV.sel==null)return null;
+  const key=[PV.sel,PV.focus,PV.seq,PV.showBonds,PV.ctxOn,PV.prune,
+    _idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.cells)].join('|');
+  if(key===_keepKey)return _keepSet;
+  _keepKey=key;
   const adj={};
   pvGraphEdges().forEach(b=>{
     if(b.src_rkey==null||b.dst_rkey==null)return;
@@ -485,6 +1325,7 @@ function pvKeep(){
     frontier.forEach(r=>(adj[r]||[]).forEach(x=>{if(!seen.has(x)){seen.add(x);next.push(x)}}));
     frontier=next;
   }
+  _keepSet=seen;
   return seen;
 }
 function pvDerive(){
@@ -492,6 +1333,16 @@ function pvDerive(){
   const src=full?PV.plane:pvCellsUpTo(PV.seq);
   PV.over=Object.keys(src).filter(k=>src[k]>PV.budget).map(Number);
   if(PV.mode==='plane'){PV.n=144;PV.cells=src;return}
+  if(PV.mode==='window'){
+    // the frame size is the reader's choice; the wrapping is not
+    PV.n=PV.win;
+    const c={};
+    for(const k in src){
+      const[dx,dy]=pvXY(+k);
+      if(dx>=0&&dy>=0)c[k]=src[k];
+    }
+    PV.cells=c;return;
+  }
   if(PV.mode==='blocks'){
     PV.n=12;const agg={};
     for(const k in src){
@@ -500,16 +1351,22 @@ function pvDerive(){
     }
     PV.cells=agg;return;
   }
-  const bw=PV.origin.wedge,br=PV.origin.ring;PV.n=12;const c={};
+  // the block view IS a window — the same wrapping frame, entered by zooming
+  // into one block instead of by choosing an origin by hand. One code path, or
+  // the picture and the hit-test drift apart at the seam.
+  PV.mode='window';PV.win=12;PV.n=PV.win;
+  const c={};
   for(const k in src){
-    const rk=+k,w=rk%144,r=Math.floor(rk/144);
-    if(w>=bw&&w<bw+12&&r>=br&&r<br+12)c[rk]=src[k];
+    const[dx,dy]=pvXY(+k);
+    if(dx>=0&&dy>=0)c[k]=src[k];
   }
   PV.cells=c;
 }
 function pvCenter(rk){
   const [x,y]=pvXY(rk);
-  if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+  /* torus: edges may reference ghost-zone coords (-8..151), allow them */
+  const bound=PV.mode==='plane'&&PV.n===144?T144+8:PV.n;
+  if(x<-8||y<-8||x>=bound||y>=bound)return null;
   const step=pstep();
   return[x*step+step/2,y*step+step/2];
 }
@@ -548,15 +1405,24 @@ function pvRelInk(b){return PV.relColour?relCSS(pvRelOf(b),1)
   :(b.kind==='lifted'?'#bc8cff':'var(--acc2)')}
 // which edges the current style actually draws — the legend must be able to say
 // how much of each rel it left out, or a hub view looks like a complete graph
+let _deKey=null,_deArr=null;
 function pvDrawnEdges(){
+  // Memoised on the same object identity pvGraphEdges now hands back: the filter
+  // and the full degree ranking do not change between frames either, so doing
+  // them per wrapped copy was pure repetition.
+  const key=[PV.style,PV.autoAt,PV.hubK,_idOf(pvGraphEdges())].join('|');
+  if(key===_deKey&&_deArr)return _deArr;
+  _deKey=key;
   const edges=pvGraphEdges();
-  if(PV.style==='degree')return edges;
+  if(PV.style==='degree'){_deArr=edges;return edges}
   const hubMode=PV.style==='hub'||(PV.style==='auto'&&edges.length>PV.autoAt);
-  if(!hubMode)return edges;
+  if(!hubMode){_deArr=edges;return edges}
   const deg=pvDegrees(edges);
   const top=Object.keys(deg).map(Number).sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK);
   const set=new Set(top);
-  return edges.filter(e=>set.has(e.src_rkey)||set.has(e.dst_rkey));
+  const drawn=edges.filter(e=>set.has(e.src_rkey)||set.has(e.dst_rkey));
+  _deArr=drawn;
+  return drawn;
 }
 function pvEdgeStrokes(keep){
   const step=pstep(),edges=pvDrawnEdges();
@@ -601,8 +1467,16 @@ function pvEdgeStrokesOf(edges,keep,style){
                     :'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+','+alpha.toFixed(3)+')')});
   };
   edges.forEach(e=>{
-    const a=pvCenter(e.src_rkey),z=pvCenter(e.dst_rkey);
+    let a=pvCenter(e.src_rkey),z=pvCenter(e.dst_rkey);
     if(!a||!z)return;                          // only edges fully inside this view
+    /* torus wrap: if the direct distance > half the plane, draw the short
+       path across the seam instead.  We pick the endpoint (a or z) that
+       is near an edge and shift it by ±T144 so the line wraps. */
+    if(PV.mode==='plane'&&PV.n===144){
+      const dx=Math.abs(a[0]-z[0]),dy=Math.abs(a[1]-z[1]);
+      if(dx>T144/2){const shift=a[0]>z[0]?T144:-T144;z=[z[0]+shift,z[1]]}
+      if(dy>T144/2){const shift=a[1]>z[1]?T144:-T144;z=[z[0],z[1]+shift]}
+    }
     let alpha=0.5;
     if(keep){
       const s=keep.has(e.src_rkey),d=keep.has(e.dst_rkey);
@@ -739,60 +1613,676 @@ function pvBenchRel(N,hubK){
   return {edges:N,rels:9,result:res};
 }
 window.pvBenchRel=pvBenchRel;
+/* ── the window: a wrapping viewport on the torus ─────────────────────
+   The plane is a torus (rkey = ring*144 + wedge, both mod 144), so a window
+   over it must WRAP: scroll right and what left the frame comes back on the
+   left. Without the modulo a window near the seam renders empty space where
+   the other side belongs — the field looked finite when it is not.
+   Both directions go through one `%144`, so there is no seam logic, no ghost
+   copy and nothing to keep in sync: the address IS toroidal, only the
+   projection was flat. Cheap by construction — the data never moves, a cell
+   is just asked for at its wrapped name. */
+function pvWrap(v){return((v%144)+144)%144}
+/* ── panning the window ───────────────────────────────────────────────
+   Moving the frame is the whole point of a viewport: the reader slides over
+   the field and the field slides under them. Because the address is
+   toroidal, panning wraps for free — scroll right past 143 and you arrive at
+   0, which is the SAME edge, so the picture never jumps.
+   Panning is a READ, not stored state: the frame is one caller's position at
+   one moment, exactly like a pointer. */
+function pvPan(dx,dy){
+  if(PV.mode!=='window'||!PV.origin)return;
+  PV.origin={wedge:pvWrap(PV.origin.wedge+dx),ring:pvWrap(PV.origin.ring+dy)};
+  pvMode();
+}
+function pvWinInfo(){
+  const el=$('#pv-wininfo');if(!el)return;
+  if(PV.mode!=='window'||!PV.origin){el.textContent='';return}
+  const w=PV.win,o=PV.origin;
+  const x0=o.wedge,y0=o.ring,x1=pvWrap(o.wedge+w-1),y1=pvWrap(o.ring+w-1);
+  // name the seams the frame crosses, or a wrapped edge reads as a glitch
+  const sx=o.wedge+w>144?' · ข้ามขอบ x':'';
+  const sy=o.ring+w>144?' · ข้ามขอบ y':'';
+  el.textContent='กรอบเลื่อน '+w+'×'+w+' · ช่อง ('+x0+','+y0+')→('+x1+','+y1+')'+sx+sy
+    +' · ลากเพื่อเลื่อน (ไม่รู้จบ — วนรอบ torus)';
+}
 function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
   if(PV.mode==='blocks')return[Math.floor((rk%144)/12),Math.floor(rk/144/12)];
-  return[rk%144-PV.origin.wedge,Math.floor(rk/144)-PV.origin.ring];
+  const n=PV.n,o=PV.origin||{wedge:0,ring:0};
+  const dx=pvWrap(rk%144-o.wedge),dy=pvWrap(Math.floor(rk/144)-o.ring);
+  if(dx>=n||dy>=n)return[-1,-1];          // this address is outside the frame
+  return[dx,dy];
 }
 function pvRkeyAt(x,y){
-  if(PV.mode==='plane')return y*144+x;
+  if(PV.mode==='plane')return pvWrap(y)*144+pvWrap(x);
   if(PV.mode==='blocks')return(y*12)*144+x*12;          // origin of that square
-  return(PV.origin.ring+y)*144+PV.origin.wedge+x;
+  const o=PV.origin||{wedge:0,ring:0};
+  return pvWrap(o.ring+y)*144+pvWrap(o.wedge+x);
+}
+/* ── torus helpers ──────────────────────────────────────────────────── */
+const T144=144;
+function torusDist(a,b){const d=Math.abs(a-b);return Math.min(d,T144-d)}
+function torusDx(a,b){const d=b-a;return Math.abs(d)<=T144/2?d:(d>0?d-T144:d+T144)}
+/* ghost offset: if a cell at (cx,cy) is near the edge, return [[dx,dy],...]
+   of wrapped copies that should also be drawn.  Only fires within 8 cells
+   of any border — beyond that the copy is off-screen and wasted. */
+function ghostOffsets(cx,cy){
+  const G=8,o=[];
+  if(cx<G)o.push([T144,0]);if(cx>=T144-G)o.push([-T144,0]);
+  if(cy<G)o.push([0,T144]);if(cy>=T144-G)o.push([0,-T144]);
+  // corners: both axes near border
+  if(cx<G&&cy<G)o.push([T144,T144]);
+  if(cx<G&&cy>=T144-G)o.push([T144,-T144]);
+  if(cx>=T144-G&&cy<G)o.push([-T144,T144]);
+  if(cx>=T144-G&&cy>=T144-G)o.push([-T144,-T144]);
+  return o;
 }
 function pvCountAt(x,y,rk){return(PV.mode==='blocks'?PV.cells[y*12+x]:PV.cells[rk])||0}
-function pvDraw(){
-  const n=PV.n,step=pstep(),px=n*step,dpr=window.devicePixelRatio||1;
-  pcv.width=px*dpr;pcv.height=px*dpr;pcv.style.width=px+'px';pcv.style.height=px+'px';
-  const c=pcv.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);
-  c.fillStyle='#0d1117';c.fillRect(0,0,px,px);
+/* Cell colour is a LAYER, not decoration: the same plane answers four
+   different questions and one function decides the hue, so the legend can
+   never disagree with the canvas. Slower traffic is the point here — a log is
+   heavy-tailed, so one hub would swallow the whole ramp if it were linear. */
+const HEAT=[[11,37,69],[29,92,143],[57,197,207],[126,231,135],[255,212,121],[255,123,114]];
+function pvRamp(t){
+  t=Math.max(0,Math.min(1,t));
+  const x=t*(HEAT.length-1),i=Math.min(HEAT.length-2,Math.floor(x)),f=x-i;
+  const a=HEAT[i],b=HEAT[i+1];
+  return[Math.round(a[0]+(b[0]-a[0])*f),Math.round(a[1]+(b[1]-a[1])*f),Math.round(a[2]+(b[2]-a[2])*f)];
+}
+const pvHeatCSS=(t,a)=>'rgba('+pvRamp(t).join(',')+','+a.toFixed(2)+')';
+const pvRampCSS=n=>HEAT.slice(0,n===undefined?HEAT.length:n).map(c=>'rgb('+c.join(',')+')');
+// one app, one hue — hashed and stable, so the same writer is the same colour
+// on the plane, on the ribbon and in the legend, on every render
+function pvAppHue(app){let h=7;for(const ch of String(app||'?'))h=(h*31+ch.charCodeAt(0))%360;return h}
+const pvAppInk=(app,rel)=>'hsla('+pvAppHue(app)+',72%,'+Math.round(38+26*Math.max(0,Math.min(1,rel)))
+  +'%,'+Math.min(1,0.34+0.62*rel).toFixed(2)+')';
+const pvTopApps=()=>{
+  const n={};Object.keys(PV.cellApp).forEach(k=>{const a=PV.cellApp[k]||'?';(n[a]=n[a]||0)});
+  return Object.keys(n).length?n:null;
+};
+// rel is the value normalised to the busiest cell: how loud this cell is
+function pvCellInk(rk,rel){
+  if(PV.colour==='heat')return pvHeatCSS(Math.sqrt(rel),0.95);
+  if(PV.colour==='writer')return pvAppInk(PV.cellApp[rk],rel);
+  if(PV.colour==='recent'){
+    // "when did this address last change": the ordinal of its newest line,
+    // straight from the fold — no clock anywhere in the picture
+    const s=PV.cellSeq[rk];
+    return pvHeatCSS(s==null||!PV.cellSeqMax?0:1-s/PV.cellSeqMax,0.92);
+  }
+  return'rgba(126,231,135,'+(0.22+0.78*rel).toFixed(2)+')';
+}
+/* ── 🔍 the magnifier ────────────────────────────────────────────────
+   A lens held over the plane. Three rules make it a viewport instead of a
+   second plane:
+
+   1. It magnifies the SAME data (PV.cells), so the glass cannot show a cell
+      the map disagrees with. There is no second picture to keep in step.
+   2. It stops at the REAL SCALE — the zoom cap is where one cell fills the
+      lens, because a cell is the finest ADDRESS that exists. Past that the
+      glass would only enlarge a single number, and the honest next step is
+      that cell's CONTENTS (the panel read), not more magnification.
+   3. Its position is stored in PLANE coordinates, so moving the base view or
+      changing mode never teleports the glass.
+   The seam is free: positions are torus deltas, so a patch near x=143 borrows
+   real cells from x=0 and there is no edge case to handle. */
+const PV_ZOOM=[1,2,3,4,5,6,8,10,12,16,20,25,32,40,48,64];
+function pvLensR(){
+  // sized from the canvas, not fixed: 70px is most of the view on a phone and
+  // a speck on a laptop, and the cap below is derived from this radius
+  const px=PV.n*pstep();
+  return Math.max(34,Math.min(120,Math.round(px*0.17)));
+}
+function pvLensZ(){
+  const m=pvLensZMax();return Math.max(1,Math.min(PV.lens.z,m));
+}
+function pvLensPxPerCell(){
+  // one PLANE cell in canvas pixels. In block view a block is step px and a
+  // block is 12x12 cells, so the glass must move and grow by step/12 there —
+  // otherwise the same drag would fly across the plane 12x too fast.
+  return pstep()/(PV.mode==='blocks'?12:1);
+}
+function pvLensZMax(){
+  // ⛔ the real scale: the zoom at which one CELL spans the lens. Expressed in
+  // px-per-cell, so the cap means the same thing in every view.
+  return Math.max(1,Math.floor(2*pvLensR()/pvLensPxPerCell()));
+}
+function pvLensStops(){
+  const m=pvLensZMax(),s=PV_ZOOM.filter(z=>z<=m);
+  return s.length?s:[1];
+}
+function pvLensPos(){
+  const step=pstep(),L=PV.lens;
+  if(PV.mode==='plane')return[L.wedge*step,L.ring*step];
+  if(PV.mode==='blocks')return[L.wedge*step/12,L.ring*step/12];
+  const o=PV.origin||{wedge:0,ring:0};
+  return[pvWrap(L.wedge-o.wedge)*step,pvWrap(L.ring-o.ring)*step];
+}
+function pvLensCS(){return pvLensPxPerCell()*pvLensZ()}
+function pvLensNudge(dw,dr){
+  PV.lens.wedge=pvWrap(PV.lens.wedge+dw);
+  PV.lens.ring=pvWrap(PV.lens.ring+dr);
+  pvLensFollow();
+  pvDraw();pvLensInfo();
+}
+// Keep the glass ON SCREEN. The glass has a radius, so a window of N cells can
+// only hold it centred within N-2m of them; past that band the FRAME slides
+// instead. Without this the glass would simply vanish when dragged past the
+// window edge, and a magnifier you can lose is not a viewport.
+function pvLensFollow(){
+  if(PV.mode!=='window'||!PV.origin)return;
+  const m=Math.ceil(pvLensR()/pvLensPxPerCell())+1,win=PV.win;
+  if(win<=2*m)return;                        // no band to keep it in
+  const L=PV.lens,o=PV.origin;
+  let off=pvWrap(L.wedge-o.wedge),adj=0;
+  if(off<m)adj=off-m;else if(off>win-m)adj=off-(win-m);
+  if(adj)o.wedge=pvWrap(o.wedge+adj);
+  off=pvWrap(L.ring-o.ring);adj=0;
+  if(off<m)adj=off-m;else if(off>win-m)adj=off-(win-m);
+  if(adj)o.ring=pvWrap(o.ring+adj);
+}
+// Name the RESOLUTION, not the zoom factor: ×4 is "cells" on a laptop and
+// "blocks" on a phone, so a label in multiples would mean different things
+// on different screens. A level means the same thing everywhere.
+function pvLensLevel(cs){
+  if(cs>=pvLensR()*1.35)return['จริง','สเกลจริง — 1 ช่องเต็มแว่น','หยุดแล้ว: ไม่มีที่อยู่ที่ละเอียดกว่านั้น เนื้อในอ่านที่แผงขวา'];
+  if(cs>=7)return['L0','L0 เซลล์','แต่ละช่องแยกออกจากกันแล้ว — เห็นว่าช่องไหนแน่นกว่าช่องไหน'];
+  if(cs>=3)return['L1','L1 บล็อก','เห็นกริด 12×12 — ที่อยู่ยังรวมกันอยู่'];
+  return['L2','L2 ระนาบ','ยังเป็นแผนที่ความหนาแน่น — ยังแยกเซลล์ไม่ออก'];
+}
+function pvLensPt(w,r){return[pvWrap(w),pvWrap(r)]}
+// Where on the glass a canvas point falls, or null when it is off it. Every
+// wrapped copy is tested: the copy the pointer is visibly over is the one that
+// must answer, or the cursor would contradict the picture.
+function pvLensHit(gx,gy){
+  if(!PV.lens.on)return null;
+  const [bx,by]=pvLensPos(),R=pvLensR(),px=PV.n*pstep();
+  for(const dx of [-px,0,px])for(const dy of [-px,0,px]){
+    const mx=gx-(bx+dx),my=gy-(by+dy);
+    if(mx*mx+my*my<=R*R)return[mx,my];
+  }
+  return null;
+}
+function pvLensPaint(){
+  // a drag fires faster than a frame is worth: drawing the lens on every
+  // pointermove would spend the whole budget on frames nobody sees
+  if(PV.lens.snap)return;
+  PV.lens.snap=requestAnimationFrame(()=>{PV.lens.snap=null;pvDraw();pvLensInfo()});
+}
+// the cluster's elements, found once: pvLensInfo runs on every drag frame, and
+// three querySelectors per frame to re-find buttons that never move is exactly
+// the kind of cost §14 was about.
+let _zEls=null;
+function pvZoomEls(){
+  if(!_zEls)_zEls={lvl:$('#pv-zlvl'),zin:$('#pv-lens-zin'),zout:$('#pv-lens-zout')};
+  return _zEls;
+}
+function pvLensInfo(){
+  const el=$('#pv-lensinfo');
+  const z=pvLensZ(),m=pvLensZMax(),lv=pvLensLevel(pvLensCS());
+  // the cluster mirrors the same numbers the status line reports, and greys out
+  // at the same limits. The one place the magnifier PROMISES to stop (§10.1) is
+  // the one place a control should stop — a + that keeps working at the real
+  // scale would be the UI contradicting the model.
+  const zi=pvZoomEls();
+  if(zi.lvl)zi.lvl.textContent=PV.lens.on?('×'+z+(z>=m?' ⛔':'')):'×1';
+  if(zi.zin)zi.zin.disabled=!PV.lens.on||z>=m;
+  if(zi.zout)zi.zout.disabled=!PV.lens.on||z<=1;
+  if(!el)return;
+  el.classList.toggle('on',PV.lens.on);
+  if(!PV.lens.on){el.textContent='';return}
+  const w=Math.floor(PV.lens.wedge),r=Math.floor(PV.lens.ring);
+  const at=m?Math.round(100*z/m):0;
+  el.textContent='🔍 ×'+z+(z>=m?' ⛔':'')+' · '+lv[1]+' · (คอลัมน์ '+w+', แถว '+r+')'
+    +' · ขยายแล้ว '+at+'% ของความละเอียดจริง';
+  el.title=lv[2];
+}
+function pvLensDraw(c){
+  const L=PV.lens;if(!L.on)return;
+  const px=PV.n*pstep(),r=pvLensR(),[bx,by]=pvLensPos();
+  // The glass WRAPS with the plane: near an edge its rim reappears on the far
+  // side, exactly like the cells it is magnifying. The seam is not a special
+  // case here either — the content is placed by torus deltas, so the copy on
+  // the other side is the same glass, not a second one.
+  for(const dx of [-px,0,px])for(const dy of [-px,0,px]){
+    const ox=bx+dx,oy=by+dy;
+    if(ox+r<0||ox-r>px||oy+r<0||oy-r>px)continue;
+    pvLensOne(c,ox,oy,r,dx===0&&dy===0);
+  }
+}
+function pvLensOne(c,ox,oy,r,primary){
+  const L=PV.lens,step=pstep(),cs=pvLensCS();
+  const z=pvLensZ(),lv=pvLensLevel(cs);
+  const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
+  const keep=pvKeep(),half=Math.ceil(r/cs)+1;
+  c.save();
+  c.beginPath();c.arc(ox,oy,r,0,7);c.clip();
+  c.fillStyle='#0a0e14';c.fillRect(ox-r,oy-r,2*r,2*r);
+  // ── the cells, magnified. At low zoom only OCCUPIED cells are painted:
+  // 20k empty rects is a black frame either way, and the loop is the whole
+  // cost of a drag at ×2.
+  const cw=Math.floor(L.wedge),cr=Math.floor(L.ring),fw=L.wedge-cw,fr=L.ring-cr;
+  for(let dy=-half;dy<=half;dy++){
+    const py=oy+(dy-fr)*cs;if(py+cs<oy-r||py>oy+r)continue;
+    for(let dx=-half;dx<=half;dx++){
+      const px=ox+(dx-fw)*cs;if(px+cs<ox-r||px>ox+r)continue;
+      const P=pvLensPt(cw+dx,cr+dy),rk=P[1]*144+P[0],v=PV.cells[rk]||0;
+      if(!v&&cs<7)continue;
+      c.globalAlpha=(!keep||keep.has(rk))?1:0.15;
+      c.fillStyle=v?pvCellInk(rk,v/max):'#121821';
+      c.fillRect(px+.5,py+.5,cs-1,cs-1);
+      // at this size the NUMBER is the data — a colour ramp a reader has to
+      // remember is worse than the count written where it happened
+      if(cs>=26&&v>0){
+        c.fillStyle='#0a0e14';c.font='bold '+Math.min(16,cs*0.42).toFixed(0)+'px monospace';
+        c.textAlign='center';c.fillText(v,px+cs/2,py+cs/2+5);c.textAlign='left';
+      }
+      c.globalAlpha=1;
+    }
+  }
+  // ── the 12x12 grid: the only landmark that survives magnification, and the
+  // one that keeps you oriented without reading a coordinate out loud
+  if(cs*12>=20){
+    c.strokeStyle='rgba(139,148,158,.3)';c.lineWidth=1;
+    const k0=Math.floor((L.wedge-half)/12)-1,k1=Math.ceil((L.wedge+half)/12)+1;
+    for(let k=k0;k<=k1;k++){
+      const gx=ox+torusDx(L.wedge,pvWrap(k*12))*cs;
+      const gy=oy+torusDx(L.ring,pvWrap(k*12))*cs;
+      if(gx>ox-r&&gx<ox+r){c.beginPath();c.moveTo(gx+.5,oy-r);c.lineTo(gx+.5,oy+r);c.stroke()}
+      if(gy>oy-r&&gy<oy+r){c.beginPath();c.moveTo(ox-r,gy+.5);c.lineTo(ox+r,gy+.5);c.stroke()}
+    }
+  }
+  // ── edges, magnified: a graph read without its lines is half the picture
+  if(PV.showBonds){
+    const edges=pvDrawnEdges(),reach=2*r;
+    const at=rk=>rk==null?null:[ox+torusDx(L.wedge,rk%144)*cs,oy+torusDx(L.ring,Math.floor(rk/144))*cs];
+    c.lineWidth=1.1;
+    edges.forEach(e=>{
+      const a=at(e.src_rkey),b=at(e.dst_rkey);
+      if(!a||!b)return;
+      const far=(p,q)=>Math.abs(p[0]-ox)>reach&&Math.abs(p[1]-oy)>reach
+        &&Math.abs(q[0]-ox)>reach&&Math.abs(q[1]-oy)>reach;
+      if(far(a,b))return;                    // entirely off the glass
+      const hot=PV.sel!=null&&(e.src_rkey===PV.sel||e.dst_rkey===PV.sel);
+      c.strokeStyle=hot?'#ffffff':(PV.relColour?relCSS(pvRelOf(e),0.75)
+        :'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+',.7)');
+      c.globalAlpha=hot?1:0.8;
+      c.beginPath();c.moveTo(a[0],a[1])
+        ;c.lineTo(b[0],b[1]);c.stroke();c.globalAlpha=1;
+    });
+  }
+  // ── red rings: a sighting under the glass is still a sighting
+  PV.sights.forEach(s=>{
+    const x=ox+torusDx(L.wedge,s.point%144)*cs;
+    const y=oy+torusDx(L.ring,Math.floor(s.point/144))*cs;
+    if(Math.abs(x-ox)>r+6||Math.abs(y-oy)>r+6)return;
+    c.strokeStyle='#79c0ff';c.lineWidth=1.2;
+    c.beginPath();c.arc(x+cs/2,y+cs/2,Math.max(3.5,Math.min(cs*0.7,7)),0,7);c.stroke();
+  });
+  c.restore();
+  // ── the rim, drawn OUTSIDE the clip so it stays crisp at every zoom
+  c.strokeStyle='rgba(121,192,255,.9)';c.lineWidth=2;
+  c.beginPath();c.arc(ox,oy,r,0,7);c.stroke();
+  c.strokeStyle='rgba(10,14,20,.85)';c.lineWidth=1;
+  c.beginPath();c.arc(ox,oy,r-2,0,7);c.stroke();
+  // crosshair on the exact address being magnified — the glass has a POINT,
+  // not just a region, or "what am I looking at" has no answer
+  c.strokeStyle='rgba(255,212,121,.95)';c.lineWidth=1;
+  c.beginPath();c.moveTo(ox-7,oy);c.lineTo(ox+7,oy);
+  c.moveTo(ox,oy-7);c.lineTo(ox,oy+7);c.stroke();
+  // At the real scale the glass covers ONE address and there is nothing finer
+  // to draw. So it stops magnifying and instead SAYS WHAT IS THERE — more zoom
+  // at this point would be enlarging a single number, which is the one thing a
+  // viewport must never do.
+  if(primary&&cs>=r*1.4){
+    const vw=pvWrap(Math.floor(L.wedge)),vr=pvWrap(Math.floor(L.ring));
+    const vv=PV.cells[vr*144+vw]||0;
+    c.textAlign='center';
+    c.fillStyle=vv?'#ffd479':'#484f58';c.font='bold 26px monospace';
+    c.fillText(vv,ox,oy+3);
+    c.fillStyle='#8b949e';c.font='10px monospace';
+    c.fillText('line'+(vv===1?'':'s')+' ในที่อยู่นี้',ox,oy+21);
+    if(vv)c.fillText('คลิกเพื่ออ่านเนื้อใน',ox,oy+35);
+    c.textAlign='left';
+  }
+  if(primary){
+    // the label and the handle belong to the ONE glass, not to every wrapped
+    // copy of its rim: nine labels is not nine times the information
+    const cw2=pvWrap(Math.floor(L.wedge)),cr2=pvWrap(Math.floor(L.ring));
+    const v=PV.cells[cr2*144+cw2]||0;
+    const txt='×'+z+' '+lv[0]+' · '+cw2+','+cr2+' · '+v+' line'+(v===1?'':'s');
+    c.font='11px monospace';
+    const tw=c.measureText(txt).width+14,by=oy+r-19;
+    c.fillStyle='rgba(10,14,20,.9)';
+    c.beginPath();
+    if(c.roundRect)c.roundRect(ox-tw/2,by,tw,16,8);else c.rect(ox-tw/2,by,tw,16);
+    c.fill();
+    c.fillStyle=z>=pvLensZMax()?'#ff9f9f':'#ffd479';c.textAlign='center';
+    c.fillText(txt,ox,by+11.5);c.textAlign='left';
+  }
+  pvLensHandle(c,ox,oy,r);
+}
+// A visible grab handle, because a lens with no handle reads as a rendering
+// artefact and nobody tries to drag it
+function pvLensHandle(c,ox,oy,r){
+  const a=-Math.PI/4,hx=ox+Math.cos(a)*r,hy=oy+Math.sin(a)*r;
+  c.strokeStyle='rgba(121,192,255,.9)';c.lineWidth=4;c.lineCap='round';
+  c.beginPath();c.moveTo(hx,hy);c.lineTo(hx+Math.cos(a)*13,hy+Math.sin(a)*13);c.stroke();
+  c.lineWidth=1.4;c.strokeStyle='rgba(10,14,20,.75)';
+  c.beginPath();c.moveTo(hx,hy);c.lineTo(hx+Math.cos(a)*13,hy+Math.sin(a)*13);c.stroke();
+  c.lineCap='butt';
+}
+function pvGrid(c,n,step,px){
+  // a faint L1 grid: without it a 144x144 plane of 3px cells has no landmarks
+  if(step*12<18)return;
+  c.strokeStyle='rgba(139,148,158,.16)';c.lineWidth=1;
+  for(let i=1;i*12<n;i++){
+    const p=i*12*step+.5;
+    c.beginPath();c.moveTo(p,0);c.lineTo(p,px);c.moveTo(0,p);c.lineTo(px,p);c.stroke();
+  }
+}
+/* ── the base layer: painted once, blitted per frame ────────────────────
+   The base picture is a function of data that does NOT move during a gesture,
+   so it is rendered into an offscreen canvas and blitted. Two measurements
+   forced this:
+
+     * pvDraw assigned canvas.width — and so reallocated the whole backing
+       store, and cleared it — on EVERY call: 30 assignments for 30 draws;
+     * one plane-mode draw repainted all 10,131 cells in **27.7ms** (max 37ms,
+       ~27fps) before the lens had drawn anything.
+
+   A wheel tick and a drag frame therefore each paid for the entire map. Now a
+   zoom frame repaints ONLY the glass.
+
+   The key is the exact set of inputs the base reads, taken by OBJECT IDENTITY
+   wherever the input is a big structure (cells/bonds/sights are replaced
+   wholesale, never edited in place), so a stale cache is not something to
+   reason about — it is a key mismatch. `PV.origin` is in the key because in
+   window mode it moves every cell without touching PV.cells at all: the glass
+   sliding its FRAME (§10.4) would otherwise leave the base behind. */
+let _pvUid=0;const _pvIds=new WeakMap();
+function _idOf(o){
+  if(o==null)return'-';
+  let v=_pvIds.get(o);if(!v){v=String(++_pvUid);_pvIds.set(o,v)}
+  return v;
+}
+function pvBaseKey(px,bw){
+  const o=PV.origin;
+  return[px,bw,PV.n,PV.mode,PV.colour,PV.sel,PV.focus,PV.seq,PV.win,
+    PV.showBonds,PV.ctxOn,PV.style,PV.hubK,PV.relColour,PV.prune,PV.cellSeqMax,
+    o?o.wedge:null,o?o.ring:null,
+    _idOf(PV.cells),_idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.sights),
+    _idOf(PV.cellApp),_idOf(PV.cellSeq)].join('|');
+}
+let _baseKey=null,_baseCv=null;
+function pvBase(px,bw){
+  const key=pvBaseKey(px,bw);
+  if(key===_baseKey&&_baseCv){PV.baseHit=(PV.baseHit||0)+1;return _baseCv}
+  _baseKey=key;PV.baseMiss=(PV.baseMiss||0)+1;
+  const cv=_baseCv||document.createElement('canvas');
+  _baseCv=cv;
+  if(cv.width!==bw){cv.width=bw;cv.height=bw}
+  const c=cv.getContext('2d');
+  c.setTransform(1,0,0,1,0,0);c.clearRect(0,0,bw,bw);
+  const scale=bw/px;                    // css px -> device px, exactly
+  c.setTransform(scale,0,0,scale,0,0);
+  pvBasePaint(c,px);
+  return cv;
+}
+function pvBasePaint(c,px){
+  const n=PV.n,step=pstep();
+  c.fillStyle='#0a0e14';c.fillRect(0,0,px,px);
   const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
   const keep=pvKeep();
+  if(!vals.length){
+    c.fillStyle='#8b949e';c.font='12px monospace';c.textAlign='center';
+    c.fillText('ยังไม่มีบรรทัดในมุมมองนี้',px/2,px/2);c.textAlign='left';
+  }
+  pvGrid(c,n,step,px);
+  // the three busiest cells get a glow: at plane scale they are the only
+  // landmarks, and "where is the weight" is the first question anyone asks
+  const hubs=new Set(Object.keys(PV.cells).map(Number)
+    .sort((a,b)=>PV.cells[b]-PV.cells[a]).slice(0,3).filter(k=>PV.cells[k]>1));
   for(const k in PV.cells){
     const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
     const near=!keep||keep.has(+k);
-    const a=(0.22+0.78*(PV.cells[k]/max))*(near?1:0.10);   // masked = barely there
-    c.fillStyle='rgba(126,231,135,'+a.toFixed(2)+')';
+    const rel=PV.cells[k]/max;
     // at plane scale one cell is ~3px, so a single line is nearly invisible;
     // every occupied cell gets a floor of 2px so the map is actually readable
     const w=Math.max(step,2),o=(w-step)/2;
-    c.fillRect(x*step-o,y*step-o,w,w);
-    if(keep&&near&&+k!==PV.sel){                        // in radius: mark it
-      c.strokeStyle='rgba(126,231,135,.75)';c.lineWidth=1;
+    const gap=step>=6?1:0;                      // a hairline between cells
+    c.globalAlpha=near?1:0.12;                  // masked = barely there
+    c.fillStyle=pvCellInk(+k,rel);
+    c.fillRect(x*step-o+gap/2,y*step-o+gap/2,w-gap,w-gap);
+    if(hubs.has(+k)){
+      c.strokeStyle='rgba(255,212,121,.85)';c.lineWidth=1;
       c.strokeRect(x*step-o-.5,y*step-o-.5,w+1,w+1);
     }
+    if(keep&&near&&+k!==PV.sel){                // in radius: mark it
+      c.strokeStyle='rgba(126,231,135,.55)';c.lineWidth=1;
+      c.strokeRect(x*step-o-.5,y*step-o-.5,w+1,w+1);
+    }
+    c.globalAlpha=1;
   }
-  PV.sights.forEach(s=>{                    // declared reads (data, not state)
-    const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
-    c.strokeStyle='#79c0ff';c.lineWidth=1;c.strokeRect(x*step+.5,y*step+.5,step-1,step-1);
-  });
+  /* ── torus ghost cells: draw near-border cells on opposite side ── */
+  if(PV.mode==='plane'){
+    for(const k in PV.cells){
+      const rk=+k,cx=rk%144,cy=Math.floor(rk/144);
+      const ghosts=ghostOffsets(cx,cy);
+      if(!ghosts.length)continue;
+      const near=!keep||keep.has(rk),rel=PV.cells[k]/max;
+      const w=Math.max(step,2),o=(w-step)/2,gap=step>=6?1:0;
+      c.globalAlpha=near?0.65:0.08;
+      c.fillStyle=pvCellInk(rk,rel);
+      for(const[dx,dy]of ghosts){
+        const gx=cx+dx,gy=cy+dy;
+        c.fillRect(gx*step-o+gap/2,gy*step-o+gap/2,w-gap,w-gap);
+        if(hubs.has(rk)){
+          c.strokeStyle='rgba(255,212,121,.85)';c.lineWidth=1;
+          c.strokeRect(gx*step-o-.5,gy*step-o-.5,w+1,w+1);
+        }
+        if(keep&&near&&rk!==PV.sel){
+          c.strokeStyle='rgba(126,231,135,.55)';c.lineWidth=1;
+          c.strokeRect(gx*step-o-.5,gy*step-o-.5,w+1,w+1);
+        }
+      }
+      c.globalAlpha=1;
+    }
+    /* seam indicators: faint dashed lines at 0/144 boundaries */
+    c.save();c.setLineDash([4,6]);c.strokeStyle='rgba(139,148,158,.25)';c.lineWidth=1;
+    c.beginPath();c.moveTo(0,0);c.lineTo(0,px);c.stroke();
+    c.beginPath();c.moveTo(px,0);c.lineTo(px,px);c.stroke();
+    c.beginPath();c.moveTo(0,0);c.lineTo(px,0);c.stroke();
+    c.beginPath();c.moveTo(0,px);c.lineTo(px,px);c.stroke();
+    c.restore();
+  }
   // edges are drawn from the addresses of their two ends — a bond line
   // carries the meaning, the plane only shows where both ends sit
   if(PV.showBonds)pvEdgeStrokes(keep).forEach(s=>pvStroke(c,s));
   if(PV.ctxOn)pvMemoryPass(c,step,keep);
+  // Reads go on TOP of the edges: a sighting is a point event and must not be
+  // buried under the graph it sits in. A cell rect alone vanishes exactly
+  // where the plane is most crowded (a whole 144x144 plane on a phone is ~3px
+  // per cell), so the marker is a RING sized in pixels, not in cells — it
+  // stays a circle at every zoom, which is what the legend promises.
+  PV.sights.forEach(s=>{
+    const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
+    const cx=x*step+step/2, cy=y*step+step/2;
+    c.save();
+    c.strokeStyle='#79c0ff';c.lineWidth=1.2;
+    if(step>=7)c.strokeRect(x*step+.5,y*step+.5,step-1,step-1);
+    const rr=Math.max(3.6,Math.min(step*0.75,7));
+    c.beginPath();c.arc(cx,cy,rr,0,7);c.stroke();
+    c.fillStyle='#79c0ff';c.beginPath();c.arc(cx,cy,1.4,0,7);c.fill();
+    if(PV.sel===s.point){                 // you are here: a second ring
+      c.globalAlpha=.45;c.lineWidth=1;
+      c.beginPath();c.arc(cx,cy,rr+3,0,7);c.stroke();c.globalAlpha=1;
+    }
+    c.restore();
+  });
   if(PV.sel!=null){
     const [x,y]=pvXY(PV.sel);
-    if(x>=0&&y>=0&&x<n&&y<n){c.strokeStyle='#ffa657';c.lineWidth=2;c.strokeRect(x*step+1,y*step+1,step-2,step-2)}
+    if(x>=0&&y>=0&&x<n&&y<n){
+      const o=step>=6?3:1;
+      c.strokeStyle='#ffa657';c.lineWidth=2;
+      c.strokeRect(x*step+o,y*step+o,step-2*o,step-2*o);
+      c.strokeStyle='rgba(255,166,87,.35)';c.lineWidth=1;
+      c.strokeRect(x*step-o,y*step-o,step+2*o,step+2*o);
+    }
   }
+}
+function pvDraw(){
+  const n=PV.n,step=pstep(),px=n*step;
+  // Device-pixel-exact backing store. A fractional devicePixelRatio (measured
+  // 1.232 here) with an integer css pixel size gave a NON-integer backing
+  // store, which is the blurriest of all worlds: the size and the transform
+  // now agree by construction instead of by luck. And the assignment happens
+  // only when the size actually changed — re-assigning width reallocates and
+  // clears, which is exactly what we are no longer paying for per frame.
+  const dpr=window.devicePixelRatio||1,bw=Math.round(px*dpr);
+  if(pcv.width!==bw||pcv.height!==bw){pcv.width=bw;pcv.height=bw}
+  pcv.style.width=px+'px';pcv.style.height=px+'px';
+  const c=pcv.getContext('2d');
+  c.setTransform(1,0,0,1,0,0);c.clearRect(0,0,bw,bw);
+  const scale=bw/px;
+  c.setTransform(scale,0,0,scale,0,0);
+  c.drawImage(pvBase(px,bw),0,0,px,px);
+  // the magnifier is drawn LAST and over everything: it is a thing held above
+  // the map, so nothing on the map may paint over the glass
+  pvLensDraw(c);
+}
+/* ── the timeline strip ────────────────────────────────────────────────
+   The tick layer with both of its axes visible: height = how many lines in
+   that tick, colour = who wrote most of them. Past a few hundred ticks one bar
+   per tick is a smear, so bars bucket and the label says how many ticks each
+   bar stands for — an unlabelled aggregate would be a lie about resolution. */
+const rb=$('#pv-ribbon');
+function pvRibbon(){
+  const rows=PV.timeline,n=rows.length,dpr=window.devicePixelRatio||1;
+  const w=Math.max(120,rb.clientWidth||320),h=42;
+  rb.width=w*dpr;rb.height=h*dpr;rb.style.width=w+'px';rb.style.height=h+'px';
+  const c=rb.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);
+  c.fillStyle='#0a0e14';c.fillRect(0,0,w,h);
+  if(!n){
+    c.fillStyle='#8b949e';c.font='10px monospace';c.fillText('ยังไม่มีบรรทัดให้แสดง',7,24);
+    $('#pv-ribbon-info').textContent='ช่วง —';PV.rib=null;return;
+  }
+  // A bar is a TICK — the same 8-line chunk the feed counts in — so the strip
+  // and the feed are the same ruler. Past a few hundred ticks one bar per tick
+  // is a smear, so bars bucket and B says how many ticks each one stands for:
+  // an unlabelled aggregate would be a lie about resolution.
+  const ticks=Math.ceil(n/CHUNK);
+  const MAXB=240,B=Math.ceil(ticks/MAXB),bars=Math.ceil(ticks/B),bw=w/bars;
+  PV.rib={B,bars,bw,ticks};
+  // Two passes because the height is relative to the BUSIEST bar, not to the
+  // bar size: normalising by the bucket width would paint every bar full and a
+  // picture that cannot show a quiet stretch is not showing activity at all.
+  const bucket=[];
+  let maxCnt=1;
+  for(let i=0;i<bars;i++){
+    let cnt=0;const apps={};
+    for(let j=i*B*CHUNK;j<Math.min((i+1)*B*CHUNK,n);j++){cnt++;const a=rows[j][5]||'?';(apps[a]=apps[a]||0)}
+    const ent=Object.entries(apps).sort((p,q)=>q[1]-p[1]);
+    bucket.push({cnt,app:ent.length?ent[0][0]:'?'});
+    if(cnt>maxCnt)maxCnt=cnt;
+  }
+  for(let i=0;i<bars;i++){
+    const full=bucket[i].cnt/maxCnt;
+    const bh=Math.max(3,(h-7)*full);
+    c.fillStyle=pvAppInk(bucket[i].app,full);
+    c.fillRect(i*bw+0.5,h-3-bh,Math.max(1,bw-1),bh);
+  }
+  // where we are in time (the scrub position), and the live edge
+  const S=PV.seq===null?n-1:PV.seq;
+  const x=Math.round(((Math.floor(S/CHUNK)+0.5)/ticks)*w)+.5;
+  c.strokeStyle='#ffa657';c.lineWidth=1.5;
+  c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();
+  const seen=new Set();PV.timeline.slice(0,S+1).forEach(r=>seen.add(r[5]||'?'));
+  // short on screen, complete in the tooltip: the same rule as the header line
+  const where=PV.seq===null?'ทุกบรรทัด':('ช่วงที่ '+Math.floor(S/CHUNK)+'/'+(ticks-1));
+  const info=$('#pv-ribbon-info');
+  info.textContent=where+' · '+bars+' แท่ง';
+  info.title=where+' · '+bars+' แท่ง'+(B>1?(' (แท่งละ '+B+' ช่วง)'):'')
+    +' · สูงสุด '+maxCnt+' บรรทัด · ผู้เขียน '+seen.size;
+}
+function pvRibbonAt(ev){
+  // returns a TICK, and lands on that chunk's last line: scrubbing to a tick
+  // should show the plane as it was when that chunk was written
+  if(!PV.rib||!PV.timeline.length)return null;
+  const r=rb.getBoundingClientRect(),x=Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width));
+  const bar=Math.max(0,Math.min(PV.rib.bars-1,Math.floor(x*PV.rib.bars)));
+  const tick=Math.min(PV.rib.ticks-1,bar*PV.rib.B);
+  return Math.min(PV.timeline.length-1,tick*CHUNK+CHUNK-1);
+}
+/* ── the legend ────────────────────────────────────────────────────────
+   A layer that does not say what it means is a stain. So the panel names the
+   gradient, its ends, and — in writer mode — which hue belongs to whom. */
+let _legendKey=null;   // redrawing a legend 16x/s during replay is pure waste
+function pvLegend(){
+  const box=$('#pv-legend');if(!box)return;const cells=PV.cells;
+  const hubs=Object.keys(cells).map(Number).sort((a,b)=>cells[b]-cells[a]).slice(0,3);
+  const key=[PV.colour,PV.metaOn,Object.keys(cells).length,hubs.join(','),PV.cellSeqMax].join('|');
+  if(key===_legendKey)return;
+  _legendKey=key;
+  const end=(a,b)=>'<span>'+a+' → '+b+'</span>';
+  let h='';
+  if(PV.colour==='writer'){
+    const apps=pvTopApps();
+    h='<div style="color:var(--fg)">สี = แอปที่เขียนล่าสุดในช่องนั้น</div>';
+    h+=apps?Object.keys(apps).map(a=>'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:9px">'
+      +'<span style="width:11px;height:11px;border-radius:3px;background:'+pvAppInk(a,1)+';display:inline-block"></span>'
+      +esc(a)+'</span>').join('')
+      :'<span style="color:var(--warn)">ยังโหลดข้อมูลผู้เขียนไม่เสร็จ — เลือกสีนี้ใหม่อีกครั้ง</span>';
+  }else if(PV.colour==='recent'){
+    h='<div style="color:var(--fg)">สี = ช่องนี้เปลี่ยนล่าสุดเมื่อไร</div>'
+      +'<span class="pvgrad" style="background:linear-gradient(90deg,'+pvRampCSS().join(',')+')"></span>'
+      +end('เก่าสุด','ใหม่สุด');
+  }else if(PV.colour==='heat'){
+    h='<div style="color:var(--fg)">สี = ความร้อน: จำนวนบรรทัด (ย่อด้วย √ ให้ช่องที่แน่นมากไม่กลืนที่เหลือ)</div>'
+      +'<span class="pvgrad" style="background:linear-gradient(90deg,'+pvRampCSS().join(',')+')"></span>'
+      +end('เบา','แน่นสุด');
+  }else{
+    h='<div style="color:var(--fg)">สี = จำนวนบรรทัด (เข้ม = แน่นกว่า)</div>'
+      +'<span class="pvgrad" style="background:linear-gradient(90deg,rgba(126,231,135,.22),rgba(126,231,135,1))"></span>'
+      +end('เบา','แน่นสุด');
+  }
+  if(hubs.length)h+='<div style="margin-top:4px">จุดรวมเด่น: '
+    +hubs.map(k=>'<span style="color:var(--warn)">#'+k+'</span> ('+PV.cells[k]+')').join(' · ')+'</div>';
+  box.innerHTML=h;
 }
 function pvCellAt(ev){
   const r=pcv.getBoundingClientRect(),step=pstep();
-  const x=Math.floor((ev.clientX-r.left)/step),y=Math.floor((ev.clientY-r.top)/step);
-  if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+  // Under the glass the pointer is over the MAGNIFIED cell, not the base one.
+  // Answering with the base cell would make hovering and clicking the lens
+  // disagree with what the lens is visibly showing.
+  const on=pvLensHit(ev.clientX-r.left,ev.clientY-r.top);
+  if(on){
+    const cs=pvLensCS();
+    const w=pvWrap(Math.floor(PV.lens.wedge+on[0]/cs));
+    const q=pvWrap(Math.floor(PV.lens.ring+on[1]/cs));
+    return[w,q,q*144+w];
+  }
+  let x=Math.floor((ev.clientX-r.left)/step),y=Math.floor((ev.clientY-r.top)/step);
+  if(PV.mode==='plane'){
+    /* torus: clicking outside 0..143 wraps around */
+    x=((x%T144)+T144)%T144;y=((y%T144)+T144)%T144;
+  }else{
+    if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+  }
   return[x,y,pvRkeyAt(x,y)];
+}
+// one way in, one way out: the top layer is the mechanism, so no call site can
+// "hide" the popup in a way that leaves it open, or "show" it without showing.
+function pvTopOpen(el){
+  if(el&&!el.matches(':popover-open')){try{el.showPopover()}catch(e){}}
+}
+function pvTopHide(el){
+  if(el&&el.matches(':popover-open')){try{el.hidePopover()}catch(e){}}
 }
 function pvPop(){
   const pop=$('#plane-pop'),d=PV.lines;
-  if(PV.sel==null||!d){pop.style.display='none';return}
+  if(PV.sel==null||!d){pvTopHide(pop);return}
   const keep=pvKeep();
   const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
   let h='<div style="color:var(--warn)">point '+d.point+' · '+d.count+' line(s)</div>';
@@ -804,39 +2294,59 @@ function pvPop(){
     h+='<div class="pp" style="color:'+pvRelInk(b)+'">'+esc(b.rel||'lifted')+' '
       +(out?'→ ':'← ')+(out?(b.dst8||('#row'+b.dst_rowid)):b.src8)+'</div>';
   });
-  if(keep)h+='<div class="pp">รัศมี '+PV.focus+' hop → '+keep.size+' เซลล์</div>';
+  if(keep)h+='<div class="pp">รัศมี '+PV.focus+' ทอด → '+keep.size+' เซลล์</div>';
   h+='<div class="prow"><button class="pbtn" id="pop-focus">'+(PV.focus?'ปิดรัศมี':'โฟกัส 1 hop')+'</button>'
     +'<button class="pbtn" id="pop-zoom">ซูมบล็อก</button>'
     +'<button class="pbtn" id="pop-close">ปิด</button></div>';
-  pop.innerHTML=h;pop.style.display='block';
-  const cr=pcv.getBoundingClientRect(),wr=$('#plane-canvaswrap').getBoundingClientRect();
+  pop.innerHTML=h;pvTopOpen(pop);
+  // Clamp against the VIEWPORT, never the canvas box — the box is a clipping
+  // container, and clamping to it is precisely what guaranteed the cut-off. Its
+  // rect only supplies where the selected cell is on screen. `max-height` plus
+  // `overflow:auto` mean the clamp below is always satisfiable: the popup can
+  // scroll, but it can no longer be chopped.
+  const cr=pcv.getBoundingClientRect();
   const ctr=pvCenter(PV.sel)||[0,0];
-  const x=Math.max(4,Math.min((cr.left-wr.left)+ctr[0]+14,wr.width-pop.offsetWidth-10));
-  const y=Math.max(4,Math.min((cr.top-wr.top)+ctr[1]+14,wr.height-pop.offsetHeight-10));
+  const vw=window.innerWidth||document.documentElement.clientWidth;
+  const vh=window.innerHeight||document.documentElement.clientHeight;
+  const pw=pop.offsetWidth,ph=pop.offsetHeight;
+  const x=Math.max(10,Math.min(cr.left+ctr[0]+14,vw-pw-10));
+  const y=Math.max(10,Math.min(cr.top+ctr[1]+14,vh-ph-10));
   pop.style.left=x+'px';pop.style.top=y+'px';
   $('#pop-focus').onclick=()=>setFocus(PV.focus?0:1);
   $('#pop-zoom').onclick=()=>pvZoomBlock(PV.sel);
-  $('#pop-close').onclick=()=>pop.style.display='none';
+  $('#pop-close').onclick=()=>pvTopHide(pop);
 }
 function setFocus(h){
   PV.focus=h;pvFocusBtns();pvDraw();pvInfo();pvPop();
-  if(h&&PV.sel==null)toast('เลือวจุดบนระนาบก่อน แล้วรัศมีจะบังส่วนที่ไม่เกี่ยวข้องให้');
+  if(h&&PV.sel==null)toast('เลือวจุดบนแผนที่ก่อน แล้วรัศมีจะบังส่วนที่ไม่เกี่ยวข้องให้');
 }
 function pvFocusBtns(){
-  for(let i=0;i<4;i++)$('#pv-f'+i).classList.toggle('on',PV.focus===i);
+  // A radius needs a CENTRE. With nothing selected these buttons only produced a
+  // toast telling you to pick a point — a control that cannot do its job sitting
+  // there looking available is how "what are hop 1-3?" happens. Disabled until
+  // there is a point to be a radius of, and the tooltip says why.
+  const noCentre=PV.sel==null;
+  for(let i=0;i<4;i++){
+    const b=$('#pv-f'+i);
+    b.classList.toggle('on',PV.focus===i);
+    b.disabled=i>0&&noCentre;
+    b.title=i===0?'เห็นทั้งแผนที่ ไม่กรองอะไร'
+      :('รัศมี '+i+' ทอด: เหลือเฉพาะช่องที่ต่อจากจุดที่เลือกภายใน '+i+' เส้น'
+        +(noCentre?' — ต้องเลือกจุดบนแผนที่ก่อน':' · ตอนนี้เหลือ '+PV.focus+' จุด'));
+  }
 }
 // A style that shows fewer edges must SAY so — a picture that quietly drops
 // half the graph would be worse than a cluttered one.
 function pvEdgeDisclosure(){
   const edges=pvGraphEdges();
   if(PV.style==='degree')
-    return ' · โหมด degree: ไม่วาดเส้น ('+edges.length+' edges) — เลือกจุดหรือกด 1 hop เพื่อดูเส้นจริง';
+    return ' · วงตามจำนวนเส้น: ไม่วาดเส้น ('+edges.length+' เส้น) — เลือกจุดหรือกดรัศมี 1 ทอด เพื่อดูเส้นจริง';
   if(PV.style==='hub'||(PV.style==='auto'&&edges.length>PV.autoAt)){
     const deg=pvDegrees(edges),top=new Set(Object.keys(deg).map(Number)
       .sort((a,b)=>deg[b]-deg[a]).slice(0,PV.hubK));
     const shown=edges.filter(e=>top.has(e.src_rkey)||top.has(e.dst_rkey)).length;
     if(shown<edges.length)
-      return ' · hub: แสดง '+shown+'/'+edges.length+' เส้น (ที่เหลือซ่อน — คลิกจุดหรือกดรัศมีเพื่อดูของมัน)';
+      return ' · จุดรวม: แสดง '+shown+'/'+edges.length+' เส้น (ที่เหลือซ่อน — คลิกจุดหรือกดรัศมีเพื่อดูของมัน)';
   }
   return '';
 }
@@ -857,48 +2367,109 @@ function pvRelLegend(){
     +'<span style="width:12px;height:2px;background:'+relCSS(r,1)+';display:inline-block"></span>'
     +esc(r)+' <span style="color:var(--dim)">'+(showed[r]||0)+'/'+tot[r]+'</span></span>').join('');
   const hidden=all.length-drawn.size;
-  if(hidden>0)h+='<div style="color:var(--warn)">hub ไม่วาด '+hidden+' เส้นที่'
-    +'ไม่แตะ hub — ตัวเลข 0/12 ข้างบนคือ rel ที่ถูกตัดออกมากที่สุด</div>';
+  if(hidden>0)h+='<div style="color:var(--warn)">จุดรวม: ไม่วาด '+hidden+' เส้นที่'
+    +'ไม่แตะจุดรวม — ตัวเลข 0/12 ข้างบนคือความหมายที่ถูกตัดออกมากที่สุด</div>';
   // the measurement, said out loud: hue is free on coverage but past a couple of
   // hundred strokes the colours sit on top of each other and the panel is the
   // only place a rel is still certain
   if(drawn.size>200)h+='<div style="color:var(--dim)">สีเริ่มทับกันที่ขนาดนี้ —'
-    +' คลิกจุดหรือกดรัศมีเพื่อดู rel ให้แน่</div>';
+    +' คลิกจุดหรือกดรัศมีเพื่อดูความหมายของเส้นให้แน่</div>';
   box.innerHTML=h;
 }
 function pvInfo(){
   const src=(PV.seq===null||PV.seq>=PV.seqMax-1)?PV.plane:pvCellsUpTo(PV.seq);
   const tot=Object.values(src).reduce((a,b)=>a+b,0);
-  $('#plane-info').textContent='• เซลล์ '+Object.keys(src).length+'/'+20736+' · '+tot+' lines'
-    +' · budget '+PV.budget+(PV.over.length?' · ต้องแตกชั้น '+PV.over.length+' เซลล์':'')
-    +' · edges '+pvLiveBonds().length+' · sightings '+PV.sights.length
-    +(()=>{const k=pvKeep();return k?(' · รัศมี '+PV.focus+' hop = '+k.size+' เซลล์ (บังที่เหลือ)'):''})()
+  const radius=pvKeep();
+  const full='• ช่องที่มีบรรทัด '+Object.keys(src).length+'/'+20736+' · '+tot+' บรรทัด'
+    +' · เพดานต่อช่อง '+PV.budget+(PV.over.length?' · แน่นเกินเพดาน '+PV.over.length+' ช่อง':'')
+    // say what prune removed, and say it only about the LIVE plane: while
+    // scrubbing back the numbers describe the present, not the frame drawn
+    +(!PV.prune?' · 🧹 ตัดขยะ: ปิด (แผนที่ดิบ)'
+      :(PV.seq!==null?' · 🧹 ตัดขยะ: เปิด'
+        :(PV.pruned?' · 🧹 ตัด '+PV.pruned+' บรรทัด · ช่องที่หายไป '+PV.prunedCells:' · 🧹 ไม่มีขยะ')))
+    +' · เส้นเชื่อม '+pvLiveBonds().length+' · รอยอ่าน '+PV.sights.length
+    +(radius?(' · รัศมี '+PV.focus+' ทอด = '+radius.size+' ช่อง (บังที่เหลือ)'):'')
     +pvEdgeDisclosure()
     +(()=>{
       if(!PV.ctxOn)return '';
       const mem=Object.keys(PV.ctxCells).length;
       const shared=Object.keys(PV.ctxCells).filter(k=>PV.plane[k]).length;
-      return ' · memory '+mem+' เซลล์ · ทับกัน '+shared+' · ข้ามระบบ '+PV.crossEdges.length+' เส้น';
+      return ' · ความจำ '+mem+' ช่อง · ทับกับแผนที่ '+shared+' · เชื่อมข้ามระบบ '+PV.crossEdges.length+' เส้น';
     })();
+  const who=(PV.colour==='writer'||PV.colour==='recent')
+    ?(()=>{const owners=pvTopApps();return PV.metaOn
+      ?(' · ข้อมูลผู้เขียน: '+(owners?Object.keys(owners).length:0)+' คน · ใหม่สุดที่บรรทัด '+Math.max(PV.cellSeqMax-1,0))
+      :' · ข้อมูลผู้เขียน: ยังไม่โหลด'})()
+    :'';
+  // One line on screen, everything else in the tooltip. This used to be a single
+  // 166-CHARACTER line, which on a 709px screen took a row of its own: the
+  // header measured 108px tall — three rows — for a caption. The numbers are not
+  // less true for being short; they were just the loudest thing in a modal whose
+  // job is to show a map.
+  const short='• '+Object.keys(src).length.toLocaleString()+'/20,736 ช่อง · '+tot.toLocaleString()+' บรรทัด'
+    +(!PV.prune?' · 🧹 ตัดขยะ: ปิด':(PV.pruned&&PV.seq===null?' · 🧹 ตัด '+PV.pruned.toLocaleString():''))
+    +(radius?(' · รัศมี '+PV.focus+' ทอด = '+radius.size.toLocaleString()+' ช่อง'):'');
+  const info=$('#plane-info');
+  info.textContent=short;
+  info.title=full+who;
   pvRelLegend();
+  pvLegend();
 }
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
   $('#pv-blocks').classList.toggle('on',PV.mode==='blocks');
-  $('#pv-block').classList.toggle('on',PV.mode==='block');
-  pvDerive();pvDraw();pvInfo();pvPop();   // popup rides along as the view changes
+  $('#pv-block').classList.toggle('on',PV.mode==='window');
+  pvWinInfo();
+  pvLensInfo();
+  pvFocusBtns();
+  _legendKey=null;                         // a new view is a new legend
+  pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
+}
+// One place that moves time, so the slider, the arrow keys, the strip and the
+// replay button can never disagree about where "now" is.
+function pvSetSeq(S){
+  clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';
+  const max=Math.max(PV.seqMax-1,0);
+  PV.seq=Math.max(0,Math.min(max,S));
+  if(PV.seq>=max)PV.seq=null;              // pinned at the end = the live plane
+  $('#pv-seq').value=PV.seq===null?max:PV.seq;
+  pvDerive();pvDraw();pvInfo();pvWhen();pvRibbon();
+}
+// the who/when layer is fetched the first time a colour mode needs it, not with
+// the counts: a reader that only wants the map should not pay for the layer
+async function loadMeta(){
+  if(PV.metaOn)return;
+  try{
+    // the who/when layer must describe the SAME plane the counts do: with
+    // prune off we ask for the unpruned layer, or a colour mode would
+    // attribute a cell to a writer whose only line in it was noise
+    const m=await fetch('/plane/meta'+(PV.prune?'':'?raw=1'),{headers:H}).then(r=>r.json());
+    PV.cellApp=m.last_app||{};PV.cellSeq=m.last_seq||{};
+    PV.cellSeqMax=Math.max(m.seq_max||0,1);PV.metaOn=true;_legendKey=null;
+  }catch(e){toast('โหลดข้อมูลผู้เขียน/เวลาไม่สำเร็จ — เลือกสีนั้นอีกครั้ง')}
+}
+function pvPNG(){
+  const tick=PV.seq===null?Math.max(PV.seqMax-1,0):PV.seq;
+  const a=document.createElement('a');
+  a.download='rdh-plane-'+PV.mode+'-tick'+tick+'.png';
+  a.href=pcv.toDataURL('image/png');a.click();
+  toast('บันทึกภาพแล้ว: '+a.download);
 }
 async function loadPlane(){
   try{
     const [d,s,b,t]=await Promise.all([
-      fetch('/neighbors?rkey=0&level=2',{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
+      fetch('/neighbors?rkey=0&level=2'+(PV.prune?'':'&raw=1'),{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
       fetch('/pointers',{headers:H}).then(r=>r.json()),
-      fetch('/bonds',{headers:H}).then(r=>r.json()),
+      fetch('/bonds?fields=plane',{headers:H}).then(r=>r.json()),
       fetch('/plane/timeline',{headers:H}).then(r=>r.json())
     ]);
     PV.plane=d.fine_cells||{};PV.budget=d.budget||64;
+    PV.pruned=d.pruned||0;PV.prunedCells=d.pruned_cells||0;
     PV.sights=s.pointers||[];
     PV.timeline=t.lines||[];PV.seqMax=t.count||0;
+    // the who/when layer changes with the log, so re-read it only when a mode
+    // is actually drawing from it (never for the plain count map)
+    if(PV.colour==='writer'||PV.colour==='recent'){PV.metaOn=false;await loadMeta()}
     // place each edge on the plane and stamp it with the tick of its own line,
     // so scrubbing back in time hides edges that had not been written yet
     const seqOf={};PV.timeline.forEach(r=>{seqOf[r[4]]=r[0]});
@@ -920,87 +2491,274 @@ async function loadCtx(){
     const seqOf={};PV.timeline.forEach(r=>{seqOf[r[4]]=r[0]});
     // a lift happens at flush time, but the edge exists as soon as its line does
     PV.crossEdges=(l.links||[]).map(e=>({...e,seq:seqOf[e.src8]}));
-  }catch(e){toast('ctx plane: '+e);PV.ctxCells={};PV.crossEdges=[]}
+  }catch(e){toast('โหลดความจำกลางไม่สำเร็จ — แสดงเฉพาะแผนที่');PV.ctxCells={};PV.crossEdges=[]}
 }
 function pvWhen(){
   const S=PV.seq===null?PV.seqMax-1:PV.seq;
   const row=PV.timeline[S];
-  $('#pv-when').textContent=(PV.seq===null?'ทุกบรรทัด':('tick '+S+'/'+Math.max(PV.seqMax-1,0)))
+  $('#pv-when').textContent=(PV.seq===null?'ทุกบรรทัด':('บรรทัดที่ '+S+'/'+Math.max(PV.seqMax-1,0)))
     +(row?(' · '+fmt(row[1])+' · '+row[3]):'');
 }
-async function pvZoomBlock(rk){
+async function pvZoomBlock(rk,size){
   const d=await fetch('/neighbors?rkey='+rk+'&level=1',{headers:H}).then(r=>r.json());
-  PV.origin=d.origin;PV.mode='block';pvMode();
+  PV.origin=d.origin;PV.mode='window';PV.win=size||PV.win||12;pvMode();
   const keys=Object.keys(d.fine_cells).map(Number);
   const busiest=keys.length?keys.reduce((a,b)=>d.fine_cells[a]>=d.fine_cells[b]?a:b):d.base;
   openPoint(busiest);
 }
 async function openPoint(rk,path){
   PV.sel=rk;PV.path=path||[];
-  const q='/neighbors?rkey='+rk+'&level=0'+(PV.path.length?'&path='+PV.path.join(','):'');
-  const d=await fetch(q,{headers:H}).then(r=>r.json());
-  PV.lines=d;PV.stacked=d.stacked||null;
+  pvFocusBtns();          // now there IS a centre, so the radius buttons wake up
+  // Clicking a cell is a deliberate READ, so it declares itself: that is the
+  // only honest source of a sighting (the system must be able to say "someone
+  // looked here", and a person clicking is the someone). The server makes it
+  // idempotent, so re-opening the same cell writes nothing new.
+  const as=identity==='admin'?'':'&as='+encodeURIComponent(identity);
+  const q='/neighbors?rkey='+rk+'&level=0&record=1'+as+(PV.path.length?'&path='+PV.path.join(','):'');
+  // The cell read and its walk are two questions about ONE click, so they go
+  // together: opening a point should not cost two round trips before the panel
+  // can say what shape the address has. A walk that fails must not lose the
+  // read, hence the catch — the cell is the answer, the shape is a bonus.
+  const [d,w]=await Promise.all([
+    fetch(q,{headers:H}).then(r=>r.json()),
+    fetch('/explore?rkey='+rk+'&hops=2',{headers:H}).then(r=>r.json()).catch(()=>null)
+  ]);
+  PV.lines=d;PV.stacked=d.stacked||null;PV.walk=w;
+  PV.walkSel=null;PV.trail=[];PV.hops=[];PV.showCensus=false;
+  if(d.sighting_written){
+    const s=await fetch('/pointers',{headers:H}).then(r=>r.json());
+    PV.sights=s.pointers||[];                    // the circle appears now, not next poll
+  }
   pvDetail();pvDraw();pvPop();
+}
+// The shape of a node from its two degrees. Kept here as well as on the server
+// because a HOP carries its degrees already — asking the server to re-derive a
+// shape it just told us would be a round trip for arithmetic.
+function pvShape(o,i){return (!o&&!i)?'○':!o?'◀':!i?'▶':'⇄'}
+function pvShapeName(s){return s==='sink'?'ปลายน้ำ':s==='source'?'ต้นน้ำ':s==='chain'?'กลางสาย':s==='edge'?'เส้นเชื่อม':'เกาะ'}
+function pvCrumbs(){
+  if(!PV.trail.length&&PV.walkSel==null)return '';
+  let c='<div class="crumbs">';
+  if(PV.lines)c+='<span class="crumb'+(PV.walkSel==null?' here':' x')+'" data-crumb="-1">▣ ช่อง '
+    +PV.lines.point+'</span>';
+  PV.trail.forEach((t,i)=>{
+    const last=i===PV.trail.length-1&&PV.walkSel===t.hash;
+    c+='<span class="crumb'+(last?' here':'')+'" data-crumb="'+i+'" title="'+esc(t.text||t.hash8)+'">'
+      +(i?'→ ':'')+pvShape(t.out||0,t.in||0)+' '+esc(t.hash8)+'</span>';
+  });
+  c+='</div>';
+  return c;
+}
+// One hop node row. A node is ONE line with TWO reasons to be here (a rel on
+// each edge), so the rel shown is the first and the rest are counted — a node
+// listed twice would read as two neighbours.
+function pvHopRows(level){
+  return level.nodes.map(n=>{
+    const i=PV.hops.push(n)-1;
+    return '<div class="hop" data-hop="'+i+'" title="'+esc(n.text||'')+'">'
+      +'<span class="shape" style="padding:1px 6px">'+pvShape(n.out,n.in)+'</span>'
+      +'<span style="flex:1;min-width:0"><span class="badge">'+esc(n.app||'?')+'</span> '
+      +'<span class="relchip">'+esc(n.rel)+'</span>'
+      +'<div class="tx">'+esc((n.text||'').slice(0,180))+'</div></span>'
+      +'<span class="deg" title="มี '+n.in+' เส้นชี้เข้ามา · นำไป '+n.out+' เส้น">'+n.in+'↓ '+n.out+'↑</span></div>';
+  }).join('');
+}
+function pvHopSection(title,hint,levels,tone){
+  const tot=levels.reduce((a,l)=>a+l.total,0);
+  if(!tot)return '';
+  let s='<div class="hopsec"><div class="hophead" style="color:'+tone+'">'+title
+    +' <span class="n">'+tot+'</span></div><div class="wyhy">'+hint+'</div>';
+  levels.forEach(l=>{
+    if(!l.total)return;
+    s+='<div class="hoplevel">ทอดที่ '+l.depth+' · '+l.total+' บรรทัด'
+      +(l.nodes.length<l.total?' (แสดง '+l.nodes.length+')':'')+'</div>'+pvHopRows(l);
+  });
+  return s+'</div>';
+}
+// The census: proportions have to be SEEN. "3,001 islands" beside "13,572
+// edges" reads as two comparable numbers, and they are not.
+function pvCensusHTML(){
+  const c=PV.census;
+  if(!c)return '<div>…</div>';
+  const tot=c.lines||1,meta=c.shape_meta||{};
+  let h='<div style="color:var(--fg);font-size:12px">📊 แพทเทินของแผนที่ทั้งใบ</div>'
+    +'<div class="wyhy">'+c.lines+' บรรทัด · '+c.edges+' เส้น · ข้าม platform '+c.cross+'</div><div class="cen">';
+  Object.keys(c.shapes).forEach(s=>{
+    const v=c.shapes[s],m=meta[s]||{},pct=(100*v/tot);
+    h+='<div class="cenrow" title="'+esc(m.why||'')+'"><span style="font-size:12px">'
+      +(m.icon||'?')+'</span><span>'+esc(m.label||s)+'</span>'
+      +'<span class="cenbar"><i style="width:'+Math.max(1,pct).toFixed(1)+'%"></i></span>'
+      +'<span class="cennum">'+(pct>=1?pct.toFixed(0):'<1')+'%</span></div>';
+  });
+  h+='</div><div class="hopsec"><div class="hophead">แยกตามคนเขียน</div>'
+    +'<div class="wyhy">เส้น = จำนวนเส้นเชื่อมที่แอปนั้นเขียน · เกาะ = ไม่มีเส้นเลย</div>';
+  Object.keys(c.by_app).forEach(a=>{
+    const v=c.by_app[a];
+    h+='<div style="display:flex;gap:6px;margin:3px 0"><span class="badge">'+esc(a)+'</span>'
+      +'<span class="cennum" style="flex:1;text-align:left">'+v.lines+' บรรทัด · '+v.edges
+      +' เส้น · '+v.isolated+' เกาะ ('+(v.lines?Math.round(100*v.isolated/v.lines):0)+'%)</span></div>';
+  });
+  h+='</div><div class="hopsec"><div class="hophead">ชุมทาง — บรรทัดที่มีคนอ้างถึงมากสุด</div>'
+    +'<div class="wyhy">in ตั้งแต่ '+c.hub_at+' ขึ้นไป · ทั้งระนาบมีไม่กี่บรรทัดที่คนอื่นเกาะอยู่</div>';
+  c.hubs.forEach(x=>{
+    const i=PV.hops.push({hash:x.hash,hash8:x.hash8,rkey:x.rkey,app:x.app,text:x.text,out:x.out,in:x.in})-1;
+    h+='<div class="cenhub" data-hop="'+i+'" title="'+esc(x.text||'')+'">'
+      +'<span class="deg" style="color:var(--warn)">'+x.in+'↓</span>'
+      +'<span style="flex:1;min-width:0"><span class="badge">'+esc(x.app||'?')+'</span> '
+      +'<div class="tx">'+esc((x.text||'').slice(0,140))+'</div></span></div>';
+  });
+  h+='</div><div class="hopsec"><div class="hophead">คำกริยาที่ข้อมูลเขียนไว้</div>';
+  Object.keys(c.rels).forEach(r=>{h+='<div style="margin:2px 0"><span class="relchip">'+esc(r)
+    +'</span> <span class="cennum" style="text-align:left">'+c.rels[r]+'</span></div>'});
+  return h+'</div>';
 }
 function pvDetail(){
   const d=PV.lines,el=$('#plane-detail');
   if(!d){el.textContent='…';return}
-  let h='<div style="color:var(--fg);font-size:12px">point <b style="color:var(--warn)">'+d.point
-    +'</b> · '+d.count+' line(s)</div>';
-  h+='<div style="margin:4px 0">(x '+(d.point%144)+', y '+Math.floor(d.point/144)+') บนระนาบ'
-    +(PV.path.length?' · path '+PV.path.map((v,i)=>'ชั้น '+(i+1)+'='+v).join(' → '):'')+'</div>';
-  if(PV.path.length)h+='<button class="pbtn" id="pv-up">↑ ขึ้นชั้น</button>';
+  PV.hops=[];
+  if(PV.showCensus){el.innerHTML=pvCensusHTML();pvWireDetail();return}
+  let h=pvCrumbs();
+  if(PV.walkSel!=null&&PV.walk&&!PV.walk.gone){
+    const f=PV.walk.shape||{};
+    h+='<div><span class="shape"><b style="color:var(--warn)">'+(f.icon||'?')+'</b> '
+      +esc(f.label||'?')+'</span> <span class="badge">'+esc(f.kind||'')+'</span> '
+      +'<span class="badge">'+esc(f.app||'?')+'</span></div>'
+      +'<div class="swhy">'+esc(f.why||'')+'</div>'
+      +'<div style="margin:5px 0">← มี '+f.in+' เส้นชี้เข้ามา · นำไป '+f.out+' เส้น'
+      +(f.cross?' · ข้าม platform '+f.cross:'')
+      +(f.hub?' · <b style="color:var(--warn)">ชุมทาง</b>':'')+'</div>'
+      +'<div class="pline" style="cursor:default"><div style="white-space:pre-wrap">'
+      +esc((f.text||'').slice(0,400))+'</div></div>'
+      +'<button class="pbtn" id="pv-clrc">✕ ออกจากเส้น กลับไปที่เซลล์</button>';
+    if(PV.walk.out&&PV.walk.out.length)
+      h+=pvHopSection('→ ต่อไปจากบรรทัดนี้','สิ่งที่มีคนเขียนไว้ว่าต่อจากมัน',PV.walk.out,'var(--acc2)');
+    if(PV.walk.in&&PV.walk.in.length)
+      h+=pvHopSection('← ย้อนกลับมาที่บรรทัดนี้','มีอะไรอ้างถึงมัน และอ้างด้วยคำกริยาอะไร',PV.walk.in,'var(--warn)');
+  }else{
+    const w=PV.walk||{};
+    h+='<div style="color:var(--fg);font-size:12px">point <b style="color:var(--warn)">'+d.point
+      +'</b> · '+d.count+' line(s)</div>'
+      +'<div style="margin:4px 0">(x '+(d.point%144)+', y '+Math.floor(d.point/144)+') บนระนาบ'
+      +(PV.path.length?' · path '+PV.path.map((v,i)=>'ชั้น '+(i+1)+'='+v).join(' → '):'')+'</div>';
+    if(w.count){h+='<div><span class="shape"><b style="color:var(--warn)">'+w.icon+'</b> '
+      +esc(w.label)+'</span></div><div class="swhy">'+esc(w.why)+'</div>'}
+    if(PV.path.length)h+='<button class="pbtn" id="pv-up">↑ ขึ้นชั้น</button>';
+    if(w.out&&w.out.length)
+      h+=pvHopSection('→ ต่อไปจากที่อยู่นี้','ทุกบรรทัดในเซลล์นี้รวมกัน — ออกไปที่ไหน',w.out,'var(--acc2)');
+    if(w.in&&w.in.length)
+      h+=pvHopSection('← ย้อนกลับมาที่ที่อยู่นี้','อะไรอ้างถึงบรรทัดที่อยู่ในเซลล์นี้',w.in,'var(--warn)');
+  }
   if(PV.stacked){
     const cells=PV.stacked.sub_cells,keys=Object.keys(cells).map(Number);
     const max=keys.length?Math.max(...keys.map(k=>cells[k])):1;
     h+='<div style="color:var(--warn);margin-top:8px">แน่นเกิน budget '+PV.stacked.budget
       +' — แตกเป็น sub-map ชั้น '+PV.stacked.depth+' (address ล้วน)'
-      +(PV.stacked.still_over?' · ยังมี '+PV.stacked.still_over+' ช่องที่ต้องลงต่อ':'')+'</div>';
-    h+='<div id="subgrid">';
+      +(PV.stacked.still_over?' · ยังมี '+PV.stacked.still_over+' ช่องที่ต้องลงต่อ':'')+'</div>'
+      +'<div id="subgrid">';
     for(let i=0;i<144;i++){
       const v=cells[i]||0,bg=v?'rgba(126,231,135,'+(0.25+0.75*(v/max)).toFixed(2)+')':'var(--panel2)';
-      h+='<div data-sub="'+i+'" title="sub '+i+' · '+v+' line(s)" style="background:'+bg+'"></div>';
+      h+='<div data-sub="'+i+'" title="ช่องย่อย '+i+' · '+v+' บรรทัด" style="background:'+bg+'"></div>';
     }
     h+='</div>';
   }
   const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
   if(mine.length){
-    h+='<div style="color:var(--acc2);margin-top:8px">edges ที่แตะจุดนี้ ('+mine.length+') — คลิกปลายทางเพื่อเดินต่อ</div>';
-    h+=mine.map(b=>{
+    h+='<div style="color:var(--acc2);margin-top:8px">edges ที่แตะจุดนี้ ('+mine.length+')</div>'
+      +mine.map(b=>{
       const out=b.src_rkey===PV.sel,other=out?(b.dst8||('#row'+b.dst_rowid)):b.src8;
       const ork=out?b.dst_rkey:b.src_rkey,lift=b.kind==='lifted';
       return '<div class="pline" style="border-color:'+(lift?'#bc8cff':'var(--acc2)')+'"><span class="badge">'+esc(b.app||'?')
         +'</span> '+(out?'→':'←')+' <b style="color:'+pvRelInk(b)+'">'+esc(b.rel||'lifted')+'</b> '
-        +'<span class="ph" title="walk ไปปลายอีกด้าน" onclick="openPoint('+(ork==null?'null':ork)+')">'
+        +'<span class="ph" data-goto="'+(ork==null?'':ork)+'" title="เปิดเซลล์ปลายทาง">'
         +other+(ork==null?' (ไม่เห็นปลายทาง)'+(lift?' · row '+b.dst_rowid:''):'')+'</span></div>';
     }).join('');
   }
+  const deg={};(PV.walk&&PV.walk.lines||[]).forEach(l=>{deg[l.hash]=l});
   const ls=d.lines||[];
-  h+=ls.length?ls.slice(0,40).map(m=>'<div class="pline"><span class="badge">'+esc(m.app||'?')
-      +'</span> <span class="badge kind">'+esc(m.kind||'')+'</span> <span class="ph" onclick="navigator.clipboard.writeText(\''
-      +(m.hash||'')+'\');toast(\'copied '+hash8(m.hash)+'\')">'+hash8(m.hash)+'</span>'
-      +'<div style="white-space:pre-wrap;margin-top:3px">'+esc((m.text||'').slice(0,240))+'</div></div>').join('')
+  h+=ls.length?'<div class="hoplevel" style="margin-top:9px">บรรทัดในเซลล์นี้ — กดที่บรรทัดเพื่อเดินตามมัน</div>'
+    +ls.slice(0,40).map(m=>{
+      const g=deg[m.hash],o=g?g.out:0,i=g?g.in:0;
+      return '<div class="pline"><span class="badge">'+esc(m.app||'?')
+      +'</span> <span class="badge kind">'+esc(m.kind||'')+'</span> '
+      +'<span class="shape" style="padding:1px 6px" title="มี '+i+' เส้นชี้เข้ามา · นำไป '+o+' เส้น">'+pvShape(o,i)+'</span> '
+      +'<span class="ph" data-copy="'+(m.hash||'')+'">'+hash8(m.hash)+'</span>'
+      +'<button class="pbtn" style="padding:0 6px;font-size:10px" data-walk="'+esc(m.hash||'')+'" title="🧭 เดินตามบรรทัดนี้ — ดูว่ามันไปเกี่ยวกับอะไร และอะไรอ้างถึงมัน">🧭</button>'
+      +'<div style="white-space:pre-wrap;margin-top:3px">'+esc((m.text||'').slice(0,240))+'</div></div>'
+    }).join('')
     :'<div style="margin-top:6px">เซลล์นี้ว่าง — ไม่มี line อยู่ตรงนี้</div>';
   el.innerHTML=h;
+  pvWireDetail();
+}
+// Wires what the render emitted. Handlers are attached here rather than inlined
+// so a line's TEXT never has to be escaped into an onclick attribute — the
+// text is data, and data must not become code.
+function pvWireDetail(){
+  const el=$('#plane-detail');
   el.querySelectorAll('#subgrid div').forEach(node=>{
     node.onclick=()=>openPoint(PV.sel,PV.path.concat([+node.dataset.sub]));
   });
-  const up=$('#pv-up');
-  if(up)up.onclick=()=>openPoint(PV.sel,PV.path.slice(0,-1));
+  el.querySelectorAll('[data-goto]').forEach(n=>{n.onclick=()=>{if(n.dataset.goto)openPoint(+n.dataset.goto)}});
+  el.querySelectorAll('[data-copy]').forEach(n=>{
+    n.onclick=()=>{navigator.clipboard.writeText(n.dataset.copy);toast('คัดลอกแล้ว · '+hash8(n.dataset.copy))}});
+  el.querySelectorAll('[data-walk]').forEach(n=>{n.onclick=()=>pvWalkLine(n.dataset.walk)});
+  el.querySelectorAll('[data-hop]').forEach(n=>{n.onclick=()=>pvWalkHop(+n.dataset.hop)});
+  el.querySelectorAll('[data-crumb]').forEach(n=>{n.onclick=()=>pvCrumb(+n.dataset.crumb)});
+  const up=$('#pv-up');if(up)up.onclick=()=>openPoint(PV.sel,PV.path.slice(0,-1));
+  const cl=$('#pv-clrc');if(cl)cl.onclick=()=>{PV.walkSel=null;PV.walk=null;PV.trail=[];openPoint(PV.sel,PV.path)};
+}
+function pvWalkHop(i){
+  const n=(PV.hops||[])[i];
+  if(!n)return;
+  // walking to a node also MOVES the plane there: the shape badge is a claim
+  // about an address, and leaving the map behind would let panel and plane
+  // disagree about where the reader is
+  if(n.rkey!=null){PV.sel=n.rkey;PV.path=[]}
+  pvWalkLine(n.hash);
+}
+function pvCrumb(i){
+  if(i<0){PV.walkSel=null;PV.walk=null;PV.trail=[];openPoint(PV.sel,PV.path);return}
+  PV.trail=PV.trail.slice(0,i+1);
+  PV.walkSel=PV.trail[PV.trail.length-1].hash;
+  pvWalkLine(PV.walkSel,true);
+}
+async function pvWalkLine(h,sameTrail){
+  if(!h)return;
+  try{
+    const w=await fetch('/explore?hash='+h+'&hops=2',{headers:H}).then(r=>r.json());
+    if(w.gone){toast('บรรทัดนี้ถูกตัดขยะไปแล้ว — ไม่มีที่อยู่ให้เดินต่อ');return}
+    PV.walk=w;PV.walkSel=h;
+    if(!sameTrail){
+      const s=w.shape||{};
+      PV.trail.push({hash:h,hash8:w.hash8,text:s.text,app:s.app,rkey:s.rkey,
+                     out:s.out,in:s.in});
+      if(PV.trail.length>12)PV.trail.shift();      // a trail is a path, not a log
+    }
+    pvDetail();pvDraw();
+  }catch(e){toast('เปิดเส้นทางของบรรทัดนี้ไม่สำเร็จ — ลองอีกครั้ง')}
+}
+async function pvCensus(){
+  try{
+    PV.census=await fetch('/patterns',{headers:H}).then(r=>r.json());
+    PV.showCensus=true;PV.walkSel=null;PV.trail=[];pvDetail();
+  }catch(e){toast('โหลดแพทเทินไม่สำเร็จ — ลองอีกครั้ง')}
 }
 pcv.onmousemove=ev=>{
   const tip=$('#plane-tip'),hit=pvCellAt(ev);
-  if(!hit){tip.style.display='none';return}
+  if(!hit){pvTopHide(tip);return}
   const [x,y,rk]=hit,n=pvCountAt(x,y,rk);
   const who=PV.sights.filter(s=>s.point===rk).map(s=>s.app).join(',');
-  tip.textContent=(PV.mode==='blocks'?'บล็อก ':'rkey ')+rk+' ('+x+','+y+') · '+n+' line'+(n===1?'':'s')
+  tip.textContent=(PV.mode==='blocks'?'ช่องย่อ ':'ที่อยู่ ')+rk+' (คอลัมน์ '+x+', แถว '+y+') · '+n+' บรรทัด'
     +(who?' · 👁 '+who:'');
-  tip.style.display='block';
-  const wrap=$('#plane-canvaswrap').getBoundingClientRect();
-  tip.style.left=(ev.clientX-wrap.left+12)+'px';tip.style.top=(ev.clientY-wrap.top+12)+'px';
+  pvTopOpen(tip);
+  const vw=window.innerWidth||document.documentElement.clientWidth;
+  const vh=window.innerHeight||document.documentElement.clientHeight;
+  const tw=tip.offsetWidth,th=tip.offsetHeight;
+  tip.style.left=Math.max(6,Math.min(ev.clientX+12,vw-tw-6))+'px';
+  tip.style.top=Math.max(6,Math.min(ev.clientY+12,vh-th-6))+'px';
 };
-pcv.onmouseleave=()=>$('#plane-tip').style.display='none';
+pcv.onmouseleave=()=>pvTopHide($('#plane-tip'));
 pcv.onclick=ev=>{
+  if(PV.panSwallow&&Date.now()-PV.panSwallow<250)return;   // the pan, not a read
   const hit=pvCellAt(ev);if(!hit)return;
   const [x,y,rk]=hit;
   if(PV.mode==='blocks'){pvZoomBlock(rk);return}   // zoom = another read, finer
@@ -1008,51 +2766,286 @@ pcv.onclick=ev=>{
 };
 $('#open-plane').onclick=()=>{
   $('#plane-modal').classList.add('open');
+  // on a phone a 144x144 plane is 3px per cell — open on the 12x12 block map
+  // instead, where a cell is big enough to hit, and let the caller zoom in
+  if(window.innerWidth<900&&PV.mode==='plane')PV.mode='blocks';
   loadPlane();
   PV.timer=setInterval(loadPlane,8000);           // watch it breathe
 };
 function pvClose(){
   $('#plane-modal').classList.remove('open');
-  $('#plane-pop').style.display='none';
+  pvTopHide($('#plane-pop'));
+  pvTopHide($('#plane-tip'));
   if(PV.timer){clearInterval(PV.timer);PV.timer=null}
 }
+// The popup is anchored to a POINT ON THE CANVAS, not to the box, so a scroll or
+// a resize moves what it points at. Re-place it rather than letting it drift —
+// the old code placed it once and never again, so a resize left it behind.
+$('#plane-canvaswrap').addEventListener('scroll',()=>{
+  if($('#plane-pop').matches(':popover-open'))pvPop();
+  pvTopHide($('#plane-tip'));
+},{passive:true});
 $('#plane-close').onclick=pvClose;
 $('#plane-modal').onclick=e=>{if(e.target.id==='plane-modal')pvClose()};
-document.addEventListener('keydown',e=>{if(e.key==='Escape')pvClose()});
+// Escape peels the overlays topmost-first. The plane modal is z-50 and the
+// drawer is z-40, so the order is not a preference — it is the stacking. The
+// drawer had no keyboard dismissal at all: Escape closed the modal and then
+// did nothing, leaving a scrim that could only be got rid of by tapping it.
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  if($('#plane-modal').classList.contains('open')){pvClose();return}
+  if($('#side').classList.contains('open'))sideOpen(false);
+});
 $('#pv-plane').onclick=()=>{PV.mode='plane';pvMode()};
 $('#pv-blocks').onclick=()=>{PV.mode='blocks';pvMode()};
 $('#pv-block').onclick=()=>{
-  if(PV.sel==null||!PV.plane[PV.sel]){toast('เลือกจุดบนระนาบก่อน');return}
-  pvZoomBlock(PV.sel);
+  // entering the window needs an origin, and the honest one is the point the
+  // reader is already at — a window has to be opened SOMEWHERE
+  if(PV.mode==='window'&&PV.origin){pvMode();return}
+  const here=(PV.sel!=null)?PV.sel:busiestCell();
+  if(here==null){toast('ยังไม่มีข้อมูลบนแผนที่');return}
+  PV.win=PV.win||12;
+  pvZoomBlock(here,PV.win);
+};
+$('#pv-win').value=String(PV.win);
+$('#pv-win').onchange=e=>{
+  PV.win=+e.target.value;
+  if(PV.mode==='window')pvMode();
+  else $('#pv-block').click();       // choosing a size IS asking for the window
+};
+function busiestCell(){
+  const ks=Object.keys(PV.plane);
+  if(!ks.length)return null;
+  return +ks.reduce((a,b)=>PV.plane[a]>=PV.plane[b]?a:b);
+}
+// drag to pan. The pointer only moves the FRAME; every address it shows stays
+// exactly where it was, which is the point of a viewport over immutable data.
+pcv.style.touchAction='none';
+function pvLensRead(){
+  // the crosshair is the address the glass is ON, so that is the read
+  const w=pvWrap(Math.floor(PV.lens.wedge)),r=pvWrap(Math.floor(PV.lens.ring));
+  PV.lens.wedge=w;PV.lens.ring=r;
+  openPoint(r*144+w);
+}
+pcv.onpointerdown=ev=>{
+  const rect=pcv.getBoundingClientRect();
+  // Grabbing the GLASS moves the glass; grabbing the canvas outside it moves
+  // the FRAME under it. Two different things to hold, told apart by which one
+  // the pointer is on — and the second is what makes every address reachable
+  // once the glass has a fixed radius it cannot get closer than.
+  if(pvLensHit(ev.clientX-rect.left,ev.clientY-rect.top)){
+    PV.lens.drag={x:ev.clientX,y:ev.clientY,w:PV.lens.wedge,r:PV.lens.ring};
+    PV.lens.moved=false;
+    pcv.setPointerCapture(ev.pointerId);
+    return;
+  }
+  if(PV.mode!=='window')return;
+  PV.panDrag={x:ev.clientX,y:ev.clientY,ox:PV.origin.wedge,oy:PV.origin.ring};
+  pcv.setPointerCapture(ev.pointerId);
+};
+pcv.onpointermove=ev=>{
+  if(PV.lens.on&&PV.lens.drag){
+    const d=PV.lens.drag,step=pvLensPxPerCell();
+    // the glass follows the POINTER at the base view's scale, not at the
+    // magnified scale: you slide the glass across the page, the page does not
+    // scroll under it — and this is what keeps high zoom from being twitchy
+    if(Math.abs(ev.clientX-d.x)>2||Math.abs(ev.clientY-d.y)>2)PV.lens.moved=true;
+    PV.lens.wedge=pvWrap(d.w+(ev.clientX-d.x)/step);
+    PV.lens.ring=pvWrap(d.r+(ev.clientY-d.y)/step);
+    pvLensFollow();
+    pvLensPaint();
+    return;
+  }
+  if(!PV.panDrag)return;
+  const step=pstep(),d=PV.panDrag;
+  // dragging right shows what is to the LEFT, so the frame moves the other way
+  const dw=Math.round((d.x-ev.clientX)/step),dr=Math.round((d.y-ev.clientY)/step);
+  if(dw||dr){
+    PV.origin={wedge:pvWrap(d.ox+dw),ring:pvWrap(d.oy+dr)};
+    PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,ox:PV.origin.wedge,oy:PV.origin.ring};
+    pvMode();
+  }
+};
+pcv.onpointerup=ev=>{
+  if(PV.lens.on&&PV.lens.drag){
+    const moved=PV.lens.moved;PV.lens.drag=null;
+    try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
+    // moving the glass is not a read, for the same reason a pan is not
+    if(moved){PV.panSwallow=Date.now();pvLensInfo();return}
+    pvLensRead();
+    return;
+  }
+  if(!PV.panDrag)return;
+  const moved=Math.abs(ev.clientX-PV.panDrag.x)>2||Math.abs(ev.clientY-PV.panDrag.y)>2;
+  PV.panDrag=null;
+  try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
+  // a pan is not a read: without this, sliding the frame would open whatever
+  // cell the pointer happened to stop on
+  if(moved)PV.panSwallow=Date.now();
+};
+// ░ the zoom wheel. It snaps between REAL resolutions rather than scaling
+// continuously: between two stops the glass would be enlarging pixels, which
+// is the opposite of what a viewport is for.
+pcv.addEventListener('wheel',ev=>{
+  if(!PV.lens.on)return;
+  ev.preventDefault();
+  pvLensZoom(ev.deltaY<0?1:-1);
+},{passive:false});
+// prune is a REFETCH, not a repaint: the server decides which cells exist, so
+// flipping it re-reads the plane (and the who/when layer with it)
+$('#pv-prune').onchange=e=>{
+  PV.prune=e.target.checked;PV.metaOn=false;loadPlane();
+  toast(PV.prune?'🧹 เปิดตัดขยะ — ข้อความไร้สาระไม่กินที่อยู่บนแผนที่'
+               :'🧹 ปิดตัดขยะ — เห็นแผนที่ดิบ รวมข้อความทดสอบ (ในไฟล์ log ยังมีครบ)');
 };
 $('#pv-bonds').onchange=e=>{PV.showBonds=e.target.checked;pvDraw()};
 $('#pv-ctx').onchange=async e=>{
   PV.ctxOn=e.target.checked;await loadCtx();pvMode();
-  if(PV.ctxOn)toast('memory plane: '+Object.keys(PV.ctxCells).length+' เซลล์ · ข้ามระบบ '+PV.crossEdges.length+' เส้น');
+  if(PV.ctxOn)toast('ความจำกลางที่แชร์ไว้: '+Object.keys(PV.ctxCells).length+' ช่อง · เชื่อมข้ามระบบ '+PV.crossEdges.length+' เส้น');
 };
 $('#pv-style').onchange=e=>{PV.style=e.target.value;pvMode()};
+// how many cells count as a hub decides how much of the graph is drawn at all.
+// 12 was tuned when a plane held a handful of edges; a real corpus puts
+// thousands here, and the ceiling — not the style — was what hid them.
+$('#pv-hubk').value=String(PV.hubK);
+$('#pv-hubk').onchange=e=>{PV.hubK=+e.target.value;pvMode()};
 $('#pv-rel').onchange=e=>{PV.relColour=e.target.checked;pvDraw();pvInfo()};
+$('#pv-lens').onclick=()=>{
+  const L=PV.lens;
+  L.on=!L.on;
+  $('#pv-lens').classList.toggle('on',L.on);
+  if(L.on){
+    // the glass has to be held over SOMETHING. The honest first position is
+    // where the reader already is; failing that, the busiest cell, which is
+    // where anyone would look first anyway.
+    const here=PV.sel!=null?PV.sel:busiestCell();
+    if(here!=null){
+      const w=here%144,r=Math.floor(here/144);
+      L.wedge=w;L.ring=r;
+      // The glass has a RADIUS, so it cannot be centred closer than r to the
+      // edge of the view — and on the full 144x144 plane that would put ~25
+      // rings permanently out of reach. So the base becomes a WINDOW and the
+      // glass gets a band to move in; the window still pans, so nothing is
+      // unreachable, only out of frame until you slide.
+      if(PV.mode!=='window'||PV.win<36||PV.win>96){PV.win=48}
+      PV.mode='window';
+      PV.origin={wedge:pvWrap(w-Math.floor(PV.win/2)),ring:pvWrap(r-Math.floor(PV.win/2))};
+    }
+    toast('🔍 แว่นขยาย — ลาก = เลื่อน · ล้อ/± = ซูม · คลิก/Enter = อ่านช่องใต้แว่น · หยุดที่ความละเอียดจริงเท่านั้น');
+  }
+  pvMode();
+};
+function pvLensZoom(dir){
+  const s=pvLensStops(),z=pvLensZ();
+  let i=s.findIndex(v=>v>=z);if(i<0)i=s.length-1;
+  i=dir>0?Math.min(s.length-1,i+1):Math.max(0,i-1);
+  PV.lens.z=s[i];
+  pvDraw();pvLensInfo();
+  const lv=pvLensLevel(pvLensCS());
+  toast('🔍 ×'+s[i]+' · '+lv[1]+(s[i]>=pvLensZMax()
+    ?' · ⛔ ละเอียดสุดแล้ว — ไม่มีอะไรให้ขยายมากกว่านี้ เนื้อหาข้างในอยู่ในแผงขวา':''));
+}
+$('#pv-lens-zin').onclick=()=>pvLensZoom(1);
+$('#pv-lens-zout').onclick=()=>pvLensZoom(-1);
+// ⟲ = "never mind, show me the whole thing again". It undoes BOTH ways of being
+// zoomed in at once — the magnifier's ×level AND the view being narrowed to a
+// block or a window — because the difference between "what magnification" and
+// "which patch am I looking at" is OUR distinction, not the reader's. Two
+// separate resets would just make them guess which one they wanted. It also
+// re-centres the glass, so it doubles as "I dragged it somewhere and lost it".
+function pvZoomReset(){
+  const wasNarrow=PV.mode!=='plane';
+  PV.lens.z=1;
+  const here=PV.sel!=null?PV.sel:busiestCell();
+  if(here!=null){PV.lens.wedge=here%144;PV.lens.ring=Math.floor(here/144)}
+  if(wasNarrow){PV.mode='plane';pvMode()}
+  else{pvLensFollow();pvDraw();pvLensInfo()}
+  toast(wasNarrow?'⟲ กลับไปทั้งแผนที่ · ความละเอียด ×1'
+    :'⟲ ความละเอียด ×1 · แว่นกลับมาที่'+(PV.sel!=null?'จุดที่เลือกไว้':'ช่องที่แน่นที่สุด'));
+}
+$('#pv-zreset').onclick=pvZoomReset;
+// The options bar is one button away, and the button says what is behind it.
+// Kept in a variable so opening ⚙ stays open across a mode change — a panel
+// that closes itself every time you touch something is worse than no panel.
+let pvOptOn=false;
+function pvOptApply(){
+  $('#plane-bar').classList.toggle('off',!pvOptOn);
+  $('#pv-opt').classList.toggle('on',pvOptOn);
+}
+$('#pv-opt').onclick=()=>{pvOptOn=!pvOptOn;pvOptApply();toast(pvOptOn?'⚙ ตัวเลือกการวาด':'⚙ ซ่อนตัวเลือก — เหลือแค่สิ่งที่ต้องใช้บ่อย')};
+pvOptApply();
+$('#pv-census').onclick=()=>{
+  // toggle: the census REPLACES the detail panel rather than sitting beside it,
+  // because both answer "what is this" and two answers on a 360px column is
+  // how a panel becomes unreadable
+  if(PV.showCensus){PV.showCensus=false;pvDetail();return}
+  pvCensus();
+};
 $('#pv-f0').onclick=()=>setFocus(0);
 $('#pv-f1').onclick=()=>setFocus(1);
 $('#pv-f2').onclick=()=>setFocus(2);
 $('#pv-f3').onclick=()=>setFocus(3);
-$('#pv-seq').oninput=e=>{
-  clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';
-  PV.seq=+e.target.value;
-  if(PV.seq>=PV.seqMax-1)PV.seq=null;      // pinned at the end = live plane
-  pvDerive();pvDraw();pvInfo();pvWhen();
+$('#pv-seq').oninput=e=>pvSetSeq(+e.target.value);
+$('#pv-last').onclick=()=>pvSetSeq(PV.seqMax);          // "latest" = live plane
+$('#pv-colour').onchange=async e=>{
+  PV.colour=e.target.value;
+  if(PV.colour==='writer'||PV.colour==='recent')await loadMeta();
+  _legendKey=null;pvDraw();pvInfo();
 };
-$('#pv-last').onclick=()=>{
-  PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;
-  pvDerive();pvDraw();pvInfo();pvWhen();
+$('#pv-png2').onclick=pvPNG;
+// the strip is a scrubber: press and drag to move through the log's order
+const ribSeek=ev=>{const S=pvRibbonAt(ev);if(S!=null)pvSetSeq(S)};
+let ribDrag=false;
+rb.onmousedown=ev=>{ribDrag=true;ribSeek(ev)};
+rb.onmousemove=ev=>{
+  const S=pvRibbonAt(ev);
+  if(!S&&S!==0)return;
+  const row=PV.timeline[Math.min(PV.timeline.length-1,S)];
+  rb.title=row?('tick '+S+' · '+fmt(row[1])+' · '+(row[5]||'?')+' ('+row[3]+') · กดเพื่อเลื่อนไปช่วงนี้'):'';
+  if(ribDrag)ribSeek(ev);
 };
+window.addEventListener('mouseup',()=>{ribDrag=false});
+rb.onmouseleave=()=>{ribDrag=false};
+// arrow keys step time, space plays, Esc closes — the plane is something you
+// look at for a while, so it should not need the mouse for the boring moves
+document.addEventListener('keydown',e=>{
+  if(!$('#plane-modal').classList.contains('open'))return;
+  if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return;
+  // With the glass in hand the arrows move the GLASS, because that is what you
+  // are holding — and one press is one CELL, which is the fine control a drag
+  // at x50 cannot give you. Shift+arrows still move time, so the old keys stay
+  // reachable instead of being taken away.
+  if(PV.lens.on){
+    const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];
+    if(d&&!e.shiftKey){e.preventDefault();pvLensNudge(d[0],d[1]);return}
+    if(e.key==='Enter'){e.preventDefault();pvLensRead();return}
+    if(e.key==='+'||e.key==='='){e.preventDefault();$('#pv-lens-zin')&&$('#pv-lens-zin').click();return}
+    if(e.key==='-'){e.preventDefault();$('#pv-lens-zout')&&$('#pv-lens-zout').click();return}
+  }
+  // arrows move TIME; shift+arrows move the FRAME. Two different kinds of
+  // "move" on the same keys would be a trap, so they are kept apart.
+  if(e.shiftKey&&PV.mode==='window'){
+    const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];
+    if(d){e.preventDefault();pvPan(d[0],d[1])}
+    return;
+  }
+  if(e.key==='ArrowLeft'){e.preventDefault();pvSetSeq((PV.seq===null?PV.seqMax-1:PV.seq)-1)}
+  else if(e.key==='ArrowRight'){e.preventDefault();pvSetSeq((PV.seq===null?PV.seqMax-1:PV.seq)+1)}
+  else if(e.key===' '){e.preventDefault();$('#pv-play').click()}
+});
+window.addEventListener('resize',()=>{
+  if(!$('#plane-modal').classList.contains('open'))return;
+  pvDraw();pvRibbon();          // both canvases are sized from the space they have
+  pvPop();                      // and the popup is anchored to a point in them
+  pvTopHide($('#plane-tip'));
+});
 $('#pv-play').onclick=()=>{
-  if(PV.playing){clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';return}
+  if(PV.playing){clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';return}
   $('#pv-play').textContent='⏸ หยุด';
   PV.seq=0;$('#pv-seq').value=0;
   PV.playing=setInterval(()=>{
     if(PV.seq===null||PV.seq>=PV.seqMax-1){
-      clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ replay';
+      clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';
       PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;pvDerive();pvDraw();pvInfo();pvWhen();
       return;
     }
@@ -1065,9 +3058,96 @@ $('#pv-play').onclick=()=>{
 // without this a LAN phone shows the shell with a stuck "chain…" forever
 refresh().catch(()=>{});
 loadInbox().catch(()=>{});
+
+// ── ⏱ session-block timeline ──────────────────────────────────────────────
+let tlOn=false, tlData=null;
+async function loadTimeline(){
+  try{ tlData=await fetch('/blocks/timeline',{headers:H}).then(r=>r.json()); }
+  catch(e){ tlData={nodes:[],links:[]}; }
+  paintTimeline();
+}
+function paintTimeline(){
+  const d=tlData||{nodes:[],links:[]};
+  const n=d.nodes||[], lk=d.links||[];
+  if(!n.length){
+    $('#tl-body').innerHTML='<div class="tl-empty">ยังไม่มีความจำที่ปิดงานแล้ว — ปิดงานด้วย <code>POST /session-end</code> หรือ <code>pool.py session-end &lt;app&gt;</code></div>';
+    $('#tl-count').textContent='0 ชิ้น';return;
+  }
+  // build similarity lookup: slug → [{to, sim, via}]
+  const simMap={};
+  lk.forEach(l=>{
+    if(!simMap[l.from])simMap[l.from]=[];
+    if(!simMap[l.to])simMap[l.to]=[];
+    simMap[l.from].push({slug:l.to,sim:l.sim,via:l.via});
+    simMap[l.to].push({slug:l.from,sim:l.sim,via:l.via});
+  });
+  const hiSlugs=new Set(lk.map(l=>l.from).concat(lk.map(l=>l.to)));
+  // render as vertical timeline (oldest first)
+  const rows=n.slice().reverse().map((b,i)=>{
+    const isLast=i===n.length-1;
+    const isHi=hiSlugs.has(b.slug);
+    const links=(simMap[b.slug]||[]).map(l=>
+      '<span class="tl-link" data-goto="'+esc(l.slug)+'" title="คล้ายกัน '+l.sim+' ('+l.via+')">↗ '+esc(l.slug)+' <span class="sim">('+Math.round(l.sim*100)+'%)</span></span>'
+    ).join(' ');
+    return '<div class="tl-row"><div class="tl-rail">'
+      +'<div class="tl-dot'+(isHi?' dup':'')+'"></div>'
+      +(isLast?'':'<div class="tl-line"></div>')
+      +'</div><div class="tl-card'+(isHi?' hi':'')+'">'
+      +'<div class="tl-h"><span class="app">'+esc(b.app)+'</span>'
+      +'<span class="ts">'+esc(b.ts)+'</span>'
+      +'<span class="rev">rev '+b.rev+'</span>'
+      +(b.status!=='closed'?'<span class="st">'+esc(b.status)+'</span>':'')
+      +'</div>'
+      +'<div class="tl-title">'+esc(b.title||'(no title)')+'</div>'
+      +(b.evidence?'<div class="tl-ev">'+esc(b.evidence)+'</div>':'')
+      +(links?'<div>'+links+'</div>':'')
+      +'</div></div>';
+  }).join('');
+  $('#tl-body').innerHTML=rows;
+  $('#tl-count').textContent=n.length+' blocks · '+lk.length+' dedup links';
+}
+$('#tl-body').onclick=ev=>{
+  const lnk=ev.target.closest('[data-goto]');
+  if(lnk){
+    const slug=lnk.dataset.goto;
+    blocksOn=true;$('#blocks').hidden=false;blkOpen.add(slug);
+    loadBlocks().then(()=>$('#blk-list').querySelector('.blk[data-slug="'+slug+'"]')?.scrollIntoView({block:'nearest'}));
+  }
+};
+$('#btn-tl').onclick=()=>{tlOn=!tlOn;$('#tl-panel').hidden=!tlOn;if(tlOn)loadTimeline()};
+$('#tl-close').onclick=()=>{tlOn=false;$('#tl-panel').hidden=true};
+setInterval(()=>{if(tlOn&&!document.hidden)loadTimeline()},30000);
+
 </script>
 </body>
 </html>"""
+
+
+class PoolServer(ThreadingHTTPServer):
+    """Threaded server whose error path understands that a closed client is
+    normal traffic.
+
+    SSE keeps a socket open per dashboard tab: shutting the tab, reloading,
+    or the preview webview detaching aborts the socket mid-write and Windows
+    reports it as ConnectionAbortedError (WinError 10053) on the *server*
+    side. That is not a crash — the reply is already going nowhere — but
+    socketserver's default handle_error() prints a full traceback per
+    occurrence, which buried the terminal under phantom failures. Count them
+    and print one line; anything that is not a socket error keeps the
+    traceback (that one is a real bug).
+    """
+
+    daemon_threads = True
+    dropped = 0
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, OSError):
+            PoolServer.dropped += 1
+            print(f"  · client {client_address[0]} went away ({exc.__class__.__name__}"
+                  f", {PoolServer.dropped} total) — reply dropped")
+            return
+        super().handle_error(request, client_address)
 
 
 class PoolHandler(BaseHTTPRequestHandler):
@@ -1094,6 +3174,52 @@ class PoolHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json(self):
+        """Request body -> dict, or None when it is absent, malformed, or not
+        an object. Every POST branch reads its body through this.
+
+        Written because `json.loads(self.rfile.read(length))` was unguarded in
+        all four write endpoints, so a bad or empty body raised straight out of
+        do_POST and the connection closed with NO response at all (curl reports
+        http=000; fetch rejects). The caller could not tell a refused write from
+        a dead server, and on the input path that is the difference between
+        "retry" and "give up". A write path may refuse loudly; it must not fail
+        silently."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if length <= 0:
+            return None
+        try:
+            obj = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _int_param(self, qs, name, default, cap=None, error=None):
+        """An integer query parameter, or a 400 answer. `_REFUSED` when it
+        refused — the answer is already written, the caller only has to stop.
+
+        Written because `int(qs.get("n")[0])` sat unguarded in /tail, /view,
+        /stream and /curator (twice more for the curator thresholds), so a typo
+        in ?n=abc raised straight out of do_GET: the client got NO response at
+        all (curl reports http=000, fetch rejects) and stderr got a traceback.
+        Measured: 6 of 39 malformed requests answered nothing — the same
+        failure §12 fixed for POST bodies, still standing on every GET that
+        reads a number. A request that fails silently and a server that is gone
+        look identical from the outside, which is the one thing an error path
+        must never be."""
+        raw = qs.get(name, [""])[0]
+        if raw == "":
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            self._json(400, {"error": error or ("?%s=<int> required" % name)})
+            return _REFUSED
+        return min(value, cap) if cap is not None else value
+
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
@@ -1115,7 +3241,7 @@ class PoolHandler(BaseHTTPRequestHandler):
                 body = body.replace(
                     b"</body>",
                     ("<div id='qrpanel' style='display:none;margin:12px 18px;padding:12px;border:1px solid var(--warn);border-radius:10px'>"
-                     + "<div style='font:12px var(--mono);color:var(--warn);margin-bottom:6px'>⚠ token ไม่ถูกต้อง — สแกน QR นี้จากมือถือ (token ฝังใน QR)</div>"
+                     + "<div style='font:12px var(--mono);color:var(--warn);margin-bottom:6px'>⚠ ยังไม่ได้เข้าสู่ระบบ — สแกน QR นี้ด้วยมือถือ (รหัสเข้าใช้อยู่ในตัว QR)</div>"
                      + _qr_panel() + "</div></body>").encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1146,11 +3272,45 @@ class PoolHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "lines": lines, "log": pool.LOG})
 
         elif parsed.path == "/tail":
-            n = min(int(qs.get("n", ["10"])[0]), 500)
+            n = self._int_param(qs, "n", 10, cap=500)
+            if n is _REFUSED:
+                return
             as_app = qs.get("as", [None])[0]
+            clean = qs.get("clean", ["0"])[0] in ("1", "true")
             with _lock:
-                msgs = pool.tail(n, as_app=as_app)
+                # each line rides out with its tick (`seq`): the feed groups
+                # lines into fixed-width chunks by seq // CHUNK, so a chunk keeps
+                # its number as the log grows. Decoration on the wire only —
+                # nothing new is stored and the hash never covered this field.
+                msgs = pool.stamp_cur(pool.stamp_seq(pool.tail(n, as_app=as_app)))
+            if clean:
+                # opt-in, and opt-in only: a reader that asked for a window and
+                # got fewer lines without asking would be the same silent
+                # truncation tail(None) exists to prevent
+                msgs = [m for m in msgs if not m["cur"]["h"]]
             self._json(200, msgs)
+
+        elif parsed.path == "/curator":
+            # what the feed would HIDE, and what the plane PRUNES, and why —
+            # the report a human runs before trusting either. Same rules, two
+            # consequences: a hidden line still happened, a pruned one stopped
+            # occupying an address. ?prune=1 adds the plane's view (it reads the
+            # whole log, so it is opt-in), ?at=<n> moves either threshold.
+            n = self._int_param(qs, "n", 200, cap=5000)
+            hide = self._int_param(qs, "hide", None, error=_THRESHOLD_ERR)
+            at = self._int_param(qs, "at", None, error=_THRESHOLD_ERR)
+            if n is _REFUSED or hide is _REFUSED or at is _REFUSED:
+                return
+            want_prune = qs.get("prune", [""])[0] not in ("", "0", "false")
+            with _lock:
+                rep = pool.curator_report(n=n, hide_at=hide)
+                # the plane's numbers ride along for free: they are read from
+                # the derived() cache the map is already drawn from
+                rep["plane"] = pool.plane_prune_stats()
+                if want_prune:
+                    # this one walks the WHOLE log, so it is opt-in
+                    rep["prune"] = pool.curator_prune_report(prune_at=at)
+                self._json(200, rep)
 
         elif parsed.path == "/apps":
             reg = pool.list_apps()
@@ -1158,6 +3318,33 @@ class PoolHandler(BaseHTTPRequestHandler):
                 ({"app": name, **info} for name, info in reg.items()),
                 key=lambda a: -a.get("last_seen", 0))
             self._json(200, apps)
+
+        elif parsed.path == "/blocks":
+            # the story/method layer. One canonical view for every platform —
+            # this is the endpoint that makes "ใช้ร่วมกัน + เข้าใจตรงกัน"
+            # checkable instead of aspirational. ?slug= also returns the chain
+            # check (verify) and, with &revs=1, the whole revision history.
+            slug = qs.get("slug", [None])[0]
+            with _lock:
+                if slug:
+                    row = pool.block_get(slug)
+                    if row is None:
+                        self._json(404, {"error": f"no such block: {slug}"})
+                        return
+                    row["verify"] = pool.verify_block(row)
+                    if qs.get("revs", ["0"])[0] in ("1", "true"):
+                        row["history"] = pool.block_revs(slug)
+                    self._json(200, row)
+                else:
+                    self._json(200, pool.blocks(
+                        status=qs.get("status", [None])[0],
+                        query=qs.get("q", [None])[0]))
+
+        elif parsed.path == "/blocks/timeline":
+            # session-block timeline: which platform closed when, with
+            # similarity links between deduped blocks. Read-only, derived.
+            with _lock:
+                self._json(200, pool.block_timeline())
 
         elif parsed.path == "/inbox":
             app = qs.get("app", [""])[0]
@@ -1191,12 +3378,29 @@ class PoolHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "?path=<int>[,<int>...] — the sub-cell chosen at each depth"})
                 return
+            # &raw=1 shows the map BEFORE the curator pruned it: the honest
+            # escape hatch for judging the threshold instead of trusting it.
+            # L0 content is never pruned — an explicit read is already the
+            # reader asking for those exact lines.
+            rawp = qs.get("raw", [""])[0] not in ("", "0", "false")
+            # &record=1 declares the read as data (a sighting). A read that a
+            # person deliberately made IS the thing a sighting describes, and
+            # nothing else in the system can produce one — which is why the
+            # plane had zero until this existed. sighting_once() makes it
+            # idempotent, so a view that re-reads on render does not write a
+            # line per render.
+            rec = qs.get("record", [""])[0] not in ("", "0", "false")
             with _lock:
                 # one pointer, one level, one read: L0 content · L1 12x12
                 # block map · L2 whole-plane map. Over-budget cells come
                 # back already split (stacked), never as a wall of lines,
                 # and &path=1,42 walks one sub-cell down at a time.
-                vis = pool.open_pointer(rk, level=int(lv), path=path, as_app=as_app)
+                vis = pool.open_pointer(rk, level=int(lv), path=path,
+                                        as_app=as_app, raw=rawp)
+                if rec:
+                    wrote = pool.sighting_once(rk, level=int(lv),
+                                               app=as_app or "dashboard")
+                    vis["sighting_written"] = wrote is not None
             self._json(200, vis)
 
         elif parsed.path == "/pointers":
@@ -1210,8 +3414,11 @@ class PoolHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "?rkey=<int>&level=<int> are optional"})
                 return
+            # &raw=1 keeps sightings whose address was emptied by prune,
+            # each marked `dangling`, instead of dropping them
+            rawp = qs.get("raw", [""])[0] not in ("", "0", "false")
             with _lock:
-                seen = pool.pointers_at(rk, lv)
+                seen = pool.pointers_at(rk, lv, raw=rawp)
             self._json(200, {"point": rk, "level": lv, "pointers": seen})
 
         elif parsed.path == "/bonds":
@@ -1220,12 +3427,68 @@ class PoolHandler(BaseHTTPRequestHandler):
             # (that is what lets the plane draw the whole graph in one read).
             as_app = qs.get("as", [None])[0]
             h = qs.get("hash", [""])[0].strip().lower()
+            # &raw=1 also returns edges whose far end was pruned (each marked
+            # `dangling`) — the same escape hatch the map has
+            rawp = qs.get("raw", [""])[0] not in ("", "0", "false")
+            # &fields=plane drops the two 64-hex hashes. The plane addresses
+            # edges by the CELLS their ends sit in (src_rkey/dst_rkey) and
+            # carries src8/dst8 for the panel, so it never reads src/dst — and
+            # at 10k edges those two fields are 38% of a 4 MB payload that a
+            # phone re-fetches every time the plane opens.
+            lean = qs.get("fields", [""])[0] == "plane"
             with _lock:
                 if h:
-                    self._json(200, {"hash": h, "edges": pool.bonds_for(h, as_app=as_app)})
+                    edges = pool.bonds_for(h, as_app=as_app, raw=rawp)
+                    self._json(200, {"hash": h, "edges": edges})
                     return
-                edges = pool.all_bonds(as_app=as_app)
+                edges = pool.all_bonds(as_app=as_app, raw=rawp)
+            if lean:
+                edges = [{k: v for k, v in e.items() if k not in ("src", "dst")}
+                         for e in edges]
             self._json(200, {"hash": None, "count": len(edges), "edges": edges})
+
+        elif parsed.path == "/explore":
+            # The plane answers "what is where". This answers "what IS this in
+            # relation to the rest" — what came out of it and what points back.
+            # ?hash= walks one LINE (a panel click); ?rkey= walks one ADDRESS
+            # (a plane click), because those are two different questions and
+            # pooling them would make a cell read as if its lines were one line.
+            h = qs.get("hash", [""])[0].strip().lower()
+            try:
+                rk = int(qs.get("rkey", [""])[0])
+            except ValueError:
+                rk = None
+            try:
+                hops = max(1, min(4, int(qs.get("hops", ["2"])[0] or 2)))
+                cap = max(1, min(60, int(qs.get("cap", [""])[0] or pool.REACH_CAP)))
+            except ValueError:
+                self._json(400, {"error": "?hops=<1-4>&cap=<1-60>"})
+                return
+            if not h and rk is None:
+                self._json(400, {"error": "?hash=<64hex> or ?rkey=<int>"})
+                return
+            with _lock:
+                out = (pool.reach(h, hops=hops, cap=cap) if h
+                       else pool.explore_cell(rk, hops=hops, cap=cap))
+            self._json(200, out)
+
+        elif parsed.path == "/patterns":
+            # the whole plane's link shape: islands vs springs vs wells, and
+            # which few lines everything hangs off. One read, because none of
+            # it is visible from any single cell.
+            with _lock:
+                self._json(200, pool.pattern_census())
+
+        elif parsed.path == "/plane/meta":
+            # the plane's second map (who wrote each cell last, at which tick).
+            # Its own endpoint because it is a layer: a reader that only wants
+            # addresses and counts should not pay for a picture it will not draw
+            # &raw=1 follows the same escape hatch as /neighbors: the who/when
+            # layer of the UNPRUNED plane.
+            as_app = qs.get("as", [None])[0]
+            rawp = qs.get("raw", [""])[0] not in ("", "0", "false")
+            with _lock:
+                self._json(200, pool.plane_meta(raw=rawp))
 
         elif parsed.path == "/plane/timeline":
             # the plane's own tick: append-order ordinals, not wall clock,
@@ -1248,9 +3511,18 @@ class PoolHandler(BaseHTTPRequestHandler):
                     return
                 if parsed.path == "/ctx/links":
                     # cross-system edges, derived from what the bridge already
-                    # wrote — both ends sit in the same 144x144 plane
+                    # wrote — both ends sit in the same 144x144 plane.
+                    # &raw=1 also returns edges whose LOG end was pruned.
+                    rawp = qs.get("raw", [""])[0] not in ("", "0", "false")
                     with _lock:
-                        self._json(200, {"links": ctx_plane.links(),
+                        # read once with the mark, then choose: the count of
+                        # what was held back is part of the answer, not
+                        # something the client has to infer from two requests
+                        every = ctx_plane.links(raw=True)
+                        live = [l for l in every if not l["dangling"]]
+                        self._json(200, {"links": every if rawp else live,
+                                         "total": len(every),
+                                         "dangling": len(every) - len(live),
                                          "cross": ctx_plane.cross_stats()})
                     return
                 rk = int(qs.get("rkey", [""])[0])
@@ -1272,13 +3544,16 @@ class PoolHandler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
 
         elif parsed.path == "/view":
-            n = min(int(qs.get("n", ["20"])[0]), 1000)
+            n = self._int_param(qs, "n", 20, cap=1000)
+            if n is _REFUSED:
+                return
             cloud = qs.get("cloud", ["0"])[0] == "1"
             as_app = qs.get("as", [None])[0]
             if as_app == "admin":
                 as_app = None
             try:
-                lines = pool.view(n, cloud=cloud, as_app=as_app)
+                lines = pool.view(n, cloud=cloud, as_app=as_app,
+                                  clean=qs.get("clean", ["0"])[0] in ("1", "true"))
                 # chain audit for the dashboard header
                 ok, hashes = _chain_audit()
                 self._json(200, {"lines": lines, "chain_ok": ok, "hashes": hashes})
@@ -1286,25 +3561,53 @@ class PoolHandler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
 
         elif parsed.path == "/stream":
-            n = min(int(qs.get("n", ["5"])[0]), 500)
+            n = self._int_param(qs, "n", 5, cap=500)
+            if n is _REFUSED:
+                return
             as_app = qs.get("as", [None])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            seen = 0
+            # No backfill: the client just loaded this window from /tail, and
+            # re-sending 200 lines on every (re)connect is how one session's
+            # read turned into the whole chat arriving at every card again.
+            # The cursor is therefore the HASH of the newest line at connect
+            # time, not a count: the window is capped at n, so past n lines the
+            # length stops changing and a count-based cursor goes permanently
+            # silent. A gap left by a reconnect is closed by the client's own
+            # refresh on open, which is exact instead of a guess at a window.
+            def _cursor(rows):
+                return rows[-1].get("hash") if rows else None
+
+            with _lock:
+                last = _cursor(pool.tail(n, as_app=as_app))
             try:
                 while True:
                     with _lock:
-                        msgs = pool.tail(n, as_app=as_app)
-                    if len(msgs) > seen:
-                        for m in msgs[seen:]:
-                            self.wfile.write(f"data: {json.dumps(m, ensure_ascii=False)}\n\n".encode())
+                        # same verdict the feed uses, so a line that arrives live
+                        # is judged the moment it lands (no flash of noise that
+                        # disappears one refresh later)
+                        msgs = pool.stamp_cur(pool.stamp_seq(pool.tail(n, as_app=as_app)))
+                    idx = next((i for i, m in enumerate(msgs)
+                                if m.get("hash") == last), None)
+                    # cursor not in the window (it fell off the end, or there
+                    # was no line at all at connect time): send what we see and
+                    # let the client de-dupe by hash
+                    fresh = msgs[idx + 1:] if idx is not None else msgs
+                    for m in fresh:
+                        self.wfile.write(f"data: {json.dumps(m, ensure_ascii=False)}\n\n".encode())
+                    if fresh:
                         self.wfile.flush()
-                        seen = len(msgs)
+                    last = _cursor(msgs) or last
                     time.sleep(1)
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
+                # OSError is the umbrella for every "peer left" shape:
+                # BrokenPipeError / ConnectionResetError /
+                # ConnectionAbortedError (WinError 10053 on Windows). The
+                # dashboard reconnects on its own, so just drop this stream
+                # and let the thread end.
                 pass
 
         else:
@@ -1316,8 +3619,16 @@ class PoolHandler(BaseHTTPRequestHandler):
             self._json(401, {"error": "token required — see .pool_token on the server"})
             return
         if parsed.path == "/register":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json()
+            if body is None:
+                # say what is actually wrong: the body, not the registry.
+                # Falling through to the app checks turned a malformed body
+                # into "? not registered", which sends the caller to fix the
+                # wrong thing — and now that the client SHOWS this error, a
+                # label that lies costs a real debugging cycle.
+                self._json(400, {"error": "body must be a JSON object",
+                                 "howto": {"header": "Content-Type: application/json"}})
+                return
             name = body.get("app", "")
             try:
                 ok, created = pool.register_app(name)
@@ -1326,8 +3637,16 @@ class PoolHandler(BaseHTTPRequestHandler):
             except ValueError as e:
                 self._json(400, {"error": str(e)})
         elif parsed.path == "/append":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json()
+            if body is None:
+                # say what is actually wrong: the body, not the registry.
+                # Falling through to the app checks turned a malformed body
+                # into "? not registered", which sends the caller to fix the
+                # wrong thing — and now that the client SHOWS this error, a
+                # label that lies costs a real debugging cycle.
+                self._json(400, {"error": "body must be a JSON object",
+                                 "howto": {"header": "Content-Type: application/json"}})
+                return
             app = body.get("app", "?")
             if not pool.is_registered(app):
                 self._json(403, {"error": f"{app} not registered — POST /register first",
@@ -1343,6 +3662,72 @@ class PoolHandler(BaseHTTPRequestHandler):
                 result = pool.append(app, kind, text, to=to)
             self._json(200, {"ok": True, "hash": result["hash"],
                              "tags": result.get("tags", [])})
+        elif parsed.path == "/block":
+            # a block is a write like any other: same chain, same registry gate, and
+            # a revision is a NEW line (nothing is edited, so the hash keeps meaning
+            # what it means everywhere else in this log).
+            body = self._read_json()
+            if body is None:
+                # say what is actually wrong: the body, not the registry.
+                # Falling through to the app checks turned a malformed body
+                # into "? not registered", which sends the caller to fix the
+                # wrong thing — and now that the client SHOWS this error, a
+                # label that lies costs a real debugging cycle.
+                self._json(400, {"error": "body must be a JSON object",
+                                 "howto": {"header": "Content-Type: application/json"}})
+                return
+            app = body.get("app", "?")
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first",
+                                 "howto": {"method": "POST", "url": "/register", "body": {"app": app}}})
+                return
+            try:
+                with _lock:
+                    row = pool.block(app, body.get("slug", ""), body.get("title", ""),
+                                     story=body.get("story", ""),
+                                     method=body.get("method", ""),
+                                     evidence=body.get("evidence", ""),
+                                     refs=body.get("refs", ""),
+                                     status=body.get("status", "open"))
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._json(200, {"ok": True, "slug": row["slug"], "rev": row["rev"],
+                             "hash": row["hash"], "t": row["t"],
+                             "howto": {"read": f"GET /blocks?slug={row['slug']}&revs=1"}})
+        elif parsed.path == "/session-end":
+            body = self._read_json()
+            if body is None:
+                # say what is actually wrong: the body, not the registry.
+                # Falling through to the app checks turned a malformed body
+                # into "? not registered", which sends the caller to fix the
+                # wrong thing — and now that the client SHOWS this error, a
+                # label that lies costs a real debugging cycle.
+                self._json(400, {"error": "body must be a JSON object",
+                                 "howto": {"header": "Content-Type: application/json"}})
+                return
+            app = body.get("app", "")
+            if not app:
+                self._json(400, {"error": "app required"})
+                return
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first",
+                                 "howto": {"method": "POST", "url": "/register", "body": {"app": app}}})
+                return
+            force = body.get("force", False)
+            try:
+                with _lock:
+                    b = pool.session_end(app, force=force)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            if b is None:
+                self._json(200, {"ok": False, "reason": "session too short or no substantive work"})
+            else:
+                self._json(200, {"ok": True, "slug": b["slug"], "rev": b["rev"],
+                                 "hash": b["hash"], "title": b["title"],
+                                 "t": b["t"],
+                                 "howto": {"read": f"GET /blocks?slug={b['slug']}&revs=1"}})
         elif parsed.path == "/flush":
             path = pool.flush_emit()
             pushed, failed = pool.push_outbox()
@@ -1380,8 +3765,15 @@ def main():
     # Threaded: SSE streams hold a connection each; the dashboard also
     # fires /tail+/view+/stream in parallel on load — a single-threaded
     # server deadlocks on the second request.
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), PoolHandler)
-    server.daemon_threads = True
+    #
+    # Guard: the server itself is a writer (flush emit, curator, etc.),
+    # so register + guard it — when the server stops, session_end fires.
+    try:
+        pool.register_app("pool-server")
+        pool.pool_session_guard("pool-server")
+    except Exception:
+        pass
+    server = PoolServer(("0.0.0.0", PORT), PoolHandler)
     tok = _get_token()
     import socket
     try:
@@ -1399,8 +3791,20 @@ def main():
     print(f"  UI : http://localhost:{PORT}/   (dashboard)")
     print(f"  POST /register  {{app}}            (first-time identity)")
     print(f"  POST /append    {{app, kind, text, to?, }}  @name in text = tag")
+    print(f"  GET  /blocks?q=&status=   (ก้อนเรื่องราว/วิธีการ — shared memory, every platform)")
+    print(f"  GET  /blocks?slug=X&revs=1 (one block + ref check + history)")
+    print(f"  GET  /blocks/timeline      (session-block timeline + dedup links)")
+    print(f"  POST /block     {{app, slug, title, story?, method?, evidence?, refs?, status?}}")
     print(f"  GET  /inbox?app=X        (unread mentions+DMs, marks read; mark=0 peek)")
+    print(f"  GET  /neighbors?rkey=0&level=2&raw=1  (plane map; raw=1 = before prune)")
+    print(f"  GET  /neighbors?rkey=X&level=0&record=1 (read + declare it as a sighting)")
+    print(f"  GET  /bonds?fields=plane  (every edge, without the two 64-hex ends)")
+    print(f"  GET  /explore?hash=X&hops=2 (walk one line: backlinks + forward + its shape)")
+    print(f"  GET  /explore?rkey=N&hops=2 (walk one address: shapes inside + edges leaving)")
+    print(f"  GET  /patterns           (whole plane's link shape: islands/springs/wells + hubs)")
+    print(f"  GET  /curator?prune=1    (what the feed hides AND what the plane prunes)")
     print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
+    print(f"  POST /session-end  {{app, force?}}   (auto-write a block on session close)")
     print(f"  POST /flush   (emit + push now)")
     try:
         server.serve_forever()
