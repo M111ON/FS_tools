@@ -472,6 +472,25 @@ INVARIANTS = [
      "every click, so the acts the tour waits for were unreachable and the "
      "whole page felt dead — กดอะไรไม่ได้. pointer-events:none on the shell, "
      "auto only on the card; #tour[hidden] must beat display:flex"),
+    ("a held glass never moves the frame mid-drag",
+     lambda js, html: ("pvLensFollow()" not in block(js, "pcv.onpointermove=ev=>{",
+                                                      "if(!PV.panDrag)return;")
+                       and re.search(r"if\s*\(\s*PV\.lens\.drag\s*\)\s*return", js)
+                       and "pvLensReclaim" in block(js, "pcv.onpointerup=ev=>{",
+                                                    "if(!PV.panDrag)return;")),
+     "the follow used to run on every pointermove of a glass drag: the hand "
+     "moved the glass one way, the edge band moved the frame the other, and the "
+     "paint between them flickered and snapped the view back — ใช้แว่นแล้วเด้งกลับจุดเดิม. "
+     "A held glass must move alone (guarded by the early return at the top of "
+     "pvLensFollow) and the frame catches up once, on pointerup, via pvLensReclaim"),
+    ("the zoom dial is a small vertical column",
+     lambda js, html: re.search(r"#pv-zoom\{[^}]*flex-direction:column", html)
+                      and re.search(r"#pv-zoom button\{width:30px", html)
+                      and not re.search(r"#pv-zoom\{flex-direction:row", html),
+     "the dial used to grow to 46px buttons and, on a phone, lie down into a "
+     "row beside the very canvas it zoomed — chrome crowding the thing it "
+     "controls. A compact always-vertical column reads as the up/down ladder "
+     "it is, and stays clear of the map"),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),

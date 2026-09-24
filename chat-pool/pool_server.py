@@ -303,23 +303,21 @@ button.send:disabled{opacity:.55;cursor:progress}
 #pv-lensinfo{display:none;color:var(--warn);font:10px var(--mono);white-space:nowrap}
 #pv-lensinfo.on{display:inline}
 /* ── 🔍 the zoom cluster ───────────────────────────────────────────────────
-   Big enough to hit with a thumb, and always in the SAME place: over the thing
-   it zooms. The two zoom buttons used to be 10px text in the header row — which
-   is where "ซูมเข้าออกมัน struggle" starts on the UI side even once the frame
-   cost is zero. Three buttons and a level readout, in that order, because the
-   level is the feedback for the two buttons above it. */
+   Small and ALWAYS VERTICAL: the zoom dial is an up/down ladder (level climbs
+   with +), so the column reads the same as the ladder. A compact 30px row of
+   buttons — the buttons never move, so thumb accuracy comes from the fixed
+   spot, not from the size — and it stays out of the canvas it magnifies. */
 #pv-zoom{position:absolute;right:10px;bottom:10px;z-index:3;display:flex;
-  flex-direction:column;gap:5px;align-items:center;
-  background:rgba(13,17,23,.88);border:1px solid var(--line);border-radius:13px;
-  padding:6px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
-#pv-zoom button{width:46px;height:46px;border-radius:10px;border:1px solid var(--line);
-  background:var(--panel2);color:var(--fg);font:22px/1 var(--mono);cursor:pointer;
+  flex-direction:column;gap:4px;align-items:center;
+  background:rgba(13,17,23,.88);border:1px solid var(--line);border-radius:10px;
+  padding:5px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+#pv-zoom button{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--fg);font:16px/1 var(--mono);cursor:pointer;
   display:flex;align-items:center;justify-content:center;padding:0;flex:0 0 auto}
 #pv-zoom button:hover{border-color:var(--acc);color:var(--acc)}
 #pv-zoom button:disabled{opacity:.35;cursor:default}
 #pv-zoom button:disabled:hover{border-color:var(--line);color:var(--fg)}
-#pv-zoom #pv-zreset{font-size:17px;height:38px}
-#pv-zoom .zlvl{font:10px var(--mono);color:var(--acc);text-align:center;white-space:nowrap;min-width:46px}
+#pv-zoom #pv-zreset{font-size:13px;height:26px}
 /* The drawing options are worth having and not worth SHOWING: 14 controls in a
    wrapping row measured 115px, above a canvas that then had 175px left — and
    the row held the scrubber too, which belonged with the strip. One button
@@ -387,11 +385,6 @@ button.send:disabled{opacity:.55;cursor:progress}
   #plane-side{width:100%;flex:1 1 60%;min-height:0;border-left:none;
     border-top:1px solid var(--line)}
   #plane-head,#plane-bar{gap:5px;padding:6px 9px}
-  /* a 170px-tall column beside a 235px canvas is a control that takes over the
-     thing it controls. On a phone the cluster lies down instead: 58px tall,
-     still thumb-sized, still out of the way. */
-  #pv-zoom{flex-direction:row;align-items:center}
-  #pv-zoom .zlvl{min-width:34px}
   #plane-head .pbtn,#plane-bar .pbtn{font-size:10px;padding:3px 7px}
 }
 /* ▣ ก้อนเรื่องราว — the story/method layer. Cards, not a table, for the same
@@ -630,7 +623,6 @@ button.send:disabled{opacity:.55;cursor:progress}
              their state from the moment it runs. -->
         <div id="pv-zoom">
           <button id="pv-lens-zin" disabled title="ซูมเข้า — เห็นช่องเล็กลง (หยุดที่ความละเอียดจริง)">+</button>
-          <span class="zlvl" id="pv-zlvl">×1</span>
           <button id="pv-lens-zout" disabled title="ซูมออก — เห็นช่องใหญ่ขึ้น">−</button>
           <button id="pv-zreset" title="รีเซ็ตมุมมอง — กลับไปทั้งแผนที่และความละเอียด ×1 พร้อมวางแว่นที่จุดที่เลือก">⟲</button>
         </div>
@@ -1994,11 +1986,17 @@ function pvLensNudge(dw,dr){
   pvLensFollow();
   pvDraw();pvLensInfo();
 }
-// Keep the glass ON SCREEN. The glass has a radius, so a window of N cells can
-// only hold it centred within N-2m of them; past that band the FRAME slides
-// instead. Without this the glass would simply vanish when dragged past the
-// window edge, and a magnifier you can lose is not a viewport.
+/* Keep the glass ON SCREEN — only when the reader is NOT holding it.
+
+   The follow used to run on every pointermove of a glass drag too, and that
+   was the flicker: the hand moved the glass one way, the band moved the frame
+   the other, and pvDraw between them painted a frame that jumped against the
+   hand — "flicker, and it snaps back where it was". A reader holding the
+   glass wants the patch they are inspecting; a nudge or a zoom may reveal a
+   glass that was left at an edge, and then following is the courtesy that
+   keeps it visible. */
 function pvLensFollow(){
+  if(PV.lens.drag)return;
   if(PV.mode!=='window'||!PV.origin)return;
   const m=Math.ceil(pvLensR()/pvLensPxPerCell())+1,win=PV.win;
   if(win<=2*m)return;                        // no band to keep it in
@@ -2009,6 +2007,15 @@ function pvLensFollow(){
   off=pvWrap(L.ring-o.ring);adj=0;
   if(off<m)adj=off-m;else if(off>win-m)adj=off-(win-m);
   if(adj)o.ring=pvWrap(o.ring+adj);
+}
+/* A drag that ended at the edge leaves the glass half-visible. One repaint
+   AFTER the hand is off it — never during — slides the frame just enough
+   (the same band move, with none of the fight) */
+function pvLensReclaim(){
+  const o=PV.origin;if(!o)return;
+  const before=o.wedge+','+o.ring;
+  pvLensFollow();
+  if(o.wedge+','+o.ring!==before){pvDraw();pvLensInfo()}
 }
 // Name the RESOLUTION, not the zoom factor: ×4 is "cells" on a laptop and
 // "blocks" on a phone, so a label in multiples would mean different things
@@ -2043,7 +2050,7 @@ function pvLensPaint(){
 // the kind of cost §14 was about.
 let _zEls=null;
 function pvZoomEls(){
-  if(!_zEls)_zEls={lvl:$('#pv-zlvl'),zin:$('#pv-lens-zin'),zout:$('#pv-lens-zout')};
+  if(!_zEls)_zEls={zin:$('#pv-lens-zin'),zout:$('#pv-lens-zout')};
   return _zEls;
 }
 function pvLensInfo(){
@@ -2054,7 +2061,6 @@ function pvLensInfo(){
   // the one place a control should stop — a + that keeps working at the real
   // scale would be the UI contradicting the model.
   const zi=pvZoomEls();
-  if(zi.lvl)zi.lvl.textContent=PV.lens.on?('×'+z+(z>=m?' ⛔':'')):'×1';
   if(zi.zin)zi.zin.disabled=!PV.lens.on||z>=m;
   if(zi.zout)zi.zout.disabled=!PV.lens.on||z<=1;
   if(!el)return;
@@ -3147,7 +3153,10 @@ pcv.onpointerdown=ev=>{
   // the pointer is on — and the second is what makes every address reachable
   // once the glass has a fixed radius it cannot get closer than.
   if(pvLensHit(ev.clientX-rect.left,ev.clientY-rect.top)){
-    PV.lens.drag={x:ev.clientX,y:ev.clientY,w:PV.lens.wedge,r:PV.lens.ring};
+    // x0/y0 remember where the glass sat when the hand took it, so the drag is
+    // 1:1 with the pointer even after the drag clamps near the rim
+    PV.lens.drag={x:ev.clientX,y:ev.clientY,x0:pvLensPos()[0],y0:pvLensPos()[1],
+      w:PV.lens.wedge,r:PV.lens.ring};
     PV.lens.moved=false;
     pcv.setPointerCapture(ev.pointerId);
     return;
@@ -3189,9 +3198,14 @@ pcv.onpointermove=ev=>{
     // magnified scale: you slide the glass across the page, the page does not
     // scroll under it — and this is what keeps high zoom from being twitchy
     if(Math.abs(ev.clientX-d.x)>2||Math.abs(ev.clientY-d.y)>2)PV.lens.moved=true;
-    PV.lens.wedge=pvWrap(d.w+(ev.clientX-d.x)/step);
-    PV.lens.ring=pvWrap(d.r+(ev.clientY-d.y)/step);
-    pvLensFollow();
+    // the hand is holding the glass, so ONLY the glass moves: the frame must
+    // not shift mid-drag, or the picture fights the hand (the measured flicker).
+    // A glass centred near the rim would be clipped, so it stops 2px short of
+    // the edge instead — still the reader's position, never pushed back.
+    const px=PV.n*pstep(),R=pvLensR(),lo=R+2,hi=px-R-2;
+    const rawX=d.x0+(ev.clientX-d.x), rawY=d.y0+(ev.clientY-d.y);
+    PV.lens.wedge=pvWrap(d.w+(Math.max(lo,Math.min(hi,rawX))-d.x0)/step);
+    PV.lens.ring=pvWrap(d.r+(Math.max(lo,Math.min(hi,rawY))-d.y0)/step);
     pvLensPaint();
     return;
   }
@@ -3219,7 +3233,7 @@ pcv.onpointerup=ev=>{
     const moved=PV.lens.moved;PV.lens.drag=null;
     try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
     // moving the glass is not a read, for the same reason a pan is not
-    if(moved){PV.panSwallow=Date.now();pvLensInfo();return}
+    if(moved){PV.panSwallow=Date.now();pvLensReclaim();pvLensInfo();return}
     pvLensRead();
     return;
   }
