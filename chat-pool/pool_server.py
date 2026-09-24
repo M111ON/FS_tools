@@ -204,7 +204,8 @@ aside h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--
 #flushtip{margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;text-align:right}
 #to-sel{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:3px 6px;max-width:130px;flex:0 0 auto}
 #sysline{flex:0 0 auto;padding:5px 14px;font:11px var(--mono);color:var(--fg);background:var(--panel);border-bottom:1px solid var(--line)}
-#sysline a{color:var(--acc)}
+#sysline a{color:var(--acc);margin:0 2px}
+#sysline a.on{color:var(--bg);background:var(--acc);border-radius:6px;padding:0 5px}
 #composer{display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px));background:var(--panel);flex:0 0 auto}
 #msg-in{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:12px;padding:11px 13px;font:15px/1.45 var(--mono);outline:none;resize:none;height:46px;max-height:32dvh;overflow-y:hidden}
 #msg-in:focus{border-color:var(--acc)}
@@ -452,7 +453,7 @@ button.send:disabled{opacity:.55;cursor:progress}
   <div id="tl-body">…</div>
 </div>
 <main>
-  <div id="sysline" hidden>ซ่อนบันทึกของระบบไว้ <b id="sys-n">0</b> รายการ (เส้นเชื่อม · รอยอ่าน) — <a href="#" id="sys-show">แสดง</a> · <span style="color:var(--dim)">ยังถูกใช้บนแผนที่ตามปกติ</span></div>
+  <div id="sysline" hidden>ซ่อนบันทึกระบบไว้ <b id="sys-n">0</b> — <a href="#" data-mach="bond" class="machlink">เส้นเชื่อม <b id="sys-nb"></b></a> · <a href="#" data-mach="pointer" class="machlink">รอยอ่าน <b id="sys-np"></b></a> · <a href="#" data-mach="all" class="machlink">ทั้งหมด</a> · <a href="#" id="sys-hide" hidden>ซ่อนกลับ</a> <span style="color:var(--dim)">ยังถูกใช้บนแผนที่ตามปกติ</span></div>
   <div id="feed"></div>
   <aside id="side">
     <section>
@@ -631,13 +632,24 @@ function tickOf(m){return m.seq==null?null:Math.floor(m.seq/CHUNK)}
 // ("this line uses that term"), a pointer ("someone read here"), an unbind.
 // The feed is for reading the conversation, so these collapse to one quiet row
 // per kind per chunk instead of one card each: at 25k lines a bond flood was
-// burying every real message. `machineAll` is the off-switch ("show system
-// records"), and a search that NAMES a hash must still find its card, which is
-// why the filter stays inside inScope() rather than the renderer.
+// burying every real message. `machineSel` holds the per-kind switches, and a
+// search that NAMES a hash must still find its card, which is why the filter
+// stays inside inScope() rather than the renderer.
 const MACHINE_KINDS=new Set(['bond','pointer','unbind']);
-let machineAll=false;
+// which machine kinds the reader has ASKED to see. `all` is the old "show
+// everything": one state variable per question — "show bonds?", "show
+// pointers?" — instead of one boolean over both, because wanting to audit who
+// read where is not the same as wanting 2,000 bond lines back in the feed.
+// A search that names a hash still finds its card regardless of these.
+let machineSel={all:false,bond:false,pointer:false};
+function machineShown(m){
+  const k=m.kind||'';
+  if(k==='bond'||k==='unbind')return machineSel.all||machineSel.bond;
+  if(k==='pointer')return machineSel.all||machineSel.pointer;
+  return false;
+}
 function inScope(m){
-  if(!machineAll&&MACHINE_KINDS.has(m.kind||'')&&!filterQ)
+  if(!machineShown(m)&&MACHINE_KINDS.has(m.kind||'')&&!filterQ)
     return false;                    // data about the system: folded away by default
   return (!filterQ||(m.text||'').toLowerCase().includes(filterQ))&&
          (filterApps.size===0||filterApps.has(m.app));
@@ -738,10 +750,27 @@ function render(){
   const machineFolded=msgs.filter(m=>MACHINE_KINDS.has(m.kind||'')&&!inScope(m)).length;
   const sys=$('#sysline');
   if(sys){
-    sys.hidden=!machineFolded;
-    $('#sys-n').textContent=machineFolded;
-    $('#sys-show').onclick=e=>{e.preventDefault();machineAll=true;render()};
-    sys.title='เส้นเชื่อมและรอยอ่านเป็นข้อมูลของระบบ (ใช้วาดแผนที่) ไม่ใช่ข้อความคุย — กดแสดงเพื่อเห็นในฟีด';
+    // the bar is a PICKER, not a switch: per-kind counts, per-kind doors, and
+    // a door that closes. `on` marks what is open so the state is on the bar,
+    // never only in the feed
+    const nb=msgs.filter(m=>(m.kind==='bond'||m.kind==='unbind')&&!machineShown(m)).length;
+    const np=msgs.filter(m=>m.kind==='pointer'&&!machineShown(m)).length;
+    sys.hidden=!(nb+np);
+    $('#sys-n').textContent=nb+np;
+    $('#sys-nb').textContent=nb?nb:'';
+    $('#sys-np').textContent=np?np:'';
+    sys.querySelectorAll('.machlink').forEach(a=>{
+      const w=a.dataset.mach;
+      a.classList.toggle('on',machineSel[w]);
+      a.onclick=e=>{e.preventDefault();machineSel[w]=!machineSel[w];render()};
+      a.title=w==='bond'?'แสดง/ซ่อนเฉพาะเส้นเชื่อม (บันทึกที่บอกว่าอะไรเชื่อมกับอะไร)'
+        :w==='pointer'?'แสดง/ซ่อนเฉพาะรอยอ่าน (จุดวงฟ้าบนแผนที่)'
+        :'แสดง/ซ่อนบันทึกระบบทุกชนิด';
+    });
+    const hid=$('#sys-hide');
+    hid.hidden=!machineSel.all&&!machineSel.bond&&!machineSel.pointer;
+    hid.onclick=e=>{e.preventDefault();machineSel={all:false,bond:false,pointer:false};render()};
+    sys.title='เส้นเชื่อมและรอยอ่านเป็นข้อมูลของระบบ (ใช้วาดแผนที่) ไม่ใช่ข้อความคุย — กดเลือกชนิดที่อยากเห็น';
   }
   if(!list.length){
     feed.innerHTML=`<div class="empty">ไม่มีข้อความ${(filterQ||filterApps.size)?' ที่ตรงกับตัวกรอง':''}</div>`;
