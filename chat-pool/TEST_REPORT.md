@@ -20,7 +20,7 @@
 ```
   PASS  pool.py demo            1.1s  POOL-SELFCHECK: 306/306 PASS
   PASS  ctx_plane               1.5s  CTX-PLANE SELFCHECK: PASS
-  PASS  ui_check                0.3s  130,576 bytes · 12/12 invariants
+  PASS  ui_check                0.5s  138,016 bytes · 15/15 invariants
   PASS  stream_check            8.9s  14/14 PASS
   PASS  prune_check             2.0s  13/13 PASS
   PASS  reconnect_check         3.9s  14/14 PASS
@@ -49,7 +49,7 @@ python run_all.py
 ```bash
 python pool.py demo           # core logic 306 assertions
 python ctx_plane.py demo      # ระนาบ 144×144
-python ui_check.py            # dashboard JavaScript + 12 invariants
+python ui_check.py            # dashboard JavaScript + 15 invariants
 python stream_check.py        # SSE + ขา input 14 checks
 python prune_check.py         # ตัวกรองขยะ 13 checks
 python reconnect_check.py     # SSE backoff formula + server reconnect 14 checks
@@ -98,7 +98,7 @@ python latency_check.py       # SSE ไม่ deadlock ใต้ latency สู�
 
 ---
 
-### 3. `ui_check.py` — 12/12 invariants
+### 3. `ui_check.py` — 15/15 invariants
 
 ตรวจ dashboard JavaScript บนหน้าเว็บจริง
 
@@ -116,8 +116,15 @@ python latency_check.py       # SSE ไม่ deadlock ใต้ latency สู�
 | 10 | ไม่มีศัพท์บนหน้าจอ | คนอ่านงง |
 | 11 | error แปลเป็นไทย ไม่พิมพ์ดิบ | ข้อความ error โกหก |
 | 12 | ทุก filter rule มีคำไทย + ทุกคำไทยมี rule | ชื่อ code หลุดบนจอ |
+| 13 | บันได pinch = ห้าขนาดที่ `#pv-win` มี | ซูมไปขนาดที่เลือกกลับไม่ได้ |
+| 14 | นิ้วที่สองทิ้งการลาก + กลืนคลิก | แผนที่กระโดด / เปิดช่องที่ไม่แตะ |
+| 15 | ที่อยู่ของผังบล็อก: คีย์ · ภาพ · คลิก · แว่น ตรงกัน | ผังวาดที่หนึ่ง คลิกรายงานอีกที่ |
 
-**mutation-tested 10/10** — ทุก invariant พิสูจน์แล้วว่ากัดจริง
+#13–15 รันโค้ดจริงใน node (สกัด `pvWrap` `pvB` `pvXY` `pvRkeyAt` `pvDerive` `pvValAt`
+ออกจากสคริปต์ที่เสิร์ฟจริง) ไม่ใช่จับ regex — เพราะเวอร์ชัน regex **ผ่านทั้งที่บั๊ก**:
+ทั้งสองฟังก์ชันอ้าง `PV.bOrig` ครบ แต่เลขคณิตยังผิด (#15 จับ 336–8064 ที่อยู่ที่ไม่ตรง)
+
+**mutation-tested** — ทุก invariant พิสูจน์แล้วว่ากัดจริง (ชุดหลังสุด **7/7**)
 
 ---
 

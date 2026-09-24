@@ -1161,3 +1161,145 @@ ui_check  OK (130,576 bytes · 12/12 invariants)     stream_check  14/14
 pool.py demo  306/306 PASS    ctx_plane  PASS     prune_check  13/13
 error_check  6/6 PASS   (39 probes · 25 errors · 25 named · 0 status-only)
 ```
+
+## 18. The block map — a second address space, and two gestures
+
+### 18.1 The 12x12 map drew all 144 blocks in one row
+
+Measured in the browser, on the block map as it shipped:
+
+```
+Object.keys(PV.cells).length                          144
+new Set(keys.map(k => pvXY(k).join(','))).size         12
+squares where pvRkeyAt(x,y) is not a block's corner    132 / 144
+```
+
+Twelve positions for a hundred and forty-four blocks. `pvDerive` keyed the
+aggregation by a **block index** (`by*12+bx`) while `pvXY` reads **cell
+addresses** (`(rk%144)/12`, `rk/144/12`), so every square was drawn through the
+wrong reader: all of them landed in row 0, overdrawing each other twelve deep,
+while the edge lines around them (which carry real addresses) were placed
+correctly. The picture looked like a green heat row on top of a cloud of lines —
+and since a heat map has no labels, the only symptom available to a person was
+*"this map is confusing"*.
+
+The same split had three quieter consequences, all of them lies on screen:
+
+* the `writer` and `recent` colour layers read `PV.cellApp[rk]` / `PV.cellSeq[rk]`
+  with a block index, so they were colouring each square by an unrelated cell;
+* the radius mask asked `keep.has(blockIndex)` against a set of cell addresses,
+  so it never matched anything and dimmed **every** square;
+* the glass asked `PV.cells[cellAddress]` of a block-keyed map, so it drew a full
+  map as empty and its readout said `×2 1,1 · 0 line` over a block holding 2,228.
+
+### 18.2 One address space, or none
+
+The fix is not a corrected formula in `pvXY`; it is removing the second
+numbering. The aggregation now keys each block by its **first address**
+(`(by*12)*144 + bx*12`), which is what `pvRkeyAt` already returned, which is what
+`pvXY` already consumed, and which `pvCellApp`/`pvCellSeq`/`pvKeep`/`openPoint`
+all already spoke. One line changed; four readers became correct at once.
+
+`pvValAt(rk)` is the remaining case where two address spaces must meet: the glass
+asks for the value **at a cell**, and on the block map the entries are blocks. So
+a cell borrows the count of the block containing it — stated in one function, so
+the glass, the tooltip and the level readout cannot each invent their own answer.
+
+```
+keys are cell addresses again        new Set(pvXY(k)).size   144
+disagreements between the picture and the click   0 / 144 squares
+```
+
+### 18.3 Panning the block map
+
+The block map shows the whole plane, so a drag there cannot reveal new ground —
+but the plane is a **torus**, and moving the seam is a real view position: the
+picture slides rigidly under the finger and comes round after twelve blocks. On
+a grid of blocks that is exactly what panning a wrapping map looks like, and it
+is the same modulo the window already pans with. So the drag is shared: one
+`panDrag`, one click-swallow, two coordinate pairs, `PV.bOrig` in **block**
+coordinates (0..11) and `PV.origin` in cells. Measured: dragging right three
+blocks and down one gives `bOrig {x:9, y:11}` (= -3, -1 mod 12) and the drawn
+grid matches a rigid rotation of the previous one **144/144 squares**.
+
+The info line says what a drag does here before it is tried, because the honest
+answer ("every block is already on screen") is not the one the gesture suggests:
+
+```
+ผังย่อ 12×12 · ทั้งระนาบอยู่ในจอแล้ว — ลาก = เลื่อนขอบผัง (วนกลับที่เดิมทุก 12 บล็อก)
+```
+
+`⟲` resets the seam too: "show me the whole thing again" cannot restore
+everything except the thing the reader actually moved.
+
+### 18.4 The pinch walks extent, not magnification
+
+A phone has no wheel, and the `±` cluster magnifies the **glass**. What a map
+gesture means to everyone is *how much am I looking at* — so the pinch walks the
+extent ladder, which is the mode buttons' own ladder with the frame sizes the
+picker offers, and nothing in between:
+
+```
+   12  ->  24  ->  36  ->  48  ->  72  ->  blocks  ->  plane
+  (out)                                    (in)
+```
+
+An extent with no name is an extent the reader cannot come back to, so the
+ladder and `#pv-win`'s `<option>`s must be the same five numbers — an invariant
+tests exactly that, cross-control. It stops where the frame stops: outward at the
+whole plane (a picture smaller than the screen is all frame and no plane),
+inward at 12x12, where the glass takes over because a frame can go no finer than
+one cell per square. Both stops **say** they stopped.
+
+Pinching out of the block map opens the frame over the block under the fingers:
+measured from a spread at the block map's (6,8), `PV.win` becomes 12 and the
+origin `{wedge:72, ring:96}` = that block. Pinching in walks back out:
+`24, 36, 48, 72, blocks, plane` — six rungs, then the stop.
+
+What the touch code had to add is only bookkeeping, and it is bookkeeping that
+fails invisibly:
+
+| must happen | why | wrong answer looks like |
+|---|---|---|
+| the second finger drops `panDrag` and `lens.drag` | one pointer both panning and pinching moves the frame twice per frame | "the map jumped" |
+| a pinch sets the click-swallow | lifting two fingers would open whatever cell was under them | "it opens a cell I did not touch" |
+| a cancelled pointer releases the frame | a system gesture leaves a drag with no finger on it | "it pans on its own" |
+
+### 18.5 The invariant RUNS the code
+
+The first version of this check was a regex over the source — *pvXY mentions
+`PV.bOrig`, pvRkeyAt calls `pvBlockKey`* — and it **passed on the bug**: both
+functions mentioned the seam, and the arithmetic that turned a block key into a
+cell address was still wrong (`key*12` is the block's column at the wrong row).
+A shape check cannot see arithmetic. So the check now extracts `pvWrap`, `pvB`,
+`pvXY`, `pvRkeyAt`, `pvDerive` and `pvValAt` out of the served script, hands them
+to node with a stub `PV`, and asserts that they agree:
+
+```
+15 seam offsets x 144 squares:  the address is a block's first cell,
+                                the square reads back to the same square,
+                                every cell inside the block lands on that square
+144 blocks x 3 cells:           a cell reads the count of its own block
+```
+
+Every mutation caught (7/7), including the two that were invisible before:
+
+```
+the block map keys squares by a block INDEX again -> CAUGHT  336 disagreements
+the block click ignores the seam                  -> CAUGHT  8064
+the picture ignores the seam                      -> CAUGHT  8064
+pvB stops wrapping at twelve                      -> CAUGHT  5648
+the lens asks a block key for a cell's value      -> CAUGHT  288
+pinch step off the picker's ladder                -> CAUGHT  the ladder invariant
+two fingers keep the drag they interrupted        -> CAUGHT  the gesture invariant
+```
+
+Verified in the browser as well, because the probe is not the page: a tap reads
+a cell, a click after a pinch does not, the glass drags and zooms, a frame still
+pans with one finger.
+
+```
+ui_check  OK (138,016 bytes · 15/15 invariants)     stream_check  14/14
+pool.py demo  306/306 PASS    ctx_plane  PASS     prune_check  13/13
+error_check  6/6 PASS   curator_check  37/37   reconnect_check 14/14   latency_check  8/8
+```

@@ -227,6 +227,113 @@ def vocabulary_gaps(js):
     return gaps
 
 
+SEAM_PROBE = r"""
+const PV={mode:'blocks',n:12,seq:null,seqMax:9,budget:64,win:12,over:[],
+          bOrig:{x:0,y:0},origin:{wedge:0,ring:0},plane:{},cells:{}};
+const bad=[];
+// a plane with weight in every block: what the aggregation produces is checkable
+for(let i=0;i<20736;i+=7) PV.plane[i]=(PV.plane[i]||0)+1;
+pvDerive();
+{
+  const keys=Object.keys(PV.cells).map(Number);
+  if(keys.length!==144) bad.push(['blocks counted',keys.length]);
+  for(const k of keys){
+    const col=k%144,row=Math.floor(k/144);
+    if(col%12||row%12||col>=144||row>=144)
+      bad.push(['a block is keyed by something that is not its first address',k,col,row]);
+  }
+}
+// the glass asks for a CELL's value while the map holds block addresses, so a
+// cell has to read the block around it or the glass draws a full map as empty
+for(const b of Object.keys(PV.cells).map(Number)){
+  for(const [dx,dy] of [[0,0],[5,5],[11,11]]){
+    const cell=b+dx+dy*144;
+    if(pvValAt(cell)!==PV.cells[b])
+      bad.push(['a cell reads the wrong block',cell,b,pvValAt(cell),PV.cells[b]]);
+  }
+}
+PV.mode='blocks';
+for(const ox of [0,1,5,9,11]) for(const oy of [0,3,11]){
+  PV.bOrig={x:ox,y:oy};
+  for(let x=0;x<12;x++) for(let y=0;y<12;y++){
+    const rk=pvRkeyAt(x,y);
+    if(rk%144%12 || Math.floor(rk/144)%12) bad.push(['address-is-not-a-block-corner',x,y,rk]);
+    const back=pvXY(rk);
+    if(back[0]!==x||back[1]!==y) bad.push(['square-and-address-disagree',x,y,rk,back]);
+    for(const [dx,dy] of [[5,5],[11,0],[0,11]]){
+      const q=rk+dx+dy*144, inq=pvXY(q);
+      if(inq[0]!==x||inq[1]!==y) bad.push(['cell-inside-the-block-lands-elsewhere',x,y,q,inq]);
+    }
+  }
+}
+console.log(JSON.stringify(bad.slice(0,6))+' :: '+bad.length);
+"""
+
+
+def seam_roundtrip(js):
+    """Run the block map's address functions and check that they agree.
+
+    A regex can only see that pvXY and pvRkeyAt both MENTION the seam; it cannot
+    see that the arithmetic is right — and this arithmetic has already been wrong
+    in a way that looked right: the 12x12 block map keyed its squares by a block
+    INDEX while pvXY reads cell addresses, so all 144 blocks were drawn in row 0
+    on top of one another while the edge lines around them were placed correctly.
+    Nothing on screen says which square is which, so it read as "this map is
+    confusing", never as a bug.
+
+    So the functions are actually RUN: every square, at five seam offsets, with
+    the cells inside each block checked too. The address a click resolves to must
+    be a block's first cell, and every cell of that block must project back onto
+    the square that produced it.
+    """
+    node = shutil.which("node")
+    if not node:
+        return ""
+    pick = [js[js.find(a):js.find("\n", js.find(a))]
+            for a in ("function pvWrap(v){", "function pvB(v){")]
+    xy = block(js, "function pvXY(rk){", "\nfunction pvRkeyAt(x,y){").strip()
+    at = block(js, "function pvRkeyAt(x,y){", "\n/* ── torus helpers").strip()
+    agg = block(js, "function pvDerive(){", "\nfunction pvCenter(rk){").strip()
+    val = block(js, "function pvValAt(rk){", "\nfunction pvCountAt(x,y,rk){").strip()
+    if any(not p for p in pick + [xy, at, agg, val]):
+        return ("pvWrap, pvB, pvXY, pvRkeyAt, pvDerive and pvValAt must all still "
+                "be in the script: between them they are the only thing keeping "
+                "the block map's picture, its clicks, its keys and its glass "
+                "talking about the same square")
+    d = tempfile.mkdtemp(prefix="ui-seam-")
+    tmp = os.path.join(d, "seam.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(pick + [xy, at, agg, val]) + SEAM_PROBE)
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0:
+        return "the seam probe would not run: " + (r.stdout + r.stderr).strip()[:400]
+    bad, _, n = r.stdout.strip().rpartition(" :: ")
+    if n != "0":
+        return ("%s addresses read two different ways. Each line names what "
+                "disagreed, so the same square is drawn through one expression "
+                "and reported through another:\n    %s" % (n, bad[:600]))
+    return ""
+
+
+def frame_sizes(js, html):
+    """(the pinch ladder, the frame picker's options) — two lists that must match.
+
+    One control in two places: the pinch steps PV_WINS, the picker offers the
+    <option>s. A step onto a size the picker does not offer leaves the reader in
+    a frame they cannot choose again — and the picker then displays a stale
+    number, which is a control that lies about the view.
+    """
+    m = re.search(r"PV_WINS\s*=\s*\[([^\]]*)\]", js)
+    a = [int(v) for v in re.findall(r"\d+", m.group(1))] if m else None
+    sel = re.search(r'id="pv-win"[^>]*>(.*?)</select>', html, re.S)
+    b = ([int(v) for v in re.findall(r'<option value="(\d+)"', sel.group(1))]
+         if sel else None)
+    return a, b
+
+
 # (label, test, why) — the why is printed on failure, because the point of the
 # check is to hand back the reasoning, not just a red X. Each test gets the whole
 # script; each is written to fail loudly if its marker disappears entirely, so a
@@ -312,6 +419,26 @@ INVARIANTS = [
                        "that was deleted (orphaned translation). Fix RULE_TH / "
                        "PROTECT_TH:\n    "
                        + "\n    ".join("%s: %s" % (l, n) for l, n in vocabulary_gaps(js)))),
+    # ── the gestures: invisible on a desktop, where there is no second finger
+    ("the pinch steps the sizes the frame picker offers",
+     lambda js, html: frame_sizes(js, html)[0] == frame_sizes(js, html)[1]
+                      and frame_sizes(js, html)[0] is not None,
+     lambda js, html: ("the pinch ladder and #pv-win are one control in two "
+                       "places: ladder=%s picker=%s — a step onto a size the "
+                       "picker cannot show is a frame that cannot be chosen back"
+                       % frame_sizes(js, html))),
+    ("a two-finger gesture is not a drag or a tap",
+     lambda js, html: all(k in block(js, "pcv.onpointerdown=ev=>{",
+                                     "const rect=pcv.getBoundingClientRect()")
+                         for k in ("PV.panDrag=null", "PV.panSwallow=Date.now()")),
+     "the second finger must drop the drag the first one started (one pointer "
+     "that is both panning and pinching moves the frame twice per frame) and "
+     "must swallow the click (lifting two fingers would otherwise open whatever "
+     "cell happened to be under them). Both failures look like 'the map jumped' "
+     "— never like a missing line of code, and never on a desktop"),
+    ("the block map speaks one address for its keys, picture, clicks and glass",
+     lambda js, html: seam_roundtrip(js) == "",
+     lambda js, html: seam_roundtrip(js)),
 ]
 
 

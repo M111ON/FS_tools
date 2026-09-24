@@ -595,7 +595,7 @@ button.send:disabled{opacity:.55;cursor:progress}
         <div id="plane-tip" popover="manual"></div>
         <div id="plane-pop" popover="manual"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail"><div id="pv-legend"></div><b style="color:var(--fg)">แผนที่นี้คือที่อยู่ของทุกบรรทัด</b> — หนึ่งช่อง = หนึ่งที่อยู่ ตัวเลขในช่อง = มีกี่บรรทัดอยู่ตรงนั้น<br><br>▸ <b>คลิกช่อง</b> = ดูว่ามีอะไรอยู่ตรงนั้น<br>▸ <b>🔍 แว่นขยาย</b> = ถือไปดูใกล้ ๆ (ลาก = เลื่อนแว่น)<br>▸ ปุ่ม <b>+ −</b> มุมขวาล่าง = ซูมเข้า/ออก · <b>⟲</b> = กลับไปทั้งแผนที่<br>▸ <b>⚙ ตัวเลือก</b> ด้านบน = เปิดตัวกรอง (ตัดขยะ · เส้นเชื่อม · ความจำ · รัศมี · แพทเทิน)<br><br><span style="color:var(--dim)">◌ สีของช่อง = ข้อมูลที่เลือกไว้ด้านบน (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)<br>◌ วงฟ้า = ช่องที่มีคนบันทึกไว้ว่าอ่านแล้ว<br>◌ เส้นฟ้า = เส้นเชื่อมระหว่างบรรทัด · เส้นขาว = เส้นที่แตะจุดที่เลือกไว้<br>◌ จุดฟ้า = ความจำกลางที่แชร์ไว้ · เส้นม่วงประ = เส้นที่เชื่อมข้ามระบบ<br>◌ แถบเวลาด้านบน = ใครเขียนเมื่อไร · ลากที่แถบหรือลากสไลเดอร์เพื่อย้อนดูแผนที่ค่อย ๆ ประกอบ<br>◌ คีย์บอร์ด: ← → เลื่อนทีละบรรทัด · space เล่น/หยุด · Esc ปิด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
+      <div id="plane-side"><div id="plane-detail"><div id="pv-legend"></div><b style="color:var(--fg)">แผนที่นี้คือที่อยู่ของทุกบรรทัด</b> — หนึ่งช่อง = หนึ่งที่อยู่ ตัวเลขในช่อง = มีกี่บรรทัดอยู่ตรงนั้น<br><br>▸ <b>คลิกช่อง</b> = ดูว่ามีอะไรอยู่ตรงนั้น<br>▸ <b>🔍 แว่นขยาย</b> = ถือไปดูใกล้ ๆ (ลาก = เลื่อนแว่น)<br>▸ ปุ่ม <b>+ −</b> มุมขวาล่าง = ซูมเข้า/ออก · <b>⟲</b> = กลับไปทั้งแผนที่<br>▸ <b>บนจอสัมผัส</b>: ลาก = เลื่อนมุมมอง · บีบสองนิ้วออก = ซูมเข้า · บีบสองนิ้วเข้า = ซูมออก (หยุดที่ทั้งระนาบ และที่กรอบ 12×12)<br>▸ <b>⚙ ตัวเลือก</b> ด้านบน = เปิดตัวกรอง (ตัดขยะ · เส้นเชื่อม · ความจำ · รัศมี · แพทเทิน)<br><br><span style="color:var(--dim)">◌ สีของช่อง = ข้อมูลที่เลือกไว้ด้านบน (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)<br>◌ วงฟ้า = ช่องที่มีคนบันทึกไว้ว่าอ่านแล้ว<br>◌ เส้นฟ้า = เส้นเชื่อมระหว่างบรรทัด · เส้นขาว = เส้นที่แตะจุดที่เลือกไว้<br>◌ จุดฟ้า = ความจำกลางที่แชร์ไว้ · เส้นม่วงประ = เส้นที่เชื่อมข้ามระบบ<br>◌ แถบเวลาด้านบน = ใครเขียนเมื่อไร · ลากที่แถบหรือลากสไลเดอร์เพื่อย้อนดูแผนที่ค่อย ๆ ประกอบ<br>◌ คีย์บอร์ด: ← → เลื่อนทีละบรรทัด · space เล่น/หยุด · Esc ปิด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
     </div>
   </div>
 </div>
@@ -1225,6 +1225,10 @@ listen();
    counts: no content reaches it without a pointer. Every click is one
    explicit read (cell → sub-cell → sub-sub-cell), and L1/L2 are just
    later reads at a coarser point — nothing here is cached state. */
+// the pinch ladder and its threshold live with the view they change, not with
+// the touch code: PV_WINS must equal the options in #pv-win, because a frame
+// size the picker cannot show is a frame the reader cannot choose again
+const PV_WINS=[12,24,36,48,72],PV_PINCH_OUT=1.45;
 const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
           bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
@@ -1237,6 +1241,12 @@ const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           prune:true,pruned:0,prunedCells:0,
           // the wrapping window: PV.win cells across, origin in plane cells
           win:48,panDrag:null,
+          // the block map's own seam, in BLOCK coordinates (0..11). The 12x12
+          // map already holds the whole plane, so panning it moves the seam
+          // rather than revealing new ground — but it is still a view position,
+          // and it lives here so that pvXY (which draws) and pvRkeyAt (which
+          // answers clicks) subtract the SAME number.
+          bOrig:{x:0,y:0},
           // walk: the trail is the reader's OWN path, kept client-side and
           // never written to the pool — exploring is not a sighting (a
           // sighting says "someone read here"; a trail says "I got lost here"
@@ -1343,7 +1353,14 @@ function pvDerive(){
   if(PV.mode==='blocks'){
     PV.n=12;const agg={};
     for(const k in src){
-      const rk=+k,bx=Math.floor((rk%144)/12),by=Math.floor(rk/144/12),key=by*12+bx;
+      // keyed by the block's FIRST ADDRESS, like every other mode — pvXY, the
+      // edge strokes, the radius mask and pvCountAt all speak cell addresses,
+      // and a second numbering understood only by this branch is how the block
+      // squares ended up drawn on top of each other in row 0 while the lines
+      // around them were placed correctly (nothing on screen says which square
+      // is which, so it read as "this map is confusing", not as a bug)
+      const rk=+k,bx=Math.floor((rk%144)/12),by=Math.floor(rk/144/12);
+      const key=(by*12)*144+bx*12;
       agg[key]=(agg[key]||0)+src[k];
     }
     PV.cells=agg;return;
@@ -1634,6 +1651,14 @@ function pvPan(dx,dy){
 }
 function pvWinInfo(){
   const el=$('#pv-wininfo');if(!el)return;
+  if(PV.mode==='blocks'){
+    // Say what a drag does HERE before it is tried: the 12x12 map already holds
+    // the whole plane, so sliding it moves the seam and not the contents — and
+    // a reader who drags, sees the picture shift and is told nothing deserves
+    // better than to wonder which part they just visited.
+    el.textContent='ผังย่อ 12×12 · ทั้งระนาบอยู่ในจอแล้ว — ลาก = เลื่อนขอบผัง (วนกลับที่เดิมทุก 12 บล็อก)';
+    return;
+  }
   if(PV.mode!=='window'||!PV.origin){el.textContent='';return}
   const w=PV.win,o=PV.origin;
   const x0=o.wedge,y0=o.ring,x1=pvWrap(o.wedge+w-1),y1=pvWrap(o.ring+w-1);
@@ -1643,9 +1668,14 @@ function pvWinInfo(){
   el.textContent='กรอบเลื่อน '+w+'×'+w+' · ช่อง ('+x0+','+y0+')→('+x1+','+y1+')'+sx+sy
     +' · ลากเพื่อเลื่อน (ไม่รู้จบ — วนรอบ torus)';
 }
+/* Block coordinates wrap at 12, never at 144: a block is 12x12 cells, so the
+   12x12 grid of blocks is itself a torus and a pan has to come round after
+   twelve blocks rather than a hundred and forty-four. */
+function pvB(v){return((v%12)+12)%12}
 function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
-  if(PV.mode==='blocks')return[Math.floor((rk%144)/12),Math.floor(rk/144/12)];
+  if(PV.mode==='blocks'){const o=PV.bOrig;
+    return[pvB(Math.floor((rk%144)/12)-o.x),pvB(Math.floor(rk/144/12)-o.y)]}
   const n=PV.n,o=PV.origin||{wedge:0,ring:0};
   const dx=pvWrap(rk%144-o.wedge),dy=pvWrap(Math.floor(rk/144)-o.ring);
   if(dx>=n||dy>=n)return[-1,-1];          // this address is outside the frame
@@ -1653,7 +1683,8 @@ function pvXY(rk){
 }
 function pvRkeyAt(x,y){
   if(PV.mode==='plane')return pvWrap(y)*144+pvWrap(x);
-  if(PV.mode==='blocks')return(y*12)*144+x*12;          // origin of that square
+  if(PV.mode==='blocks'){const o=PV.bOrig;   // the square's block, in first addresses
+    return(pvB(o.y+y)*12)*144+pvB(o.x+x)*12}
   const o=PV.origin||{wedge:0,ring:0};
   return pvWrap(o.ring+y)*144+pvWrap(o.wedge+x);
 }
@@ -1675,7 +1706,16 @@ function ghostOffsets(cx,cy){
   if(cx>=T144-G&&cy>=T144-G)o.push([-T144,-T144]);
   return o;
 }
-function pvCountAt(x,y,rk){return(PV.mode==='blocks'?PV.cells[y*12+x]:PV.cells[rk])||0}
+/* The value AT AN ADDRESS — the question the glass and the tooltip both ask.
+   In blocks mode the entries are the blocks' first addresses, so a cell has to
+   borrow the count of the block around it. Without that the glass drew a block
+   map as empty and its readout said "0 line" over a cell holding 2,228. */
+function pvValAt(rk){
+  if(PV.mode!=='blocks')return PV.cells[rk]||0;
+  const bx=Math.floor((rk%144)/12),by=Math.floor(rk/144/12);
+  return PV.cells[(by*12)*144+bx*12]||0;
+}
+function pvCountAt(x,y,rk){return pvValAt(rk)}
 /* Cell colour is a LAYER, not decoration: the same plane answers four
    different questions and one function decides the hue, so the legend can
    never disagree with the canvas. Slower traffic is the point here — a log is
@@ -1752,7 +1792,7 @@ function pvLensStops(){
 function pvLensPos(){
   const step=pstep(),L=PV.lens;
   if(PV.mode==='plane')return[L.wedge*step,L.ring*step];
-  if(PV.mode==='blocks')return[L.wedge*step/12,L.ring*step/12];
+  if(PV.mode==='blocks')return[pvB(L.wedge/12-PV.bOrig.x)*step,pvB(L.ring/12-PV.bOrig.y)*step];
   const o=PV.origin||{wedge:0,ring:0};
   return[pvWrap(L.wedge-o.wedge)*step,pvWrap(L.ring-o.ring)*step];
 }
@@ -1863,8 +1903,7 @@ function pvLensOne(c,ox,oy,r,primary){
   for(let dy=-half;dy<=half;dy++){
     const py=oy+(dy-fr)*cs;if(py+cs<oy-r||py>oy+r)continue;
     for(let dx=-half;dx<=half;dx++){
-      const px=ox+(dx-fw)*cs;if(px+cs<ox-r||px>ox+r)continue;
-      const P=pvLensPt(cw+dx,cr+dy),rk=P[1]*144+P[0],v=PV.cells[rk]||0;
+      const px=ox+(dx-fw)*cs;if(px+cs<ox-r||px>ox+r)continue;        const P=pvLensPt(cw+dx,cr+dy),rk=P[1]*144+P[0],v=pvValAt(rk);
       if(!v&&cs<7)continue;
       c.globalAlpha=(!keep||keep.has(rk))?1:0.15;
       c.fillStyle=v?pvCellInk(rk,v/max):'#121821';
@@ -1933,8 +1972,7 @@ function pvLensOne(c,ox,oy,r,primary){
   // at this point would be enlarging a single number, which is the one thing a
   // viewport must never do.
   if(primary&&cs>=r*1.4){
-    const vw=pvWrap(Math.floor(L.wedge)),vr=pvWrap(Math.floor(L.ring));
-    const vv=PV.cells[vr*144+vw]||0;
+    const vw=pvWrap(Math.floor(L.wedge)),vr=pvWrap(Math.floor(L.ring));      const vv=pvValAt(vr*144+vw);
     c.textAlign='center';
     c.fillStyle=vv?'#ffd479':'#484f58';c.font='bold 26px monospace';
     c.fillText(vv,ox,oy+3);
@@ -1946,8 +1984,7 @@ function pvLensOne(c,ox,oy,r,primary){
   if(primary){
     // the label and the handle belong to the ONE glass, not to every wrapped
     // copy of its rim: nine labels is not nine times the information
-    const cw2=pvWrap(Math.floor(L.wedge)),cr2=pvWrap(Math.floor(L.ring));
-    const v=PV.cells[cr2*144+cw2]||0;
+    const cw2=pvWrap(Math.floor(L.wedge)),cr2=pvWrap(Math.floor(L.ring));      const v=pvValAt(cr2*144+cw2);
     const txt='×'+z+' '+lv[0]+' · '+cw2+','+cr2+' · '+v+' line'+(v===1?'':'s');
     c.font='11px monospace';
     const tw=c.measureText(txt).width+14,by=oy+r-19;
@@ -2008,7 +2045,7 @@ function pvBaseKey(px,bw){
   const o=PV.origin;
   return[px,bw,PV.n,PV.mode,PV.colour,PV.sel,PV.focus,PV.seq,PV.win,
     PV.showBonds,PV.ctxOn,PV.style,PV.hubK,PV.relColour,PV.prune,PV.cellSeqMax,
-    o?o.wedge:null,o?o.ring:null,
+    o?o.wedge:null,o?o.ring:null,PV.bOrig.x,PV.bOrig.y,
     _idOf(PV.cells),_idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.sights),
     _idOf(PV.cellApp),_idOf(PV.cellSeq)].join('|');
 }
@@ -2419,6 +2456,9 @@ function pvMode(){
   pvWinInfo();
   pvLensInfo();
   pvFocusBtns();
+  // the frame-size picker must show the frame that is actually drawn: the pinch
+  // and the glass both set PV.win, and a picker that disagrees is a control lying
+  if(PV_WINS.indexOf(PV.win)>=0)$('#pv-win').value=String(PV.win);
   _legendKey=null;                         // a new view is a new legend
   pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
 }
@@ -2743,8 +2783,11 @@ pcv.onmousemove=ev=>{
   const tip=$('#plane-tip'),hit=pvCellAt(ev);
   if(!hit){pvTopHide(tip);return}
   const [x,y,rk]=hit,n=pvCountAt(x,y,rk);
+  // once the map can pan, the screen square is not the address: name the BLOCK
+  const bx=PV.mode==='blocks'?pvB(PV.bOrig.x+x):x;
+  const by=PV.mode==='blocks'?pvB(PV.bOrig.y+y):y;
   const who=PV.sights.filter(s=>s.point===rk).map(s=>s.app).join(',');
-  tip.textContent=(PV.mode==='blocks'?'ช่องย่อ ':'ที่อยู่ ')+rk+' (คอลัมน์ '+x+', แถว '+y+') · '+n+' บรรทัด'
+  tip.textContent=(PV.mode==='blocks'?'ช่องย่อ ':'ที่อยู่ ')+rk+' (คอลัมน์ '+bx+', แถว '+by+') · '+n+' บรรทัด'
     +(who?' · 👁 '+who:'');
   pvTopOpen(tip);
   const vw=window.innerWidth||document.documentElement.clientWidth;
@@ -2837,7 +2880,63 @@ function pvLensRead(){
   PV.lens.wedge=w;PV.lens.ring=r;
   openPoint(r*144+w);
 }
+/* ── ✋ pinch ────────────────────────────────────────────────────────────
+   A phone has no wheel, and what a map gesture means is "how much of it am I
+   looking at" — so a pinch walks the EXTENT ladder: the whole plane (either
+   rendering of it), then a frame of 72, 48, 36, 24 or 12 cells. Those are the
+   same five sizes the frame picker offers and nothing in between, because an
+   extent with no name is an extent you cannot come back to. It stops where the
+   frame stops: outward at the whole plane, since a picture smaller than the
+   screen would be all frame and no plane; inward at 12x12, where the glass
+   takes over — a frame can go no finer than one cell per square. */
+function pvZoomStep(dir,ev){
+  if(PV.mode==='plane'){
+    if(dir<0){toast('ทั้งระนาบอยู่ในจอแล้ว — ย่อออกกว่านี้ไม่มีอะไรอยู่ข้างนอก');return}
+    const hit=ev?pvCellAt(ev):null;
+    const here=hit?hit[2]:(PV.sel!=null?PV.sel:busiestCell());
+    if(here==null){toast('ยังไม่มีข้อมูลบนแผนที่');return}
+    if(PV_WINS.indexOf(PV.win)<0)PV.win=48;
+    pvZoomBlock(here,PV.win);          // the ▢ button's own move, at the fingers
+    toast('▢ กรอบ '+PV.win+'×'+PV.win+' · ลากเพื่อเลื่อน');
+    return;
+  }
+  if(PV.mode==='blocks'){
+    if(dir<0){PV.mode='plane';pvMode();toast('▦ เห็นทั้งระนาบแล้ว — ทุกบล็อกอยู่ในจอ');return}
+    const hit=ev?pvCellAt(ev):null;
+    if(!hit){toast('บีบนิ้วบนบล็อกที่อยากดูใกล้ ๆ');return}
+    pvZoomBlock(hit[2],12);            // one block IS 12x12 cells
+    return;
+  }
+  const i=PV_WINS.indexOf(PV.win);
+  if(dir>0){
+    if(i<=0){toast('กรอบ 12×12 เล็กสุดของกรอบแล้ว — ละเอียดกว่านี้ใช้ 🔍 แว่นขยาย');return}
+    PV.win=PV_WINS[i-1];
+  }else{
+    if(i<0||i>=PV_WINS.length-1){      // past the widest frame: back to the whole plane
+      PV.mode='blocks';pvMode();
+      toast('▩ ย่อออกสุดกรอบแล้ว — กลับไปผังบล็อกทั้งระนาบ');return;
+    }
+    PV.win=PV_WINS[i+1];
+  }
+  pvMode();toast('กรอบ '+PV.win+'×'+PV.win+' · ลากเพื่อเลื่อน');
+}
+/* The two-finger bookkeeping. A gesture is a POINTER GROUP, so the pointers in
+   it have to be counted — and the first finger is already down when the second
+   lands, which is why the drag it started has to be dropped explicitly: one
+   pointer that is both panning and pinching moves the frame twice per frame. */
+const pvPts=new Map();let pvPinch=null;
+function pvPinchDist(){const a=[...pvPts.values()];
+  return a.length<2?0:Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y)}
 pcv.onpointerdown=ev=>{
+  pvPts.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+  if(pvPts.size>=2){
+    PV.panDrag=null;PV.lens.drag=null;
+    PV.lens.moved=true;                       // a pinch is not a tap on the glass
+    pvPinch={anchor:pvPinchDist()};           // ...nor on the cell under it
+    PV.panSwallow=Date.now();
+    pvTopHide($('#plane-pop'));
+    return;
+  }
   const rect=pcv.getBoundingClientRect();
   // Grabbing the GLASS moves the glass; grabbing the canvas outside it moves
   // the FRAME under it. Two different things to hold, told apart by which one
@@ -2849,11 +2948,31 @@ pcv.onpointerdown=ev=>{
     pcv.setPointerCapture(ev.pointerId);
     return;
   }
+  // the block map pans too — the same drag, the same swallow, its own pair of
+  // coordinates, because its frame is measured in blocks rather than in cells
+  if(PV.mode==='blocks'){
+    PV.panDrag={x:ev.clientX,y:ev.clientY,bx:PV.bOrig.x,by:PV.bOrig.y,blocks:true};
+    pcv.setPointerCapture(ev.pointerId);
+    return;
+  }
   if(PV.mode!=='window')return;
   PV.panDrag={x:ev.clientX,y:ev.clientY,ox:PV.origin.wedge,oy:PV.origin.ring};
   pcv.setPointerCapture(ev.pointerId);
 };
 pcv.onpointermove=ev=>{
+  if(pvPts.has(ev.pointerId))pvPts.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+  if(pvPts.size>=2){
+    const d=pvPinchDist();
+    if(!pvPinch)pvPinch={anchor:d};
+    // the anchor moves WITH each step, so a long pinch walks several rungs of
+    // the ladder instead of zooming once and then doing nothing at all
+    if(pvPinch.anchor>4){
+      if(d/pvPinch.anchor>=PV_PINCH_OUT){pvPinch.anchor=d;pvZoomStep(1,ev)}
+      else if(d/pvPinch.anchor<=1/PV_PINCH_OUT){pvPinch.anchor=d;pvZoomStep(-1,ev)}
+    }
+    PV.panSwallow=Date.now();
+    return;
+  }
   if(PV.lens.on&&PV.lens.drag){
     const d=PV.lens.drag,step=pvLensPxPerCell();
     // the glass follows the POINTER at the base view's scale, not at the
@@ -2870,13 +2989,19 @@ pcv.onpointermove=ev=>{
   const step=pstep(),d=PV.panDrag;
   // dragging right shows what is to the LEFT, so the frame moves the other way
   const dw=Math.round((d.x-ev.clientX)/step),dr=Math.round((d.y-ev.clientY)/step);
-  if(dw||dr){
+  if(!dw&&!dr)return;
+  if(d.blocks){
+    PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};
+    PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,bx:PV.bOrig.x,by:PV.bOrig.y};
+  }else{
     PV.origin={wedge:pvWrap(d.ox+dw),ring:pvWrap(d.oy+dr)};
     PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,ox:PV.origin.wedge,oy:PV.origin.ring};
-    pvMode();
   }
+  pvMode();
 };
 pcv.onpointerup=ev=>{
+  pvPts.delete(ev.pointerId);
+  if(pvPts.size<2)pvPinch=null;
   if(PV.lens.on&&PV.lens.drag){
     const moved=PV.lens.moved;PV.lens.drag=null;
     try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
@@ -2892,6 +3017,13 @@ pcv.onpointerup=ev=>{
   // a pan is not a read: without this, sliding the frame would open whatever
   // cell the pointer happened to stop on
   if(moved)PV.panSwallow=Date.now();
+};
+// a cancelled pointer (a system gesture, the tab losing focus) must not leave
+// the frame held: a pan with no finger on it drags on the very next move
+pcv.onpointercancel=ev=>{
+  pvPts.delete(ev.pointerId);
+  if(pvPts.size<2)pvPinch=null;
+  if(!pvPts.size)PV.panDrag=null;
 };
 // ░ the zoom wheel. It snaps between REAL resolutions rather than scaling
 // continuously: between two stops the glass would be enlarging pixels, which
@@ -2966,6 +3098,10 @@ $('#pv-lens-zout').onclick=()=>pvLensZoom(-1);
 function pvZoomReset(){
   const wasNarrow=PV.mode!=='plane';
   PV.lens.z=1;
+  // the seam is part of the view: leaving the block map rotated to a place the
+  // reader only got to by dragging would make "show me the whole thing again"
+  // restore everything except the thing they actually moved
+  PV.bOrig={x:0,y:0};
   const here=PV.sel!=null?PV.sel:busiestCell();
   if(here!=null){PV.lens.wedge=here%144;PV.lens.ring=Math.floor(here/144)}
   if(wasNarrow){PV.mode='plane';pvMode()}
