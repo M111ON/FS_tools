@@ -203,6 +203,8 @@ aside h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--
 #hint{display:flex;align-items:center;gap:8px;padding:5px 12px;border-top:1px solid var(--line);background:var(--panel);font:10px var(--mono);color:var(--dim);flex:0 0 auto;overflow:hidden}
 #flushtip{margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;text-align:right}
 #to-sel{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;font:12px var(--mono);padding:3px 6px;max-width:130px;flex:0 0 auto}
+#sysline{flex:0 0 auto;padding:5px 14px;font:11px var(--mono);color:var(--fg);background:var(--panel);border-bottom:1px solid var(--line)}
+#sysline a{color:var(--acc)}
 #composer{display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px));background:var(--panel);flex:0 0 auto}
 #msg-in{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:12px;padding:11px 13px;font:15px/1.45 var(--mono);outline:none;resize:none;height:46px;max-height:32dvh;overflow-y:hidden}
 #msg-in:focus{border-color:var(--acc)}
@@ -450,6 +452,7 @@ button.send:disabled{opacity:.55;cursor:progress}
   <div id="tl-body">…</div>
 </div>
 <main>
+  <div id="sysline" hidden>ซ่อนบันทึกของระบบไว้ <b id="sys-n">0</b> รายการ (เส้นเชื่อม · รอยอ่าน) — <a href="#" id="sys-show">แสดง</a> · <span style="color:var(--dim)">ยังถูกใช้บนแผนที่ตามปกติ</span></div>
   <div id="feed"></div>
   <aside id="side">
     <section>
@@ -624,7 +627,18 @@ function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{ho
 function hash8(h){return h?h.slice(0,8):''}
 function tickOf(m){return m.seq==null?null:Math.floor(m.seq/CHUNK)}
 // what the filters admit, before the curator is consulted
+// a machine line is DATA ABOUT THE SYSTEM, not something someone said — a bond
+// ("this line uses that term"), a pointer ("someone read here"), an unbind.
+// The feed is for reading the conversation, so these collapse to one quiet row
+// per kind per chunk instead of one card each: at 25k lines a bond flood was
+// burying every real message. `machineAll` is the off-switch ("show system
+// records"), and a search that NAMES a hash must still find its card, which is
+// why the filter stays inside inScope() rather than the renderer.
+const MACHINE_KINDS=new Set(['bond','pointer','unbind']);
+let machineAll=false;
 function inScope(m){
+  if(!machineAll&&MACHINE_KINDS.has(m.kind||'')&&!filterQ)
+    return false;                    // data about the system: folded away by default
   return (!filterQ||(m.text||'').toLowerCase().includes(filterQ))&&
          (filterApps.size===0||filterApps.has(m.app));
 }
@@ -652,7 +666,10 @@ function parseBlockText(t){
 }
 function card(m){
   const kind=m.kind||'chat';
-  const kbadge=kind==='chat'?'':`<span class="badge kind">${esc(kind)}</span>`;
+  // the two card-shaped machine kinds get names a reader owns, not the wire's:
+  // a bond is a connection, a pointer is a record of a read
+  const KIND_TH={bond:'เส้นเชื่อม',pointer:'รอยอ่าน',unbind:'ยกเลิกเส้นเชื่อม',block:'ความจำ'};
+  const kbadge=kind==='chat'?'':`<span class="badge kind" title="${MACHINE_KINDS.has(kind)?'บันทึกของระบบ — เป็นข้อมูลที่แผนที่ใช้วาดเส้น/วง ไม่ใช่ข้อความคุย':''}">${KIND_TH[kind]||esc(kind)}</span>`;
   const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
   const quiet=!!(m.cur&&m.cur.h);
   const full=String(m.text==null?'':m.text);
@@ -662,6 +679,35 @@ function card(m){
       +`<span class="time">${fmt(m.t)}</span><span class="meta" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอก">#${m.seq==null?'–':m.seq}</span></div>`
       +`<div class="text"><b>▣ ${esc(bd.slug)}</b> <span style="color:var(--dim)">แก้ครั้งที่ ${bd.rev} · ${blkStatusTh(bd.status)}</span><br>${esc(bd.title)}</div>`
       +`<button class="more" data-blk="${esc(bd.slug)}">▣ เปิดในแผงก้อน — เรื่อง · วิธีการ · หลักฐาน</button></div>`;
+  }
+  if(kind==='bond'){
+    // `src rel dst` where src/dst are 64-hex: the human line is the RELATION.
+    // The hashes stay reachable — the click still copies — but they are no
+    // longer the first thing the eye lands on.
+    const p=full.match(/^([0-9a-f]{64}) (\S+) ([0-9a-f]{64})$/);
+    if(p){
+      const REL_TH={'x-uses-term':'อ้างถึงศัพท์ของอีกฝั่ง','x-hint-is-term':'หัวเรื่องคือศัพท์ของอีกฝั่ง',
+        'x-same-hint':'หัวเรื่องเดียวกัน','x-same-workspace':'พื้นที่ทำงานเดียวกัน',
+        'x-next-chunk':'ต่อเนื่องกัน','x-next-in-session':'ต่อเนื่องในเซสชันเดียวกัน',
+        'x-answers':'ตอบกลับ','uses':'ใช้','produces':'ผลิต','validates':'ยืนยัน',
+        'decides':'ตัดสิน','follows':'ตามหลัง','contradicts':'ขัดแย้ง'};
+      const rel=REL_TH[p[2]]||p[2];
+      return `<div class="msg quiet" data-m="${esc(m.hash||'')}"><div class="top">`
+        +`<span class="badge">${esc(m.app||'?')}</span>${kbadge}`
+        +`<span class="time">${fmt(m.t)}</span><span class="meta" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอก">#${m.seq==null?'–':m.seq}</span></div>`
+        +`<div class="text" title="คลิกซ้ายเพื่อดูต้นทางบนแผนที่">เชื่อมบันทึกสองชิ้น: ${esc(rel)}`
+        +`<span style="color:var(--dim)"> · ${hash8(p[1])} → ${hash8(p[3])} · คลิกที่ #ลำดับเพื่อคัดลอกรหัสเต็ม</span></div></div>`;
+    }
+  }
+  if(kind==='pointer'){
+    const p=full.match(/^point=(\d+) level=(\d+)$/);
+    if(p){
+      const lv=['ช่อง','บล็อก 12×12','ทั้งระนาบ'][+p[2]]||('ชั้น '+p[2]);
+      return `<div class="msg quiet" data-m="${esc(m.hash||'')}"><div class="top">`
+        +`<span class="badge">${esc(m.app||'?')}</span>${kbadge}`
+        +`<span class="time">${fmt(m.t)}</span><span class="meta" data-h="${esc(m.hash||'')}" title="คลิกเพื่อคัดลอก">#${m.seq==null?'–':m.seq}</span></div>`
+        +`<div class="text">อ่าน${esc(lv)}ที่ ${p[1]} · <span style="color:var(--dim)">จุดวงฟ้าบนแผนที่ = ที่ที่แอปนี้กำลังดูอยู่</span></div></div>`;
+    }
   }
   const lines=full.split('\n').length;
   // a card only earns a clamp if there is something worth hiding: a text that
@@ -686,6 +732,17 @@ function render(){
   // left: a chunk whose every line is noise still keeps its tick in the rail,
   // because a timeline that renumbers itself when you flip 🧹 is not a timeline
   const list=msgs.filter(inScope);
+  // the folded machine lines did not vanish — say where they went, and keep a
+  // door open: a reader who sees "6 system records" must be able to open them
+  // without hunting for a settings panel
+  const machineFolded=msgs.filter(m=>MACHINE_KINDS.has(m.kind||'')&&!inScope(m)).length;
+  const sys=$('#sysline');
+  if(sys){
+    sys.hidden=!machineFolded;
+    $('#sys-n').textContent=machineFolded;
+    $('#sys-show').onclick=e=>{e.preventDefault();machineAll=true;render()};
+    sys.title='เส้นเชื่อมและรอยอ่านเป็นข้อมูลของระบบ (ใช้วาดแผนที่) ไม่ใช่ข้อความคุย — กดแสดงเพื่อเห็นในฟีด';
+  }
   if(!list.length){
     feed.innerHTML=`<div class="empty">ไม่มีข้อความ${(filterQ||filterApps.size)?' ที่ตรงกับตัวกรอง':''}</div>`;
     paintPickers();paintTicks([]);paintCurator();return;
@@ -2319,9 +2376,22 @@ function pvPop(){
   if(PV.sel==null||!d){pvTopHide(pop);return}
   const keep=pvKeep();
   const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
-  let h='<div style="color:var(--warn)">point '+d.point+' · '+d.count+' line(s)</div>';
+  let h='<div style="color:var(--warn)">ที่อยู่ '+d.point+' · '+d.count+' บรรทัด</div>';
   (d.lines||[]).slice(0,2).forEach(m=>{
-    h+='<div class="pp">'+esc(m.app||'?')+' '+(m.kind&&m.kind!=='chat'?esc(m.kind)+' ':'')+esc((m.text||'').slice(0,90))+'</div>';
+    // the wire kind is OUR name for the record; the popup is a person's read,
+    // so it says what the record IS, and a bond line shows the RELATION —
+    // the hashes are what the plane is about, not what the line says
+    const kind=m.kind||'chat';
+    if(kind==='bond'){
+      const p=String(m.text||'').match(/^([0-9a-f]{64}) (\S+) ([0-9a-f]{64})$/);
+      h+='<div class="pp" style="color:var(--dim)">เส้นเชื่อม'+(p?' · '+esc(p[2]):'')+'</div>';
+      return;
+    }
+    if(kind==='pointer'){
+      h+='<div class="pp" style="color:var(--dim)">รอยอ่าน — มีคนเปิดที่อยู่นี้</div>';
+      return;
+    }
+    h+='<div class="pp">'+esc(m.app||'?')+' '+esc((m.text||'').slice(0,90))+'</div>';
   });
   mine.slice(0,4).forEach(b=>{
     const out=b.src_rkey===PV.sel;
@@ -2960,6 +3030,12 @@ pcv.onpointerdown=ev=>{
   pcv.setPointerCapture(ev.pointerId);
 };
 pcv.onpointermove=ev=>{
+  // A popup is anchored to the CELL the reader picked; the frame moves UNDER
+  // that cell when the map pans, so wherever the cell goes, the popup goes.
+  // Hiding it instead would read as "the thing I opened vanished" — the anchor
+  // following the drag is the honest answer (this is the same reason pvPop
+  // re-places itself on scroll/resize).
+  const anchored=PV.sel!=null&&PV.panDrag&&$('#plane-pop').matches(':popover-open');
   if(pvPts.has(ev.pointerId))pvPts.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
   if(pvPts.size>=2){
     const d=pvPinchDist();
@@ -2998,6 +3074,9 @@ pcv.onpointermove=ev=>{
     PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,ox:PV.origin.wedge,oy:PV.origin.ring};
   }
   pvMode();
+  // the popup rides its anchor through the pan — one re-place per move, the
+  // same call a scroll or a resize already makes
+  if(anchored)pvPop();
 };
 pcv.onpointerup=ev=>{
   pvPts.delete(ev.pointerId);
@@ -3012,7 +3091,7 @@ pcv.onpointerup=ev=>{
   }
   if(!PV.panDrag)return;
   const moved=Math.abs(ev.clientX-PV.panDrag.x)>2||Math.abs(ev.clientY-PV.panDrag.y)>2;
-  PV.panDrag=null;
+  PV.panDrag=null;PV.popRide=false;
   try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
   // a pan is not a read: without this, sliding the frame would open whatever
   // cell the pointer happened to stop on
@@ -3023,8 +3102,13 @@ pcv.onpointerup=ev=>{
 pcv.onpointercancel=ev=>{
   pvPts.delete(ev.pointerId);
   if(pvPts.size<2)pvPinch=null;
-  if(!pvPts.size)PV.panDrag=null;
+  if(!pvPts.size){PV.panDrag=null;PV.popRide=false}
 };
+// the drag can also END off-canvas — the pointer keeps moving after capture
+// only if it was captured, and capture is per-pointer: a release outside the
+// canvas still fires onpointerup, but a lost one (alt-tab, context menu) does
+// not. Guard the popup against a stuck PV.panDrag from any of those.
+window.addEventListener('blur',()=>{PV.panDrag=null;PV.popRide=false});
 // ░ the zoom wheel. It snaps between REAL resolutions rather than scaling
 // continuously: between two stops the glass would be enlarging pixels, which
 // is the opposite of what a viewport is for.

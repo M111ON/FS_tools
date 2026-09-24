@@ -53,3 +53,23 @@ dkms.conf
 
 # debug information files
 *.dwo
+.mcp.json
+
+# ── agent/IDE workspace state — local only, never project source ──
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.freebuff/
+.agentsroom/
+.cortexkit/
+.claude/
+.cursor/
+.gemini/
+.windsurf/
+graft/
+.agents/
+.playwright-mcp/
+.workspace/
+.wrangler/
