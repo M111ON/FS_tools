@@ -234,8 +234,14 @@ button.send:disabled{opacity:.55;cursor:progress}
    text: it names what to DO (not what a feature is), it ADVANCES on the
    reader doing that thing — not on a Next click alone — and once dismissed
    it stays dismissed, because a guide that reappears is a nag. */
-#tour{position:fixed;inset:0;z-index:70;background:rgba(1,4,9,.55);display:flex;align-items:flex-end;justify-content:center;padding:0 12px 96px}
-#tour-card{background:var(--panel);border:1px solid var(--acc);border-radius:14px;padding:14px 16px;max-width:460px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+/* The card must never OWN the screen it is teaching: a full-scrim guide over
+   the search box it just said to type into is a lock, not a lesson (and shipped
+   as one — the backdrop swallowed every click, so the acts it waits for were
+   unreachable). pointer-events:none on the shell, auto only on the card, and
+   the page stays live underneath; left-aligned so it stays off the canvas. */
+#tour{position:fixed;inset:0;z-index:70;display:flex;align-items:flex-end;justify-content:flex-start;padding:0 12px 96px 16px;pointer-events:none}
+#tour[hidden]{display:none}
+#tour-card{background:var(--panel);border:1px solid var(--acc);border-radius:14px;padding:14px 16px;max-width:430px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.6);pointer-events:auto}
 #tour-card b{color:var(--acc);font-size:14px}
 #tour-body{font:12px/1.6 var(--mono);color:var(--fg);margin-top:6px}
 #tour-body code{color:var(--warn);background:var(--panel2);border-radius:5px;padding:0 5px}
@@ -1251,7 +1257,6 @@ $('#tour-next').onclick=e=>{e.preventDefault();
   else{tourStep++;tourPaint()}
 };
 $('#tour-skip').onclick=e=>{e.preventDefault();tourClose(true)};
-$('#tour').addEventListener('mousedown',e=>{if(e.target.id==='tour')tourClose(true)});
 // the acts: one hook each, placed where the event already fires
 $('#q').addEventListener('input',()=>{if(tourFlags&&tourStep===0&&$('#q').value)tourFlags.searched=true;tourAdvance()});
 $('#open-plane').addEventListener('click',()=>{if(tourFlags){tourFlags.map=true;tourAdvance()}});

@@ -463,6 +463,15 @@ INVARIANTS = [
                       re.search(r"\$\('#tour-skip'\)\.onclick", js),
      "ข้าม must exist in the markup AND be wired — a dismiss link that renders "
      "but does nothing leaves the guide over the feed with no escape"),
+    ("the tour never owns the screen it is teaching",
+     lambda js, html: re.search(r"#tour\{[^}]*pointer-events:none", html) and
+                      re.search(r"#tour\[hidden\]\{display:none\}", html) and
+                      not re.search(r"#tour\{[^}]*background:rgba", html),
+     "the guide is a CARD, not a scrim. Shipped once as a full-screen backdrop: "
+     "hidden did nothing (display:flex beat it) and the backdrop swallowed "
+     "every click, so the acts the tour waits for were unreachable and the "
+     "whole page felt dead — กดอะไรไม่ได้. pointer-events:none on the shell, "
+     "auto only on the card; #tour[hidden] must beat display:flex"),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),
