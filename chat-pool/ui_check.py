@@ -436,6 +436,33 @@ INVARIANTS = [
      "must swallow the click (lifting two fingers would otherwise open whatever "
      "cell happened to be under them). Both failures look like 'the map jumped' "
      "— never like a missing line of code, and never on a desktop"),
+    # ── the tour: a guide that reappears is a nag, and one that cannot be
+    # dismissed is a trap — both fail invisibly on a machine that has already
+    # used the app once
+    ("the tour is shown once, then never again",
+     lambda js, html: all(re.search(p, js) for p in (
+         r"TOUR_KEY\s*=\s*'pool_tour_done'",
+         r"localStorage\.getItem\(TOUR_KEY\)",
+         r"localStorage\.setItem\(TOUR_KEY",
+         r"if\s*\(\s*!\s*localStorage\.getItem\(TOUR_KEY\)\s*\)")),
+     "the three-step guide must read pool_tour_done from localStorage before "
+     "showing and write it on dismiss. Without the read, every refresh walks a "
+     "returning reader through the basics again; without the write, there is no "
+     "way to ever be done with it"),
+    ("the tour advances on the act, not only the Next button",
+     lambda js, html: re.search(r"function tourAdvance", js) and
+                      re.search(r"tourFlags\.searched", js) and
+                      re.search(r"tourFlags\.map", js) and
+                      re.search(r"tourFlags\.pan", js),
+     "each step must have a `when()` watching the real action (a search typed, "
+     "the map opened, a pan performed). A tour that only moves on its own Next "
+     "button is a slideshow: it tells the reader about the search box without "
+     "ever noticing they used it"),
+    ("the tour has a way out that never returns",
+     lambda js, html: re.search(r"id=\"tour-skip\"", html) and
+                      re.search(r"\$\('#tour-skip'\)\.onclick", js),
+     "ข้าม must exist in the markup AND be wired — a dismiss link that renders "
+     "but does nothing leaves the guide over the feed with no escape"),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),

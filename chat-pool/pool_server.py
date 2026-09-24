@@ -228,6 +228,27 @@ button.send:disabled{opacity:.55;cursor:progress}
 @media (min-width:901px){#btn-side{display:none}#side-close{display:none}}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--acc);color:var(--acc);font:12px var(--mono);padding:8px 18px;border-radius:9px;opacity:0;transition:.3s;pointer-events:none}
 .toast.show{opacity:1}
+/* ── 🚶 the three-step tour — shown once, dismissed forever ─────────────
+   The app has five panels and one vocabulary; a first-time reader meets all
+   of them at once. Three things make this a tour and not another wall of
+   text: it names what to DO (not what a feature is), it ADVANCES on the
+   reader doing that thing — not on a Next click alone — and once dismissed
+   it stays dismissed, because a guide that reappears is a nag. */
+#tour{position:fixed;inset:0;z-index:70;background:rgba(1,4,9,.55);display:flex;align-items:flex-end;justify-content:center;padding:0 12px 96px}
+#tour-card{background:var(--panel);border:1px solid var(--acc);border-radius:14px;padding:14px 16px;max-width:460px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+#tour-card b{color:var(--acc);font-size:14px}
+#tour-body{font:12px/1.6 var(--mono);color:var(--fg);margin-top:6px}
+#tour-body code{color:var(--warn);background:var(--panel2);border-radius:5px;padding:0 5px}
+#tour-row{display:flex;align-items:center;gap:10px;margin-top:12px}
+#tour-skip{font:11px var(--mono);color:var(--dim)}
+#tour-skip:hover{color:var(--fg)}
+#tour-next{margin-left:auto}
+#tour-steps{display:flex;align-items:center;gap:6px;margin-bottom:9px}
+.tstep{width:22px;height:22px;border-radius:50%;border:1px solid var(--line);color:var(--dim);font:11px var(--mono);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.tstep.on{border-color:var(--acc);color:var(--acc);font-weight:700}
+.tstep.done{border-color:var(--acc);background:var(--acc);color:var(--bg)}
+.tbar{height:2px;flex:0 0 26px;background:var(--line)}
+.tbar.done{background:var(--acc)}
 .cloudwrap{max-height:0;overflow:hidden;transition:max-height .3s}
 .cloudwrap.open{max-height:400px;overflow-y:auto}
 .clabel{font-size:10px;color:var(--dim);cursor:pointer;user-select:none}
@@ -504,13 +525,24 @@ button.send:disabled{opacity:.55;cursor:progress}
 <div id="hint">
   <span>ส่งถึง</span>
   <select id="to-sel" title="ส่งถึงใคร — ทุกคน หรือเฉพาะแอปเดียว"><option value="all">→ ทุกคน</option></select>
-  <span id="flushtip" style="margin-left:auto" title="ทุกชั่วโมงระบบจะคัดลอกข้อความใหม่ไปไว้ในสำเนาที่ค้นหาได้เอง โดยไม่ต้องกดอะไร">สำเนาทุกชม. · <a href="#" id="flushnow" style="color:var(--acc2)">สำเนาเดี๋ยวนี้</a></span>
+  <span id="flushtip" style="margin-left:auto" title="ทุกชั่วโมงระบบจะคัดลอกข้อความใหม่ไปไว้ในสำเนาที่ค้นหาได้เอง โดยไม่ต้องกดอะไร">สำเนาทุกชม. ·  <a href="#" id="flushnow" style="color:var(--acc2)">สำเนาเดี๋ยวนี้</a> · <a href="#" id="tour-again" style="color:var(--acc2)">แนะนำการใช้งาน</a></span>
 </div>
 <div id="composer">
   <textarea id="msg-in" rows="1" placeholder="พิมพ์ข้อความ… (Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่) · @ชื่อ=ติดป้ายให้คนนั้น"></textarea>
   <button class="send" id="send">ส่ง</button>
 </div>
 <div class="toast" id="toast"></div>
+<div id="tour" hidden>
+  <div id="tour-card">
+    <div id="tour-steps"><span class="tstep" data-s="1">1</span><span class="tbar"></span><span class="tstep" data-s="2">2</span><span class="tbar"></span><span class="tstep" data-s="3">3</span></div>
+    <b id="tour-title"></b>
+    <div id="tour-body"></div>
+    <div id="tour-row">
+      <a href="#" id="tour-skip">ข้าม — ไม่ต้องแนะนำแล้ว</a>
+      <button class="pbtn" id="tour-next"></button>
+    </div>
+  </div>
+</div>
 <div id="plane-modal">
   <div id="plane-box">
     <div id="plane-head">
@@ -1163,6 +1195,74 @@ const PROTECT_TH={kind:'ไม่ใช่ข้อความคุย (เป
   mention:'มีการเรียกชื่อ',long:'ข้อความยาว',marker:'มีคำสำคัญอย่าง สรุป/ตัดสิน'};
 const protectTh=p=>PROTECT_TH[p]||p;
 window.toast=(t,detail)=>{const el=$('#toast');el.textContent=t;el.title=detail||'';el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1600)};
+/* ── 🚶 โหมดแนะนำ 3 ขั้น — โผล่ครั้งแรก ปิดได้ จำไว้ใน localStorage ───────
+   แอปนี้มีห้าแผงกับศัพท์ชุดหนึ่ง คนแรกเข้าเจอทุกอย่างพร้อมกัน สิ่งที่ทำให้
+   อันนี้เป็น "ทัวร์" ไม่ใช่กำแพงตัวหนังสืออีกอัน: มันบอกสิ่งที่ต้อง*ทำ*
+   (ไม่ใช่นิยามของฟีเจอร์) · มันคืบหน้าเมื่อคนอ่านทำสิ่งนั้นจริง ไม่ใช่เมื่อ
+   กดปุ่มถัดไป · และเมื่อปิดแล้วมันเงียบตลอด — คู่มือที่โผล่ซ้ำคือการรบกวน */
+const TOUR_KEY='pool_tour_done';
+const TOUR_STEPS=[
+  {title:'1 · ค้นข้อความ',body:'พิมพ์ในช่อง <code>กรองข้อความ…</code> ด้านบน — เหลือเฉพาะที่ตรงกัน '
+    +'ทันที (ค้นด้วยรหัสยาว 64 ตัวก็เจอ แม้บันทึกนั้นถูกพับไว้)',
+    when:()=>tourFlags.searched},
+  {title:'2 · ดูบนแผนที่',body:'กดปุ่ม <code>▦ แผนที่</code> ด้านบน — ทุกบรรทัดมีที่อยู่ '
+    +'ของตัวเอง ช่องแน่น = บรรทัดเยอะ กดช่องเพื่อเปิดดูว่ามีอะไรอยู่ตรงนั้น',
+    when:()=>tourFlags.map},
+  {title:'3 · ลากดูเส้นเชื่อม',body:'บนแผนที่: ลาก = เลื่อนมุมมอง · เส้น = บันทึกที่อ้างถึงกัน '
+    +'· บีบสองนิ้ว = ซูม — ลองเลือกช่องที่มีเส้นผ่าน แล้วลากดูว่าเส้นวิ่งไปทางไหน',
+    when:()=>tourFlags.pan},
+];
+let tourFlags={searched:false,map:false,pan:false};
+let tourStep=0;
+function tourPaint(){
+  const t=$('#tour');if(!t||t.hidden)return;
+  $('#tour-title').textContent=TOUR_STEPS[tourStep].title;
+  $('#tour-body').innerHTML=TOUR_STEPS[tourStep].body;
+  $('#tour-next').textContent=tourStep>=TOUR_STEPS.length-1?'เริ่มใช้งาน':'ถัดไป ▸';
+  t.querySelectorAll('.tstep').forEach(s=>{
+    s.classList.toggle('on',+s.dataset.s===tourStep+1);
+    s.classList.toggle('done',+s.dataset.s<=tourStep);
+  });
+  t.querySelectorAll('.tbar').forEach((b,i)=>b.classList.toggle('done',i<tourStep));
+}
+function tourOpen(){
+  const t=$('#tour');if(!t)return;
+  tourStep=0;tourFlags={searched:false,map:false,pan:false};
+  t.hidden=false;tourPaint();
+}
+function tourClose(done){
+  const t=$('#tour');if(!t)return;
+  t.hidden=true;
+  if(done)localStorage.setItem(TOUR_KEY,'1');
+  toast('แนะนำสั้น ๆ อีกครั้งได้ที่ “☰ แผง → แนะนำการใช้งาน”');
+}
+function tourAdvance(){
+  // advance on the ACT, with a small grace so a single action cannot skip a
+  // step the reader has not read — and re-paint only on real movement
+  if(tourStep<TOUR_STEPS.length-1&&TOUR_STEPS[tourStep].when()){
+    tourStep++;tourPaint();
+    if(tourStep===TOUR_STEPS.length-1){
+      setTimeout(()=>{if(!$('#tour').hidden)tourClose(true)},20000);
+    }
+  }
+}
+$('#tour-next').onclick=e=>{e.preventDefault();
+  if(tourStep>=TOUR_STEPS.length-1)tourClose(true);
+  else{tourStep++;tourPaint()}
+};
+$('#tour-skip').onclick=e=>{e.preventDefault();tourClose(true)};
+$('#tour').addEventListener('mousedown',e=>{if(e.target.id==='tour')tourClose(true)});
+// the acts: one hook each, placed where the event already fires
+$('#q').addEventListener('input',()=>{if(tourFlags&&tourStep===0&&$('#q').value)tourFlags.searched=true;tourAdvance()});
+$('#open-plane').addEventListener('click',()=>{if(tourFlags){tourFlags.map=true;tourAdvance()}});
+// the canvas is defined LATER in this script, so the pan hook waits for it —
+// an init-order exception here would have killed every handler wired after
+window.addEventListener('load',()=>{
+  pcv.addEventListener('pointerdown',()=>{if(tourFlags&&PV.mode!=='plane')tourFlags.pan=true;tourAdvance()});
+});
+// ☰ panel: come back later — the reader asked for it once, it must exist
+$('#tour-again').onclick=e=>{e.preventDefault();sideOpen(false);tourOpen()};
+if(!localStorage.getItem(TOUR_KEY))setTimeout(tourOpen,900);   // let the feed breathe first
 
 $('#q').oninput=e=>{filterQ=e.target.value.toLowerCase();render()};
 $('#apps-sel').onchange=e=>{filterApps=new Set(e.target.value?[e.target.value]:[]);render()};
