@@ -318,6 +318,101 @@ def seam_roundtrip(js):
     return ""
 
 
+TORUS_PROBE = r"""
+const T144=144;
+const PV={mode:'plane',n:144,origin:null,bOrig:{x:0,y:0},win:24};
+function pstep(){return 8}
+const fails=[];
+function near(a,b,eps){return Math.abs(a-b)<=eps}
+function run(){
+// plane: a seam-crossing pair 1 cell apart across the rim must be ~1 cell apart
+let e=pvEdgeEnds(10*144+0,11*144+143);
+let gap=(e[1][0]-e[0][0])/8;
+if(!near(gap,-1,0.01))fails.push('plane seam pair gap='+gap+' (want -1: shortest path across the rim)');
+// plane: a NORMAL pair 4 cells apart stays 4 cells apart
+const e4=pvEdgeEnds(10*144+50,10*144+54);
+if(!near((e4[1][0]-e4[0][0])/8,4,0.01))fails.push('plane normal pair gap='+((e4[1][0]-e4[0][0])/8));
+// window: pair 4 cells apart stays 4; a pair that straddles the origin seam
+// takes the short way (-2), never the long way (+142). PV.n must follow the
+// mode: the page's pvMode() sets it, and this probe has no pvMode.
+PV.mode='window';PV.n=24;PV.origin={wedge:100,ring:100};
+const ew=pvEdgeEnds(100*144+100,100*144+104);
+if(!near((ew[1][0]-ew[0][0])/8,4,0.01))fails.push('window normal pair gap='+((ew[1][0]-ew[0][0])/8));
+const ws=pvEdgeEnds(100*144+102,100*144+((98)%144));
+if(!near((ws[1][0]-ws[0][0])/8,-4,0.01))fails.push('window seam pair gap='+((ws[1][0]-ws[0][0])/8)+' (want -4)');
+// window: an edge whose far end is outside the frame must still RETURN ends
+// (canvas clips the line) as long as some part can touch the view
+const eo=pvEdgeEnds(100*144+112,100*144+118);
+if(!eo)fails.push('window: edge leaving the frame was dropped instead of clipped');
+// blocks: block (0,0) -> block (11,0) is ONE block across the seam, on-screen
+PV.mode='blocks';PV.n=12;PV.origin=null;
+const eb=pvEdgeEnds(0,11*12);
+const bg=(eb[1][0]-eb[0][0])/8;   // in the blocks branch positions are BLOCK units x pstep
+if(!near(bg,11,0.01))fails.push('blocks seam pair gap='+bg+' blocks (want 11: the visible rim image)');
+if(eb[0][0]<0||eb[1][0]<0)fails.push('blocks: seam image drawn off-canvas');
+// re-entry: on the full plane an edge that runs off one rim must be painted a
+// second time entering from the opposite rim — the torus promise. Back to
+// plane mode FIRST: the blocks branch above left PV.n at 12.
+PV.mode='plane';PV.n=144;
+e=pvEdgeEnds(10*144+0,11*144+143);
+const ox=(Math.max(e[0][0],e[1][0])>144*8)?-144*8:(Math.min(e[0][0],e[1][0])<0?144*8:0);
+const oy=(Math.max(e[0][1],e[1][1])>144*8)?-144*8:(Math.min(e[0][1],e[1][1])<0?144*8:0);
+if(!(ox||oy))fails.push('plane: seam-crossing edge produced no far-rim re-entry image');
+const r1=[e[0][0]+ox,e[0][1]+oy],r2=[e[1][0]+ox,e[1][1]+oy];
+const inside=(p)=>p[0]>=-8&&p[0]<=144*8+8&&p[1]>=-8&&p[1]<=144*8+8;
+if(!inside(r1)&&!inside(r2))fails.push('plane: re-entry image did not land on the canvas');
+}
+try{run()}catch(err){fails.push('probe crashed: '+err.message)}
+console.log(fails.length?fails.join('\n')+' :: '+fails.length:'OK :: 0');
+"""
+
+
+def torus_edges(js):
+    """Run pvEdgeEnds under node and check the torus arithmetic.
+
+    The old path dropped every edge whose endpoint fell outside the frame, so a
+    line whose far end slipped past the seam simply vanished — it never came
+    back on the other side, which is exactly what a reader expects the plane's
+    wrap to do. This probe RUNS the function: a seam pair 1 cell apart must be
+    1 cell apart on screen (the old pairing drew it 140 cells away), a pair
+    leaving a window frame must be clipped rather than dropped, and the block
+    map's seam image must land on the visible rim, not off-canvas.
+    """
+    node = shutil.which("node")
+    if not node:
+        return ""
+    need = ["function pvEdgeEnds(", "function pvCenterRaw(", "function torusNear(",
+            "function pvB(v){", "function torusDx(", "function pvXY(rk){",
+            "function pvWrap(v){"]
+    parts = []
+    for marker in need:
+        i = js.find(marker)
+        if i < 0:
+            return ("%s must still be in the script: it is part of the edge "
+                    "placement that decides whether a seam-crossing line wraps, "
+                    "clips or vanishes" % marker[:-2])
+        j = js.find("\nfunction ", i + 1)
+        j2 = js.find("\n/* ", i + 1)
+        ends = [x for x in (j, j2) if x > 0]
+        parts.append(js[i:min(ends) if ends else len(js)].rstrip())
+    d = tempfile.mkdtemp(prefix="ui-torus-")
+    tmp = os.path.join(d, "torus.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts) + "\n" + TORUS_PROBE)
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0:
+        return "the torus probe would not run: " + (r.stdout + r.stderr).strip()[:400]
+    bad, _, n = r.stdout.strip().rpartition(" :: ")
+    if n != "0":
+        return ("%s edge placements disagree with the torus the map draws: "
+                "a line crossing the rim must take the shortest path and "
+                "re-enter on the far side of the FULL plane\n    %s" % (n, bad[:600]))
+    return ""
+
+
 def frame_sizes(js, html):
     """(the pinch ladder, the frame picker's options) — two lists that must match.
 
@@ -531,6 +626,15 @@ INVARIANTS = [
      "replay at line 20k and pressing again threw the reader back to the "
      "start. ⏸/▶ is a PAUSE: resume continues from the line on screen; only "
      "a replay that reached the live edge (or a view parked there) starts over"),
+    ("edges cross the seam by the shortest path and re-enter on the far rim",
+     lambda js, html: torus_edges(js) == ""
+                       and "[a[0]+ox,a[1]+oy],[z[0]+ox,z[1]+oy]" in js,
+     lambda js, html: torus_edges(js) or
+                      ("the seam re-entry push is gone from pvEdgeStrokesOf — a "
+                       "line that runs off the full plane's rim is no longer "
+                       "painted a second time entering from the opposite rim")
+                      if "[a[0]+ox,a[1]+oy],[z[0]+ox,z[1]+oy]" not in js
+                      else torus_edges(js)),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),

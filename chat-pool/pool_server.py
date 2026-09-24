@@ -1573,6 +1573,67 @@ function pvCenter(rk){
   const step=pstep();
   return[x*step+step/2,y*step+step/2];
 }
+/* Screen position of a plane-cell coordinate WITHOUT bounds — the caller
+   (pvEdgeEnds) has already chosen the torus image, and an end outside the
+   canvas is exactly how a seam-crossing edge must be drawn: canvas clips the
+   line, and the wrapped copy enters from the far side. */
+function pvCenterRaw(x,y){const step=pstep();return[x*step+step/2,y*step+step/2]}
+/* nearest torus image of a raw delta: v wrapped into (-T144/2, T144/2] */
+function torusNear(v){let d=((v%T144)+T144)%T144;if(d>T144/2)d-=T144;return d}
+/* Both ends of an edge in SCREEN pixels, torus-correct.
+
+   The old path dropped any edge whose endpoint fell outside the frame
+   (pvCenter -> null), so a line whose far end slipped past the seam simply
+   VANISHED — and never re-entered on the other side, which is what the torus
+   promises. The fix keeps the edge's true shape instead:
+   - the anchor end takes its image nearest the window centre;
+   - the far end is placed at anchor + SHORTEST torus delta, so cells that are
+     neighbours stay neighbours even when the naive wrap put them on opposite
+     sides (a pair 4 cells apart was once drawn 140 cells apart!).
+   A segment that cannot touch the canvas at all returns null — the one cheap
+   reject, equivalent to the old drop but only for genuinely invisible edges. */
+function pvEdgeEnds(src,dst){
+  const step=pstep(),px=PV.n*step;
+  if(PV.mode==='plane'){
+    const ax=src%144,ay=Math.floor(src/144);
+    let bx=dst%144,by=Math.floor(dst/144);
+    if(Math.abs(bx-ax)>T144/2)bx+=(bx>ax?-T144:T144);
+    if(Math.abs(by-ay)>T144/2)by+=(by>ay?-T144:T144);
+    const a=pvCenterRaw(ax,ay),z=pvCenterRaw(bx,by);
+    if((Math.max(a[0],z[0])<0&&Math.min(a[0],z[0])+step<0)||
+       (Math.min(a[0],z[0])>px&&Math.max(a[0],z[0])-step>px))return null;
+    if((Math.max(a[1],z[1])<0&&Math.min(a[1],z[1])+step<0)||
+       (Math.min(a[1],z[1])>px&&Math.max(a[1],z[1])-step>px))return null;
+    return[a,z];
+  }
+  if(PV.mode==='blocks'){
+    const o=PV.bOrig;
+    const abx=Math.floor((src%144)/12),aby=Math.floor(src/144/12);
+    const ax=pvB(abx-o.x),ay=pvB(aby-o.y);
+    // block deltas wrap at TWELVE blocks, not 144 cells: the shortest path
+    // between block columns 0 and 11 is one block across the seam
+    let ddx=(((dst%144)/12|0)-abx)%12;if(ddx<0)ddx+=12;if(ddx>6)ddx-=12;
+    let ddy=((Math.floor(dst/144/12)-aby)%12+12)%12;if(ddy>6)ddy-=12;
+    // the block map shows the WHOLE 12-block ring, so when the nearest image
+    // lands off-canvas and the opposite one (±12) is the visible rim, flip:
+    // block 11 sits ON SCREEN at the right rim — draw to it, not off the left
+    let bx=ax+ddx,by=ay+ddy;
+    if(bx<0)bx+=12;else if(bx>=12)bx-=12;
+    if(by<0)by+=12;else if(by>=12)by-=12;
+    const a=pvCenterRaw(ax,ay),z=pvCenterRaw(bx,by);
+    if(Math.max(a[0],z[0])<0||Math.min(a[0],z[0])>px||
+       Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>px)return null;
+    return[a,z];
+  }
+  const n=PV.n,o=PV.origin||{wedge:0,ring:0},half=Math.floor(n/2);
+  const aw=src%144,ar=Math.floor(src/144);
+  const ax=half+torusNear(aw-o.wedge-half),ay=half+torusNear(ar-o.ring-half);
+  const bx=ax+torusDx(aw,dst%144),by=ay+torusDx(ar,Math.floor(dst/144));
+  const a=pvCenterRaw(ax,ay),z=pvCenterRaw(bx,by);
+  if(Math.max(a[0],z[0])<0||Math.min(a[0],z[0])>px||
+     Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>px)return null;
+  return[a,z];
+}
 function pvDegrees(edges){
   const d={};
   edges.forEach(e=>{
@@ -1670,16 +1731,9 @@ function pvEdgeStrokesOf(edges,keep,style){
                     :'rgba('+(e.kind==='lifted'?'188,140,255':'121,192,255')+','+alpha.toFixed(3)+')')});
   };
   edges.forEach(e=>{
-    let a=pvCenter(e.src_rkey),z=pvCenter(e.dst_rkey);
-    if(!a||!z)return;                          // only edges fully inside this view
-    /* torus wrap: if the direct distance > half the plane, draw the short
-       path across the seam instead.  We pick the endpoint (a or z) that
-       is near an edge and shift it by ±T144 so the line wraps. */
-    if(PV.mode==='plane'&&PV.n===144){
-      const dx=Math.abs(a[0]-z[0]),dy=Math.abs(a[1]-z[1]);
-      if(dx>T144/2){const shift=a[0]>z[0]?T144:-T144;z=[z[0]+shift,z[1]]}
-      if(dy>T144/2){const shift=a[1]>z[1]?T144:-T144;z=[z[0],z[1]+shift]}
-    }
+    const ends=pvEdgeEnds(e.src_rkey,e.dst_rkey);
+    if(!ends)return;                           // cannot touch this view at all
+    const[a,z]=ends;
     let alpha=0.5;
     if(keep){
       const s=keep.has(e.src_rkey),d=keep.has(e.dst_rkey);
@@ -1695,6 +1749,20 @@ function pvEdgeStrokesOf(edges,keep,style){
     if(style==='density'&&!hot(e))
       alpha=Math.min(alpha,Math.max(0.08,0.5/Math.sqrt(Math.max(deg[e.src_rkey]||1,deg[e.dst_rkey]||1))));
     push(e,a,z,alpha,1);
+    /* seam re-entry: on the FULL plane the rim is a seam, so a line that runs
+       off one side must RE-ENTER on the other — that is the torus promise the
+       reader is asking about. In plane mode an overhang happens exactly for
+       seam-crossing pairs (every other edge sits inside the canvas), so the
+       overhang test is the cheap filter for which edges earn a second image.
+       Window/block views are a magnified PATCH, not the whole torus: their
+       far side is NOT adjacent (96 more cells sit in between), so a re-entry
+       there would lie about the geometry — those stay clipped. */
+    if(PV.mode==='plane'){
+      const px2=PV.n*step;
+      const ox=Math.max(a[0],z[0])>px2?-T144*step:(Math.min(a[0],z[0])<0?T144*step:0);
+      const oy=Math.max(a[1],z[1])>px2?-T144*step:(Math.min(a[1],z[1])<0?T144*step:0);
+      if(ox||oy)push(e,[a[0]+ox,a[1]+oy],[z[0]+ox,z[1]+oy],alpha,1);
+    }
   });
   Object.values(groups).forEach(g=>push(g.e,g.a,g.z,Math.min(0.42,g.alpha),1+Math.min(3,Math.log2(g.n))));
   out.sort((p,q)=>(p.hot?1:0)-(q.hot?1:0));     // the selected cell's edges read last = on top
