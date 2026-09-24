@@ -1206,4 +1206,12 @@ error_check  6/6 PASS   curator_check  37/37   reconnect_check 14/14   latency_c
 
 ตรวจโดย `ui_check.py` invariant ที่ 26 (gate: เปิดเฉพาะจาก `openPoint`) และที่ 27 (anchor บล็อกไม่ถูกเขียนทับ)
 
+## 37. popup เกาะเซลล์ตอนลาก · ไม่ rebuild ทุก move
+
+อาการ: ลากแผนที่ทั้งที่ popup เปิดอยู่ — เดิมเรียก `pvPop()` ทุก move → สร้างเนื้อหาใหม่ทุกครั้ง ปุ่ม/scroll หาย และ popup กระโดดทีละเซลล์ขณะที่ผังไถต่อเนื่อง
+
+แก้ด้วย **popup ride**: `pvPopRideGrab()` จำตำแหน่ง popup ตอน pointerdown (`ppx/ppy`) แล้ว `pvPopRide()` ขยับ popup ด้วย raw hand delta ชุดเดียวกับ `pvPanRide` ทุก move — ย้ายตำแหน่งอย่างเดียว ไม่ rebuild ไม่ rewire เหลือแค่ clamp ขอบจอ ปล่อยมือ (`pointerup`/`cancel`) ค่อย snap ลง anchor ทีเดียวด้วย `pvPop()`
+
+ตรวจโดย `ui_check.py` invariant ที่ 26 ครึ่ง ride: มี `pvPopRide` คณิต `d.ppx+(ev.clientX-d.x)` ไม่มี `if(anchored)pvPop();` ใน move และมี snap ใน `onpointerup`
+
 

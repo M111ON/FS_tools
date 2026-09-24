@@ -640,17 +640,22 @@ INVARIANTS = [
      lambda js, html: seam_roundtrip(js)),
     ("the popup only opens on a deliberate read",
      lambda js, html: (re.search(r"if\s*\(!PV\.popWant&&!pop\.matches\(':popover-open'\)\)return", js)
-                       and "if(anchored)pvPop();" in block(js, "pcv.onpointermove=ev=>{",
-                                                              "/* The map moves in WHOLE CELLS")
+                       and "function pvPopRide(d,ev){" in js
+                       and "d.ppx+(ev.clientX-d.x)" in js
+                       and "d.ppy+(ev.clientY-d.y)" in js
+                       and "if(anchored)pvPop();" not in js
                        and "pvDraw();pvInfo();pvPop();pvLensInfo();" not in js
+                       and "if($('#plane-pop').matches(':popover-open'))pvPop();" in block(js, "pcv.onpointerup=ev=>{", "pcv.onpointercancel")
                        and js.count("PV.popWant=true") == 1
                        and "PV.popWant=true;" in block(js, "async function openPoint(rk,path){",
                                                               "// The shape of a node")),
      "the popup is a read's answer, not a refresh's side effect: without the "
      "PV.popWant gate every pan, resize and refetch re-opened #plane-pop over "
      "the map the reader was still looking at (ชอบขึ้นมาบัง). Only openPoint "
-     "— a successful cell read — may set PV.popWant=true; every other pvPop "
-     "caller may only re-place a popup that is already open"),
+     "— a successful cell read — may set PV.popWant=true; and during a pan "
+     "the open popup must RIDE the hand by raw delta (pvPopRide), never be "
+     "rebuilt per move — a rebuild wipes its buttons, loses its scroll and "
+     "jumps whole cells while the canvas glides"),
     ("a blocks drag keeps the pointerdown anchor",
      lambda js, html: ("PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};" in js
                        and "bx:" not in block(js, "if(d.blocks){", "}else{")

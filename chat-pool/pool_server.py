@@ -3247,11 +3247,13 @@ pcv.onpointerdown=ev=>{
   // coordinates, because its frame is measured in blocks rather than in cells
   if(PV.mode==='blocks'){
     PV.panDrag={x:ev.clientX,y:ev.clientY,bx:PV.bOrig.x,by:PV.bOrig.y,blocks:true};
+    pvPopRideGrab(PV.panDrag);
     pcv.setPointerCapture(ev.pointerId);
     return;
   }
   if(PV.mode!=='window')return;
   PV.panDrag={x:ev.clientX,y:ev.clientY,ox:PV.origin.wedge,oy:PV.origin.ring};
+  pvPopRideGrab(PV.panDrag);
   pcv.setPointerCapture(ev.pointerId);
 };
 pcv.onpointermove=ev=>{
@@ -3304,12 +3306,12 @@ pcv.onpointermove=ev=>{
   // the pointerdown's own bx/by; only bOrig moves.
   const dw=Math.round((d.x-ev.clientX)/step),dr=Math.round((d.y-ev.clientY)/step);
   if(d.blocks){
-    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
+    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);if(anchored)pvPopRide(d,ev);return}
     PV._dw=dw;PV._dr=dr;
     PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};
     PV.panDrag={...d};                      // spread keeps the ORIGINAL anchor
   }else{
-    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
+    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);if(anchored)pvPopRide(d,ev);return}
     PV._dw=dw;PV._dr=dr;
     PV.origin={wedge:pvWrap(d.ox+dw),ring:pvWrap(d.oy+dr)};
     PV.panDrag={...d};
@@ -3327,9 +3329,10 @@ pcv.onpointermove=ev=>{
   // anchor below; opening one is a read's job, not a pan's.
   pvDraw();pvInfo();pvLensInfo();
   pvPanRide(d,ev,dw,dr,step);
-  // the popup rides its anchor through the pan — one re-place per move, the
-  // same call a scroll or a resize already makes
-  if(anchored)pvPop();
+  // the popup rides its anchor through the pan — the same raw hand delta the
+  // canvas ride uses, on EVERY move, so it tracks 1:1 instead of jumping one
+  // whole cell per step and freezing between; the release snaps it exactly
+  if(anchored)pvPopRide(d,ev);
 };
 /* The map moves in WHOLE CELLS (an address is a cell), but the hand moves in
    pixels. Without the fractional ride below, a hand hovering near a cell
@@ -3348,6 +3351,30 @@ function pvPanRideClear(){
   PV._dw=null;PV._dr=null;
   if(pcv.style.transform)pcv.style.transform='';
 }
+/* Where the open popup sits when a drag starts — the ride below moves it by
+   the raw hand delta from here, so it stays glued to its anchor cell without
+   rebuilding anything mid-drag. A rect, not style.left: always available. */
+function pvPopRideGrab(d){
+  const pop=$('#plane-pop');
+  if(!pop.matches(':popover-open'))return;
+  const r=pop.getBoundingClientRect();
+  d.ppx=r.left;d.ppy=r.top;
+}
+/* The popup's half of the fractional ride: the painted anchor tracks the hand
+   1:1 (that is the whole point of pvPanRide), so the open popup must move by
+   the SAME raw delta — not by whole-cell steps, or it lags half a cell behind
+   and jumps. Pure position: content cannot change mid-pan (no fetch ran), so
+   no rebuild, no rewire, no scroll loss; only the viewport edges still clamp.
+   The release snaps exactly (see onpointerup). */
+function pvPopRide(d,ev){
+  const pop=$('#plane-pop');
+  if(d.ppx==null||!pop.matches(':popover-open'))return;
+  const vw=window.innerWidth||document.documentElement.clientWidth;
+  const vh=window.innerHeight||document.documentElement.clientHeight;
+  const pw=pop.offsetWidth,ph=pop.offsetHeight;
+  pop.style.left=Math.max(10,Math.min(d.ppx+(ev.clientX-d.x),vw-pw-10))+'px';
+  pop.style.top=Math.max(10,Math.min(d.ppy+(ev.clientY-d.y),vh-ph-10))+'px';
+}
 pcv.onpointerup=ev=>{
   pvPts.delete(ev.pointerId);
   if(pvPts.size<2)pvPinch=null;
@@ -3364,6 +3391,9 @@ pcv.onpointerup=ev=>{
   if(!PV.panDrag)return;
   const moved=Math.abs(ev.clientX-PV.panDrag.x)>2||Math.abs(ev.clientY-PV.panDrag.y)>2;
   PV.panDrag=null;PV.popRide=false;
+  // the popup rode the hand by raw delta; snap it to the stepped anchor once —
+  // one exact re-place per drag (re-clamped), not one rebuild per move
+  if($('#plane-pop').matches(':popover-open'))pvPop();
   try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
   // a pan is not a read: without this, sliding the frame would open whatever
   // cell the pointer happened to stop on
@@ -3376,6 +3406,8 @@ pcv.onpointercancel=ev=>{
   if(pvPts.size<2)pvPinch=null;
   if(!pvPts.size){PV.panDrag=null;PV.popRide=false}
   pvPanRideClear();
+  // a cancelled drag still stepped the origin: the ride offset is stale, snap
+  if($('#plane-pop').matches(':popover-open'))pvPop();
 };
 // the drag can also END off-canvas — the pointer keeps moving after capture
 // only if it was captured, and capture is per-pointer: a release outside the
