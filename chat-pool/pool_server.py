@@ -2990,6 +2990,9 @@ async function pvCensus(){
   }catch(e){toast('โหลดแพทเทินไม่สำเร็จ — ลองอีกครั้ง')}
 }
 pcv.onmousemove=ev=>{
+  // a drag owns the pointer: the tooltip mid-pan is noise over a moving map,
+  // and its per-frame layout reads (offsetWidth) fight the redraw
+  if(PV.panDrag||PV.lens.drag)return;
   const tip=$('#plane-tip'),hit=pvCellAt(ev);
   if(!hit){pvTopHide(tip);return}
   const [x,y,rk]=hit,n=pvCountAt(x,y,rk);
@@ -3139,6 +3142,9 @@ function pvPinchDist(){const a=[...pvPts.values()];
   return a.length<2?0:Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y)}
 pcv.onpointerdown=ev=>{
   pvPts.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+  // a new drag starts its ride from zero: a stale _dw from the previous drag
+  // would let the first move take the ride-only path and skip its origin step
+  pvPanRideClear();
   if(pvPts.size>=2){
     PV.panDrag=null;PV.lens.drag=null;
     PV.lens.moved=true;                       // a pinch is not a tap on the glass
@@ -3208,24 +3214,55 @@ pcv.onpointermove=ev=>{
   }
   if(!PV.panDrag)return;
   const step=pstep(),d=PV.panDrag;
-  // dragging right shows what is to the LEFT, so the frame moves the other way
+  // dragging right shows what is to the LEFT, so the frame moves the other way.
+  // dw is measured from the ORIGINAL pointerdown coords every time — no per-step
+  // rewriting of the anchor, so a slow wiggle can never accumulate error
   const dw=Math.round((d.x-ev.clientX)/step),dr=Math.round((d.y-ev.clientY)/step);
-  if(!dw&&!dr)return;
   if(d.blocks){
+    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
+    PV._dw=dw;PV._dr=dr;
     PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};
-    PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,bx:PV.bOrig.x,by:PV.bOrig.y};
+    PV.panDrag={...d,bx:PV.bOrig.x,by:PV.bOrig.y};
   }else{
+    if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
+    PV._dw=dw;PV._dr=dr;
     PV.origin={wedge:pvWrap(d.ox+dw),ring:pvWrap(d.oy+dr)};
-    PV.panDrag={...d,x:d.x+dw*step,y:d.y+dr*step,ox:PV.origin.wedge,oy:PV.origin.ring};
+    PV.panDrag={...d};
   }
-  pvMode();
+  /* A pan changes WHERE you look, not WHAT exists: no fetch ran, PV.cells did
+     not move, time did not move. pvMode() would still re-derive the cells,
+     redraw the base, recount all 25k timeline rows into the ribbon (measured
+     11.5ms per step — a whole frame's budget — which is the twitch of a map
+     dragged across a full plane). The light path below draws only what the
+     pan actually changed: origin is in pvBaseKey, so pvDraw re-paints from the
+     cached base where it differs; pvInfo/pvPop re-speak the new position. */
+  pvDraw();pvInfo();pvPop();pvLensInfo();
+  pvPanRide(d,ev,dw,dr,step);
   // the popup rides its anchor through the pan — one re-place per move, the
   // same call a scroll or a resize already makes
   if(anchored)pvPop();
 };
+/* The map moves in WHOLE CELLS (an address is a cell), but the hand moves in
+   pixels. Without the fractional ride below, a hand hovering near a cell
+   boundary flips dw between n and n+1 with every 1px wiggle — the map jumps a
+   whole cell back and forth repeatedly, which is exactly "ลากแล้วเด้งไปมา".
+   The ride paints the BETWEEN-steps remainder as a CSS translate: the picture
+   tracks the hand 1:1 continuously, and when the remainder crosses a full cell
+   the origin steps and the translate resets to zero — no visible jump, because
+   the picture was already drawn there. Cleared on release. */
+function pvPanRide(d,ev,dw,dr,step){
+  const fx=(ev.clientX-d.x)+dw*step, fy=(ev.clientY-d.y)+dr*step;
+  pcv.style.transform=(Math.abs(fx)>.5||Math.abs(fy)>.5)
+    ?'translate('+fx.toFixed(1)+'px,'+fy.toFixed(1)+'px)':'';
+}
+function pvPanRideClear(){
+  PV._dw=null;PV._dr=null;
+  if(pcv.style.transform)pcv.style.transform='';
+}
 pcv.onpointerup=ev=>{
   pvPts.delete(ev.pointerId);
   if(pvPts.size<2)pvPinch=null;
+  pvPanRideClear();
   if(PV.lens.on&&PV.lens.drag){
     const moved=PV.lens.moved;PV.lens.drag=null;
     try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
@@ -3249,12 +3286,13 @@ pcv.onpointercancel=ev=>{
   pvPts.delete(ev.pointerId);
   if(pvPts.size<2)pvPinch=null;
   if(!pvPts.size){PV.panDrag=null;PV.popRide=false}
+  pvPanRideClear();
 };
 // the drag can also END off-canvas — the pointer keeps moving after capture
 // only if it was captured, and capture is per-pointer: a release outside the
 // canvas still fires onpointerup, but a lost one (alt-tab, context menu) does
 // not. Guard the popup against a stuck PV.panDrag from any of those.
-window.addEventListener('blur',()=>{PV.panDrag=null;PV.popRide=false});
+window.addEventListener('blur',()=>{PV.panDrag=null;PV.popRide=false;pvPanRideClear()});
 // ░ the zoom wheel. It snaps between REAL resolutions rather than scaling
 // continuously: between two stops the glass would be enlarging pixels, which
 // is the opposite of what a viewport is for.

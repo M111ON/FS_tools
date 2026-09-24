@@ -501,6 +501,24 @@ INVARIANTS = [
      "row beside the very canvas it zoomed — chrome crowding the thing it "
      "controls. A compact always-vertical column reads as the up/down ladder "
      "it is, and stays clear of the map"),
+    ("a pan redraws lightly and rides the hand between whole cells",
+     lambda js, html: (not re.search(r"pvMode\(\);", block(js, "if(!PV.panDrag)return;",
+                                                      "/* The map moves in WHOLE CELLS"))
+                       and "function pvPanRide(" in js
+                       and "pvPanRide(d,ev,dw,dr,step);" in block(js, "if(!PV.panDrag)return;",
+                                                                 "/* The map moves in WHOLE CELLS")
+                       and all("pvPanRideClear()" in block(js, a, b)
+                               for a, b in (("pcv.onpointerdown=ev=>{", "pvPts.size>=2"),
+                                            ("pcv.onpointerup=ev=>{", "if(PV.lens.on&&PV.lens.drag)"),
+                                            ("pcv.onpointercancel=ev=>{", "};")))),
+     "two measured pan defects: (1) every whole-cell step ran pvMode() — full "
+     "re-derive + base repaint + a recount of all 25k timeline rows, 11.5ms per "
+     "step, the twitch of a dragged map; (2) no between-cell motion — a hand "
+     "hovering near a cell boundary flipped dw between n and n+1 with every 1px "
+     "wiggle, so the map JUMPED A WHOLE CELL back and forth (ลากแล้วเด้งไปมา). "
+     "The pan must take the light path (pvDraw+pvInfo+pvPop, no pvMode) and "
+     "paint the pixel remainder via the pvPanRide CSS translate, cleared on "
+     "down/up/cancel/blur so a new drag always starts its ride from zero"),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),
