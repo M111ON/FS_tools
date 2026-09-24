@@ -519,6 +519,18 @@ INVARIANTS = [
      "The pan must take the light path (pvDraw+pvInfo+pvPop, no pvMode) and "
      "paint the pixel remainder via the pvPanRide CSS translate, cleared on "
      "down/up/cancel/blur so a new drag always starts its ride from zero"),
+    ("replay scales its step, pauses where it is, restarts only at the live edge",
+     lambda js, html: (re.search(r"pvPlayStep\s*=\s*Math\.max\(1,\s*Math\.round\(PV\.seqMax\s*/\s*\(PV_PLAY_TARGET/PV_PLAY_MS\)\)\)", js)
+                       and re.search(r"const at=PV\.seq===null\?0:PV\.seq;", js)
+                       and re.search(r"\(at>=PV\.seqMax-1\)\s*\?\s*0\s*:\s*at", js)
+                       and not re.search(r"textContent='⏸ หยุด';\s*PV\.seq=0", js, re.S)),
+     "two measured defects in ▶ เล่นย้อน: (1) the timer squeezed the INTERVAL "
+     "to fit 2.4s but hit its 60ms floor, so a 25k-line log crawled one line "
+     "per 60ms — a 25-MINUTE replay; the step SIZE must scale instead "
+     "(PV_PLAY_TARGET ms total). (2) every press reset PV.seq=0 — pausing a "
+     "replay at line 20k and pressing again threw the reader back to the "
+     "start. ⏸/▶ is a PAUSE: resume continues from the line on screen; only "
+     "a replay that reached the live edge (or a view parked there) starts over"),
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),

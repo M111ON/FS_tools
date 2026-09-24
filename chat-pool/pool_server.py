@@ -3453,19 +3453,35 @@ window.addEventListener('resize',()=>{
   pvPop();                      // and the popup is anchored to a point in them
   pvTopHide($('#plane-tip'));
 });
+/* ▶ replay. Two things a reader asked for, both measured:
+   - SPEED: the old timer scaled the INTERVAL to fit ~2.4s total, but the 60ms
+     floor turned a 25k-line log into 1 line per 60ms — a 25-MINUTE crawl. The
+     step SIZE scales instead (60ms is already a frame; redraw cost per tick
+     does not depend on how many lines it advances), so a full replay stays
+     ~12s on any log: step = ceil(seqMax / (TARGET/60)).
+   - ⏸/▶ is a PAUSE, not a restart: resuming continues from the line on
+     screen. Only a replay that reached the live edge — or a view parked there
+     — starts again from 0. Scrubbing (pvSetSeq) still pauses, and the
+     scrubber shows the true position every tick. */
+const PV_PLAY_MS=60,PV_PLAY_TARGET=12000;let pvPlayStep=1;
+function pvPlayTick(){
+  if(PV.seq===null||PV.seq>=PV.seqMax-1){
+    clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';
+    PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;pvDerive();pvDraw();pvInfo();pvWhen();pvRibbon();
+    return;
+  }
+  PV.seq=Math.min(PV.seqMax-1,PV.seq+pvPlayStep);$('#pv-seq').value=PV.seq;
+  pvDerive();pvDraw();pvInfo();pvWhen();
+}
 $('#pv-play').onclick=()=>{
   if(PV.playing){clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';return}
   $('#pv-play').textContent='⏸ หยุด';
-  PV.seq=0;$('#pv-seq').value=0;
-  PV.playing=setInterval(()=>{
-    if(PV.seq===null||PV.seq>=PV.seqMax-1){
-      clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';
-      PV.seq=null;$('#pv-seq').value=$('#pv-seq').max;pvDerive();pvDraw();pvInfo();pvWhen();
-      return;
-    }
-    PV.seq++;$('#pv-seq').value=PV.seq;
-    pvDerive();pvDraw();pvInfo();pvWhen();
-  },Math.max(60,Math.round(2400/Math.max(PV.seqMax,1))));
+  const at=PV.seq===null?0:PV.seq;                 // live edge → start over
+  PV.seq=(at>=PV.seqMax-1)?0:at;                   // otherwise continue from here
+  $('#pv-seq').value=PV.seq;
+  pvPlayStep=Math.max(1,Math.round(PV.seqMax/(PV_PLAY_TARGET/PV_PLAY_MS)));
+  pvDerive();pvDraw();pvInfo();pvWhen();
+  PV.playing=setInterval(pvPlayTick,PV_PLAY_MS);
 };
 
 // boot: initial pull for chain/registry/inbox — SSE only carries new lines,
