@@ -1197,4 +1197,13 @@ error_check  6/6 PASS   curator_check  37/37   reconnect_check 14/14   latency_c
 
 ตรวจโดย `ui_check.py` invariant ที่ 25 (probe เลขคณิตทอรัสของ `pvEdgeEnds` ทั้งสามโหมด)
 
+## 36. popup ไม่โผล่บังตอนลาก · ผังบล็อกไม่เด้งตอนลาก
+
+สองอาการที่เจอบนแผนที่:
+
+* **popup ขึ้นมาบัง** ระหว่างลาก/รีเฟรช — `pvPop()` ถูกเรียกจากทุก path (pan, resize, refetch) และมันเปิด popup ใหม่ทุกครั้งที่ยังมี `PV.sel` ค้างจากการคลิกก่อนหน้า แก้ด้วย **`PV.popWant` gate**: เฉพาะ `openPoint()` (การอ่านที่ตั้งใจคลิก) เท่านั้นที่ตั้ง `popWant=true` ให้เปิดได้ — path อื่น re-place popup ที่เปิดอยู่แล้วเท่านั้น จุดปิดทุกจุด (`ปิด` ปุ่ม, คลิกพื้นว่าง, pinch, ปิดโมดัล) ล้าง `popWant` ตาม
+* **ผังบล็อก 12×12 ลากแล้วเด้ง** — branch blocks เขียน `bx/by` anchor เป็น origin ที่เพิ่งขยับไปแล้ว แต่ยังวัด `dw` จาก pointerdown เดิม → ทุก step บวก delta ลงฐานที่ขยับแล้วซ้ำ (มือขยับ +2 บล็อก ผังวิ่ง +3, ต่อไป +6, ต่อ …) แก้ด้วยการให้ anchor คงค่า pointerdown เดิม (`PV.panDrag={...d}`) ไม่เขียนทับ
+
+ตรวจโดย `ui_check.py` invariant ที่ 26 (gate: เปิดเฉพาะจาก `openPoint`) และที่ 27 (anchor บล็อกไม่ถูกเขียนทับ)
+
 

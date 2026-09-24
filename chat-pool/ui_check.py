@@ -638,6 +638,29 @@ INVARIANTS = [
     ("the block map speaks one address for its keys, picture, clicks and glass",
      lambda js, html: seam_roundtrip(js) == "",
      lambda js, html: seam_roundtrip(js)),
+    ("the popup only opens on a deliberate read",
+     lambda js, html: (re.search(r"if\s*\(!PV\.popWant&&!pop\.matches\(':popover-open'\)\)return", js)
+                       and "if(anchored)pvPop();" in block(js, "pcv.onpointermove=ev=>{",
+                                                              "/* The map moves in WHOLE CELLS")
+                       and "pvDraw();pvInfo();pvPop();pvLensInfo();" not in js
+                       and js.count("PV.popWant=true") == 1
+                       and "PV.popWant=true;" in block(js, "async function openPoint(rk,path){",
+                                                              "// The shape of a node")),
+     "the popup is a read's answer, not a refresh's side effect: without the "
+     "PV.popWant gate every pan, resize and refetch re-opened #plane-pop over "
+     "the map the reader was still looking at (ชอบขึ้นมาบัง). Only openPoint "
+     "— a successful cell read — may set PV.popWant=true; every other pvPop "
+     "caller may only re-place a popup that is already open"),
+    ("a blocks drag keeps the pointerdown anchor",
+     lambda js, html: ("PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};" in js
+                       and "bx:" not in block(js, "if(d.blocks){", "}else{")
+                       and "PV.panDrag={...d};" in block(js, "if(d.blocks){", "}else{")),
+     "the blocks branch wrote the just-moved origin back into the drag anchor "
+     "while still measuring dw from the original pointerdown, so every step "
+     "added the absolute delta onto an already-shifted base — a hand that had "
+     "moved +2 blocks slid the map +3, then further with every step "
+     "(ลากแล้วเด้ง). The anchor must stay the pointerdown's own bx/by; only "
+     "bOrig moves"),
 ]
 
 

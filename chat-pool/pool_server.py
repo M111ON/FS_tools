@@ -1429,7 +1429,7 @@ const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           // honest raw plane, refetched with &raw=1, for judging the rules.
           prune:true,pruned:0,prunedCells:0,
           // the wrapping window: PV.win cells across, origin in plane cells
-          win:48,panDrag:null,
+          win:48,panDrag:null,popWant:false,   // the popup's memory: only a deliberate read may open it
           // the block map's own seam, in BLOCK coordinates (0..11). The 12x12
           // map already holds the whole plane, so panning it moves the seam
           // rather than revealing new ground — but it is still a view position,
@@ -2581,7 +2581,15 @@ function pvTopHide(el){
 }
 function pvPop(){
   const pop=$('#plane-pop'),d=PV.lines;
-  if(PV.sel==null||!d){pvTopHide(pop);return}
+  // Only a deliberate READ may OPEN the popup: every refresh path (pan,
+  // resize, refetch, refocus) calls this same function, and without the gate
+  // any of them would pop the panel over a map the reader is still reading —
+  // exactly the "it keeps covering what I look at" complaint. A re-place of
+  // an already-open popup is fine; an open from closed is not, unless a read
+  // just asked for it via PV.popWant.
+  if(PV.sel==null){PV.popWant=false;pvTopHide(pop);return}
+  if(!d){pvTopHide(pop);return}
+  if(!PV.popWant&&!pop.matches(':popover-open'))return;
   const keep=pvKeep();
   const mine=pvGraphEdges().filter(b=>b.src_rkey===PV.sel||b.dst_rkey===PV.sel);
   let h='<div style="color:var(--warn)">ที่อยู่ '+d.point+' · '+d.count+' บรรทัด</div>';
@@ -2626,7 +2634,7 @@ function pvPop(){
   pop.style.left=x+'px';pop.style.top=y+'px';
   $('#pop-focus').onclick=()=>setFocus(PV.focus?0:1);
   $('#pop-zoom').onclick=()=>pvZoomBlock(PV.sel);
-  $('#pop-close').onclick=()=>pvTopHide(pop);
+  $('#pop-close').onclick=()=>{PV.popWant=false;pvTopHide(pop)};
 }
 function setFocus(h){
   PV.focus=h;pvFocusBtns();pvDraw();pvInfo();pvPop();
@@ -2844,6 +2852,9 @@ async function openPoint(rk,path){
     const s=await fetch('/pointers',{headers:H}).then(r=>r.json());
     PV.sights=s.pointers||[];                    // the circle appears now, not next poll
   }
+  // a successful read is the ONE thing allowed to want the popup: every other
+  // pvPop caller only re-places an already-open one (see the gate in pvPop)
+  PV.popWant=true;
   pvDetail();pvDraw();pvPop();
 }
 // The shape of a node from its two degrees. Kept here as well as on the server
@@ -3081,7 +3092,7 @@ pcv.onmouseleave=()=>pvTopHide($('#plane-tip'));
 pcv.onclick=ev=>{
   if(PV.panSwallow&&Date.now()-PV.panSwallow<250)return;   // the pan, not a read
   const hit=pvCellAt(ev);
-  if(!hit){pvTopHide($('#plane-pop'));return}
+  if(!hit){PV.popWant=false;pvTopHide($('#plane-pop'));return}
   const [x,y,rk]=hit;
   openPoint(rk);
 };
@@ -3101,7 +3112,7 @@ $('#open-plane').onclick=()=>{
 };
 function pvClose(){
   $('#plane-modal').classList.remove('open');
-  pvTopHide($('#plane-pop'));
+  PV.popWant=false;pvTopHide($('#plane-pop'));
   pvTopHide($('#plane-tip'));
   if(PV.timer){clearInterval(PV.timer);PV.timer=null}
 }
@@ -3123,7 +3134,7 @@ document.addEventListener('mousedown',e=>{
   if(!pop||!pop.matches(':popover-open'))return;
   if(e.target===pop||pop.contains(e.target))return;
   if(e.target===pcv)return;
-  pvTopHide(pop);
+  PV.popWant=false;pvTopHide(pop);
 });
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape')return;
@@ -3218,7 +3229,7 @@ pcv.onpointerdown=ev=>{
     PV.lens.moved=true;                       // a pinch is not a tap on the glass
     pvPinch={anchor:pvPinchDist()};           // ...nor on the cell under it
     PV.panSwallow=Date.now();
-    pvTopHide($('#plane-pop'));
+    PV.popWant=false;pvTopHide($('#plane-pop'));
     return;
   }
   const rect=pcv.getBoundingClientRect();
@@ -3284,13 +3295,19 @@ pcv.onpointermove=ev=>{
   const step=pstep(),d=PV.panDrag;
   // dragging right shows what is to the LEFT, so the frame moves the other way.
   // dw is measured from the ORIGINAL pointerdown coords every time — no per-step
-  // rewriting of the anchor, so a slow wiggle can never accumulate error
+  // rewriting of the anchor, so a slow wiggle can never accumulate error. The
+  // blocks branch used to break exactly that promise: it wrote the JUST-MOVED
+  // origin back into bx/by while still measuring dw from the original pointer,
+  // so every step added the absolute delta onto an already-shifted base — a
+  // hand that had moved +2 blocks slid the map +3, then +6, then +10… which
+  // is the bounce a blocks drag kept making (ลากแล้วเด้ง). The anchor stays
+  // the pointerdown's own bx/by; only bOrig moves.
   const dw=Math.round((d.x-ev.clientX)/step),dr=Math.round((d.y-ev.clientY)/step);
   if(d.blocks){
     if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
     PV._dw=dw;PV._dr=dr;
     PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};
-    PV.panDrag={...d,bx:PV.bOrig.x,by:PV.bOrig.y};
+    PV.panDrag={...d};                      // spread keeps the ORIGINAL anchor
   }else{
     if(dw===PV._dw&&dr===PV._dr){pvPanRide(d,ev,dw,dr,step);return}
     PV._dw=dw;PV._dr=dr;
@@ -3304,7 +3321,11 @@ pcv.onpointermove=ev=>{
      dragged across a full plane). The light path below draws only what the
      pan actually changed: origin is in pvBaseKey, so pvDraw re-paints from the
      cached base where it differs; pvInfo/pvPop re-speak the new position. */
-  pvDraw();pvInfo();pvPop();pvLensInfo();
+  // a pan never OPENS the popup: it shares pvPop with every refresh path, so
+  // the unconditional call re-opened the panel mid-drag whenever a selection
+  // lingered from an earlier click. An already-open popup still rides its
+  // anchor below; opening one is a read's job, not a pan's.
+  pvDraw();pvInfo();pvLensInfo();
   pvPanRide(d,ev,dw,dr,step);
   // the popup rides its anchor through the pan — one re-place per move, the
   // same call a scroll or a resize already makes
