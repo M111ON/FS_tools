@@ -282,7 +282,13 @@ button.send:disabled{opacity:.55;cursor:progress}
 #plane-pop .pp{color:var(--dim);white-space:pre-wrap;margin-top:4px}
 #plane-pop .prow{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 #plane-body{flex:1;display:flex;min-height:0}
-#plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:auto}
+/* overflow must be HIDDEN here, not auto: pstep() sizes the canvas FROM this
+   box, so a canvas bigger than the box would raise a scrollbar, the scrollbar
+   would shrink the box, the smaller box would shrink the canvas, the scrollbar
+   would vanish — a closed feedback loop that oscillates the canvas size every
+   frame (measured mid-drag: 1152px -> 576px). The phone rule below already
+   clips for the same reason. */
+#plane-canvaswrap{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;position:relative;min-width:0;overflow:hidden}
 #plane-cv{background:#0a0e14;border:1px solid var(--line);border-radius:10px;cursor:crosshair;image-rendering:pixelated;box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.02)}
 /* the timeline strip: one bar per tick (or per bucket of ticks), coloured by who
    was writing — the tick layer with its "when" and "who" both visible at once */
@@ -2008,15 +2014,9 @@ function pvLensFollow(){
   if(off<m)adj=off-m;else if(off>win-m)adj=off-(win-m);
   if(adj)o.ring=pvWrap(o.ring+adj);
 }
-/* A drag that ended at the edge leaves the glass half-visible. One repaint
-   AFTER the hand is off it — never during — slides the frame just enough
-   (the same band move, with none of the fight) */
-function pvLensReclaim(){
-  const o=PV.origin;if(!o)return;
-  const before=o.wedge+','+o.ring;
-  pvLensFollow();
-  if(o.wedge+','+o.ring!==before){pvDraw();pvLensInfo()}
-}
+/* Deliberately NO post-drag frame slide: a reclaim that moved the frame after
+   release was measured as "เด้งกลับจุดเดิม" too — the map is a torus, so a
+   glass parked near a rim is not clipped, it re-enters from the far side. */
 // Name the RESOLUTION, not the zoom factor: ×4 is "cells" on a laptop and
 // "blocks" on a phone, so a label in multiples would mean different things
 // on different screens. A level means the same thing everywhere.
@@ -3153,10 +3153,7 @@ pcv.onpointerdown=ev=>{
   // the pointer is on — and the second is what makes every address reachable
   // once the glass has a fixed radius it cannot get closer than.
   if(pvLensHit(ev.clientX-rect.left,ev.clientY-rect.top)){
-    // x0/y0 remember where the glass sat when the hand took it, so the drag is
-    // 1:1 with the pointer even after the drag clamps near the rim
-    PV.lens.drag={x:ev.clientX,y:ev.clientY,x0:pvLensPos()[0],y0:pvLensPos()[1],
-      w:PV.lens.wedge,r:PV.lens.ring};
+    PV.lens.drag={x:ev.clientX,y:ev.clientY,w:PV.lens.wedge,r:PV.lens.ring};
     PV.lens.moved=false;
     pcv.setPointerCapture(ev.pointerId);
     return;
@@ -3200,12 +3197,12 @@ pcv.onpointermove=ev=>{
     if(Math.abs(ev.clientX-d.x)>2||Math.abs(ev.clientY-d.y)>2)PV.lens.moved=true;
     // the hand is holding the glass, so ONLY the glass moves: the frame must
     // not shift mid-drag, or the picture fights the hand (the measured flicker).
-    // A glass centred near the rim would be clipped, so it stops 2px short of
-    // the edge instead — still the reader's position, never pushed back.
-    const px=PV.n*pstep(),R=pvLensR(),lo=R+2,hi=px-R-2;
-    const rawX=d.x0+(ev.clientX-d.x), rawY=d.y0+(ev.clientY-d.y);
-    PV.lens.wedge=pvWrap(d.w+(Math.max(lo,Math.min(hi,rawX))-d.x0)/step);
-    PV.lens.ring=pvWrap(d.r+(Math.max(lo,Math.min(hi,rawY))-d.y0)/step);
+    // And NO rim clamp either: a clamp was measured SNAPPING the glass 51px
+    // against the hand the moment it crossed the rim zone. The plane is a
+    // torus — pvWrap re-enters the glass from the far rim, the same wrap every
+    // cell obeys — so 1:1 hand tracking holds everywhere by construction.
+    PV.lens.wedge=pvWrap(d.w+(ev.clientX-d.x)/step);
+    PV.lens.ring=pvWrap(d.r+(ev.clientY-d.y)/step);
     pvLensPaint();
     return;
   }
@@ -3232,8 +3229,9 @@ pcv.onpointerup=ev=>{
   if(PV.lens.on&&PV.lens.drag){
     const moved=PV.lens.moved;PV.lens.drag=null;
     try{pcv.releasePointerCapture(ev.pointerId)}catch(e){}
-    // moving the glass is not a read, for the same reason a pan is not
-    if(moved){PV.panSwallow=Date.now();pvLensReclaim();pvLensInfo();return}
+    // moving the glass is not a read, for the same reason a pan is not — and
+    // no frame catch-up here either: whatever the hand left in view stays
+    if(moved){PV.panSwallow=Date.now();pvLensInfo();return}
     pvLensRead();
     return;
   }

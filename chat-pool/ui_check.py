@@ -472,17 +472,27 @@ INVARIANTS = [
      "every click, so the acts the tour waits for were unreachable and the "
      "whole page felt dead — กดอะไรไม่ได้. pointer-events:none on the shell, "
      "auto only on the card; #tour[hidden] must beat display:flex"),
-    ("a held glass never moves the frame mid-drag",
+    ("a held glass moves alone — the frame never follows, during or after",
      lambda js, html: ("pvLensFollow()" not in block(js, "pcv.onpointermove=ev=>{",
                                                       "if(!PV.panDrag)return;")
                        and re.search(r"if\s*\(\s*PV\.lens\.drag\s*\)\s*return", js)
-                       and "pvLensReclaim" in block(js, "pcv.onpointerup=ev=>{",
-                                                    "if(!PV.panDrag)return;")),
-     "the follow used to run on every pointermove of a glass drag: the hand "
-     "moved the glass one way, the edge band moved the frame the other, and the "
-     "paint between them flickered and snapped the view back — ใช้แว่นแล้วเด้งกลับจุดเดิม. "
-     "A held glass must move alone (guarded by the early return at the top of "
-     "pvLensFollow) and the frame catches up once, on pointerup, via pvLensReclaim"),
+                       and "pvLensReclaim" not in js
+                       and "pvLensFollow" not in block(js, "pcv.onpointerup=ev=>{",
+                                                       "if(!PV.panDrag)return;")),
+     "two measured ways the viewport fought the hand: (1) pvLensFollow ran on "
+     "every pointermove of a glass drag — hand moves the glass, edge band moves "
+     "the frame, paint between them flickers and snaps back; (2) a post-drag "
+     "reclaim slid the frame once on release — the same jump, one frame later. "
+     "Both are frame movement the reader did not ask for. The plane is a torus: "
+     "a glass near a rim re-enters from the far side via pvWrap, so the frame "
+     "never needs to move for the glass's sake — not while held, not after"),
+    ("the glass drag is never rim-clamped",
+     lambda js, html: "Math.max(lo,Math.min(hi" not in block(js, "pcv.onpointermove=ev=>{",
+                                                      "if(!PV.panDrag)return;"),
+     "a rim clamp on the drag was measured SNAPPING the glass 51px against the "
+     "hand the moment it crossed the rim zone (x=16 dragged 30px left landed at "
+     "x=67). A straight-line clamp is wrong on a torus anyway — the honest "
+     "motion is pvWrap, re-entering from the far rim, 1:1 with the hand"),
     ("the zoom dial is a small vertical column",
      lambda js, html: re.search(r"#pv-zoom\{[^}]*flex-direction:column", html)
                       and re.search(r"#pv-zoom button\{width:30px", html)
