@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chat Log Chunker</title>
+<style>
+:root{
+  --bg:#f7f7f8; --panel:#ffffff; --border:#e2e2e6; --text:#1c1c1f; --sub:#6b6b74;
+  --accent:#5b5bd6; --danger:#d64545; --user:#5b8fd6; --asst:#5bb98a;
+  box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){--bg:#17171b;--panel:#1f1f24;--border:#2d2d34;--text:#eaeaef;--sub:#9a9aa4;}
+}
+:root[data-theme="dark"]{--bg:#17171b;--panel:#1f1f24;--border:#2d2d34;--text:#eaeaef;--sub:#9a9aa4;}
+html{scroll-padding-top:env(safe-area-inset-top,0px); height:100%;}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;height:100%;}
+.wrap{max-width:1100px;margin:0 auto;padding:16px;}
+h1{font-size:1.3rem;margin:4px 0 2px;}
+.sub{color:var(--sub);font-size:0.85rem;margin-bottom:16px;}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px;}
+.panel h2{font-size:0.95rem;margin:0 0 10px;color:var(--text);}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+.drop{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;color:var(--sub);cursor:pointer;font-size:0.9rem;}
+.drop.drag{border-color:var(--accent);color:var(--accent);}
+input[type=file]{display:none;}
+button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:0.85rem;cursor:pointer;}
+button.secondary{background:transparent;border:1px solid var(--border);color:var(--text);}
+button.danger{background:var(--danger);}
+button:disabled{opacity:0.4;cursor:default;}
+label.toggle{display:flex;align-items:center;gap:6px;font-size:0.82rem;color:var(--sub);cursor:pointer;}
+input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;}
+input[type=number],input[type=text],select{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:0.85rem;width:90px;}
+select{width:auto;}
+.stat{font-size:0.78rem;color:var(--sub);}
+.warn{font-size:0.78rem;color:#c78a1e;}
+.progresswrap{height:6px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:6px;display:none;}
+.progressbar{height:100%;background:var(--accent);width:0%;transition:width .15s;}
+.turnlist{max-height:480px;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;}
+.turn{border:1px solid var(--border);border-radius:10px;padding:10px;background:var(--bg);}
+.turn.excluded{opacity:0.4;}
+.turn .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;}
+.badge{font-size:0.72rem;font-weight:600;padding:2px 8px;border-radius:20px;color:#fff;}
+.badge.User{background:var(--user);}
+.badge.Assistant{background:var(--asst);}
+.meta{font-size:0.7rem;color:var(--sub);}
+.turnbtns{display:flex;gap:6px;}
+.iconbtn{background:transparent;border:1px solid var(--border);color:var(--sub);padding:3px 8px;font-size:0.72rem;border-radius:6px;}
+.iconbtn.danger{color:var(--danger);border-color:var(--danger);}
+textarea{width:100%;background:transparent;color:var(--text);border:none;font-size:0.82rem;font-family:inherit;resize:vertical;min-height:50px;line-height:1.4;}
+textarea:focus{outline:1px solid var(--accent);border-radius:6px;}
+.chunkgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;max-height:480px;overflow-y:auto;}
+.chunk{border:1px solid var(--border);border-radius:10px;padding:10px;background:var(--bg);font-size:0.78rem;}
+.chunk .idx{font-weight:700;color:var(--accent);margin-bottom:4px;}
+.chunk .preview{color:var(--sub);white-space:pre-wrap;max-height:110px;overflow:hidden;}
+.empty{color:var(--sub);font-size:0.85rem;text-align:center;padding:30px 10px;}
+.filetag{font-size:0.68rem;background:var(--border);padding:1px 6px;border-radius:5px;color:var(--sub);}
+.pager{display:flex;align-items:center;gap:8px;justify-content:flex-end;margin-top:8px;flex-wrap:wrap;}
+.pager input{width:60px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📦 Chat Log Chunker</h1>
+  <div class="sub">โหลด export chat log (รองรับไฟล์ใหญ่ผ่าน Web Worker + pagination) → ตัด/แก้ไข turn → จำลอง chunk → export</div>
+
+  <div class="panel">
+    <h2>1) Import ไฟล์</h2>
+    <div class="drop" id="drop">ลากไฟล์มาวาง หรือแตะเพื่อเลือกไฟล์ (.md, .json, .txt — เลือกได้หลายไฟล์)</div>
+    <input type="file" id="fileInput" multiple accept=".md,.json,.txt">
+    <div class="row" style="margin-top:10px;">
+      <label>เตือนถ้าไฟล์ใหญ่กว่า (MB)<br><input type="number" id="warnSize" value="50" min="1"></label>
+      <span class="stat" id="fileStat" style="margin-left:8px;">ยังไม่มีไฟล์</span>
+      <button class="secondary" id="clearAll" style="margin-left:auto;">ล้างทั้งหมด</button>
+    </div>
+    <div class="progresswrap" id="progWrap"><div class="progressbar" id="progBar"></div></div>
+    <div class="warn" id="warnMsg"></div>
+  </div>
+
+  <div class="panel">
+    <h2>2) ตัว noise-strip (ใช้กับ preview/export เท่านั้น ไม่แก้ต้นฉบับ)</h2>
+    <div class="row">
+      <label class="toggle"><input type="checkbox" id="stripTool" checked> ตัด tool-call echo / &lt;path&gt;&lt;content&gt; tags</label>
+      <label class="toggle"><input type="checkbox" id="stripThink" checked> ตัด _Thinking:_ block</label>
+      <label class="toggle"><input type="checkbox" id="stripSkill" checked> ตัด skill-injection block</label>
+      <label class="toggle"><input type="checkbox" id="stripAnsi" checked> ตัด ANSI escape</label>
+      <label class="toggle"><input type="checkbox" id="stripToolJson" checked> ตัด [tool] {json} (สมดุลวงเล็บ ไม่ตัดขาดกลาง)</label>
+    </div>
+    <div class="row" id="customRulesRow" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:10px;"></div>
+    <button class="secondary" id="addRuleBtn" style="margin-top:8px;">+ เพิ่มกฎ custom</button>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;">
+      <h2 style="margin:0;">3) Turn list (แบ่งหน้า — แก้ไข/ลบ/เลือกได้)</h2>
+      <span class="stat" id="turnStat"></span>
+    </div>
+    <div class="turnlist" id="turnList"><div class="empty">อัปโหลดไฟล์ก่อน</div></div>
+    <div class="pager" id="turnPager"></div>
+  </div>
+
+  <div class="panel">
+    <h2>4) จำลอง Chunk สำหรับ embedding</h2>
+    <div class="row">
+      <label>Chunk size (chars)<br><input type="number" id="chunkSize" value="1200" min="100"></label>
+      <label>Overlap (chars)<br><input type="number" id="chunkOverlap" value="150" min="0"></label>
+      <label>โหมด<br>
+        <select id="chunkMode">
+          <option value="turn">ต่อ turn (รวม turn จนเต็ม size)</option>
+          <option value="sliding">Sliding window (รวมทั้งหมด — หนักกว่า ระวังไฟล์ใหญ่มาก)</option>
+        </select>
+      </label>
+      <label>Auto refresh (วินาที, 0 = ปิด)<br><input type="number" id="refreshSec" value="0" min="0" step="1"></label>
+      <button id="simulateBtn" style="align-self:flex-end;">▶ Simulate chunks</button>
+    </div>
+    <div class="stat" id="chunkStat" style="margin-top:8px;"></div>
+    <div class="chunkgrid" id="chunkGrid" style="margin-top:10px;"></div>
+    <div class="pager" id="chunkPager"></div>
+  </div>
+
+  <div class="panel">
+    <h2>5) Export</h2>
+    <div class="row">
+      <button id="expJson">⬇ Chunks (.json)</button>
+      <button id="expMd" class="secondary">⬇ Cleaned turns (.md)</button>
+      <button id="expTxt" class="secondary">⬇ Plain text (.txt)</button>
+      <button id="expFacts" class="secondary">⬇ facts.jsonl style</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let turns = [];
+let chunks = [];
+let idSeq = 0;
+let customRules = [];
+let ruleIdSeq = 0;
+const TURN_PAGE_SIZE = 40;
+const CHUNK_PAGE_SIZE = 30;
+let turnPage = 0, chunkPage = 0;
+
+const dropEl = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileStat = document.getElementById('fileStat');
+const turnList = document.getElementById('turnList');
+const turnStat = document.getElementById('turnStat');
+const chunkGrid = document.getElementById('chunkGrid');
+const chunkStat = document.getElementById('chunkStat');
+const progWrap = document.getElementById('progWrap');
+const progBar = document.getElementById('progBar');
+const warnMsg = document.getElementById('warnMsg');
+
+// ---- Custom noise-strip rules (repeatable) ----
+function addRule(pattern='', isRegex=false){
+  customRules.push({id: ruleIdSeq++, pattern, isRegex});
+  renderRules();
+}
+function renderRules(){
+  const box = document.getElementById('customRulesRow');
+  box.innerHTML = '';
+  customRules.forEach(r => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.gap = '6px';
+    row.innerHTML = `
+      <input type="text" class="ruleInput" data-id="${r.id}" placeholder="คำหรือ pattern ที่จะตัดออก เช่น assistant" style="flex:1;min-width:160px;width:auto;" value="${r.pattern.replace(/"/g,'&quot;')}">
+      <label class="toggle" style="gap:4px;"><input type="checkbox" class="ruleRegex" data-id="${r.id}" ${r.isRegex?'checked':''}> regex</label>
+      <button class="iconbtn danger" data-act="delrule" data-id="${r.id}">ลบ</button>
+    `;
+    box.appendChild(row);
+  });
+}
+document.getElementById('addRuleBtn').addEventListener('click', () => addRule());
+document.getElementById('customRulesRow').addEventListener('input', e => {
+  if(e.target.classList.contains('ruleInput')){
+    const r = customRules.find(x=>x.id===Number(e.target.dataset.id));
+    if(r) r.pattern = e.target.value;
+  }
+});
+document.getElementById('customRulesRow').addEventListener('change', e => {
+  if(e.target.classList.contains('ruleRegex')){
+    const r = customRules.find(x=>x.id===Number(e.target.dataset.id));
+    if(r) r.isRegex = e.target.checked;
+  }
+});
+document.getElementById('customRulesRow').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-act="delrule"]');
+  if(btn){ customRules = customRules.filter(x=>x.id!==Number(btn.dataset.id)); renderRules(); }
+});
+function buildOpt(){
+  return {
+    tool: document.getElementById('stripTool').checked,
+    think: document.getElementById('stripThink').checked,
+    skill: document.getElementById('stripSkill').checked,
+    ansi: document.getElementById('stripAnsi').checked,
+    toolJson: document.getElementById('stripToolJson').checked,
+    customRules: customRules.filter(r=>r.pattern.trim()).map(r=>({pattern:r.pattern, isRegex:r.isRegex}))
+  };
+}
+
+// ---- Web Worker (parsing + chunking off the main thread) ----
+const workerSrc = `
+function parseContent(name, content){
+  const out = [];
+  const lower = name.toLowerCase();
+  if(lower.endsWith('.json')){
+    let data; try{ data = JSON.parse(content); } catch(e){ return out; }
+    const arr = Array.isArray(data) ? data : (data.messages || data.turns || []);
+    arr.forEach(m => {
+      const role = (m.role || m.speaker || 'Unknown');
+      const roleNorm = /assistant|model|bot/i.test(role) ? 'Assistant' : /user|you|human/i.test(role) ? 'User' : role;
+      let c = m.content || m.text || m.message || '';
+      if(Array.isArray(c)) c = c.map(x => x.text || JSON.stringify(x)).join('\\n');
+      if(c) out.push({file:name, role: roleNorm, raw: String(c)});
+    });
+    return out;
+  }
+  const roleReB = /^##\\s+(User|Assistant)\\b.*$/gm;
+  const matchesB = [...content.matchAll(roleReB)];
+  if(matchesB.length){
+    for(let i=0;i<matchesB.length;i++){
+      const m = matchesB[i];
+      const start = m.index + m[0].length;
+      const end = i+1 < matchesB.length ? matchesB[i+1].index : content.length;
+      const body = content.slice(start, end).trim();
+      if(body) out.push({file:name, role:m[1], raw:body});
+    }
+    return out;
+  }
+  const roleReA = /^\\*\\*(You|Assistant):\\*\\*.*$/gm;
+  const matchesA = [...content.matchAll(roleReA)];
+  if(matchesA.length){
+    for(let i=0;i<matchesA.length;i++){
+      const m = matchesA[i];
+      let role = m[1] === 'You' ? 'User' : m[1];
+      const start = m.index + m[0].length;
+      const end = i+1 < matchesA.length ? matchesA[i+1].index : content.length;
+      const body = content.slice(start, end).trim();
+      if(body) out.push({file:name, role, raw:body});
+    }
+    return out;
+  }
+  const lineRe = /^(User|Assistant|You)\\s*:\\s*/;
+  const lines = content.split(/\\r?\\n/);
+  let cur = null, any=false;
+  for(const line of lines){
+    const m = line.match(lineRe);
+    if(m){
+      any=true;
+      if(cur) out.push(cur);
+      let role = m[1] === 'You' ? 'User' : m[1];
+      cur = {file:name, role, raw: line.slice(m[0].length)};
+    } else if(cur){ cur.raw += '\\n' + line; }
+  }
+  if(cur) out.push(cur);
+  if(!any) out.push({file:name, role:'Unknown', raw:content});
+  return out;
+}
+function stripToolJsonBlobs(text){
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  const marker = '[tool]';
+  while(i < n){
+    if(text.startsWith(marker, i)){
+      let j = i + marker.length;
+      while(j < n && (text[j] === ' ' || text[j] === '\\t')) j++;
+      if(text[j] === '{'){
+        let depth = 0, k = j, inStr = false, esc = false;
+        while(k < n){
+          const c = text[k];
+          if(inStr){
+            if(esc) esc = false;
+            else if(c === '\\\\') esc = true;
+            else if(c === '"') inStr = false;
+          } else {
+            if(c === '"') inStr = true;
+            else if(c === '{') depth++;
+            else if(c === '}'){ depth--; if(depth === 0){ k++; break; } }
+          }
+          k++;
+        }
+        i = k;
+        continue;
+      }
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
+}
+function stripNoise(text, opt){
+  let t = text;
+  if(opt.ansi) t = t.replace(/\\x1b\\[[0-9;]*m/g, '');
+  t = t.replace(/^\\d+:\\s?/gm, '');
+  if(opt.tool){
+    t = t.replace(/Called the \\w+ tool with the following input:[^\\r\\n]*(?:<path>[\\s\\S]*?<\\/path>)?(?:\\r?\\n<type>[^<\\r\\n]*<\\/type>)?(?:\\r?\\n<content>[\\s\\S]*?<\\/content>)?/g, '');
+    let prev; do{ prev = t; t = t.replace(/<content>[\\s\\S]*?<\\/content>/g, ''); } while(t !== prev);
+    t = t.replace(/<path>[^<]*<\\/path>/g, '');
+    t = t.replace(/<type>[^<]*<\\/type>/g, '');
+    t = t.replace(/\\*\\*Tool:[\\s\\S]*?(?=\\n## |\\n\\*\\*Tool:|$)/g, '');
+    t = t.replace(/Full output saved to:.*$/gm, '');
+  }
+  if(opt.think) t = t.replace(/_Thinking:_(?:\\n(?!## ).*)*/g, '');
+  if(opt.skill){
+    t = t.replace(/\\[IMPORTANT: The user has invoked the "[\\w-]+" skill[\\s\\S]*?\\[Skill directory:[\\s\\S]*?\\]\\r?\\n?(?:Resolve any relative paths.*?\\r?\\n)?/g, '');
+    t = t.replace(/<available-skills>[\\s\\S]*?<\\/available-skills>/g, '');
+  }
+  if(opt.toolJson) t = stripToolJsonBlobs(t);
+  if(opt.customRules && opt.customRules.length){
+    opt.customRules.forEach(r => {
+      if(!r.pattern) return;
+      try{
+        const src = r.isRegex ? r.pattern : r.pattern.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\\$&');
+        t = t.replace(new RegExp(src, 'gi'), '');
+      } catch(e){ /* invalid pattern, skip silently */ }
+    });
+  }
+  return t.trim();
+}
+self.onmessage = (e) => {
+  const msg = e.data;
+  if(msg.type === 'parse'){
+    const out = parseContent(msg.name, msg.content);
+    self.postMessage({type:'parsed', name: msg.name, turns: out});
+  } else if(msg.type === 'chunk'){
+    const active = msg.turns;
+    const size = msg.size, overlap = msg.overlap, mode = msg.mode, opt = msg.opt;
+    const chunksOut = [];
+    if(mode === 'turn'){
+      let buf = '', meta = [];
+      active.forEach(t => {
+        const cleaned = stripNoise(t.raw, opt);
+        if(!cleaned) return;
+        const piece = '[' + t.role + '] ' + cleaned;
+        if(buf.length && buf.length + piece.length + 2 > size){
+          chunksOut.push({text:buf, files:[...new Set(meta)]});
+          buf = buf.slice(Math.max(0, buf.length-overlap));
+          meta = [];
+        }
+        buf += (buf ? '\\n\\n' : '') + piece;
+        meta.push(t.file);
+      });
+      if(buf) chunksOut.push({text:buf, files:[...new Set(meta)]});
+    } else {
+      const full = active.map(t => '[' + t.role + '] ' + stripNoise(t.raw, opt)).join('\\n\\n');
+      let i = 0;
+      while(i < full.length){
+        const end = Math.min(full.length, i+size);
+        chunksOut.push({text: full.slice(i,end), files:['(merged)']});
+        if(end >= full.length) break;
+        i += (size - overlap);
+        if(size - overlap <= 0) break;
+      }
+    }
+    self.postMessage({type:'chunked', chunks: chunksOut});
+  } else if(msg.type === 'export'){
+    const active = msg.turns, opt = msg.opt, format = msg.format;
+    let content = '';
+    if(format === 'md') content = active.map(t => '## ' + t.role + '\\n\\n' + stripNoise(t.raw, opt)).join('\\n\\n---\\n\\n');
+    else if(format === 'txt') content = active.map(t => '[' + t.role + '] ' + stripNoise(t.raw, opt)).join('\\n\\n');
+    else if(format === 'facts') content = active.map(t => JSON.stringify({source_file:t.file, role:t.role, content:stripNoise(t.raw, opt)})).join('\\n');
+    self.postMessage({type:'exported', format, content});
+  }
+};
+`;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], {type:'application/javascript'})));
+
+let pendingParts = 0, streamingActive = 0;
+worker.onmessage = (e) => {
+  const msg = e.data;
+  if(msg.type === 'parsed'){
+    msg.turns.forEach(t => turns.push({id: idSeq++, file:t.file, role:t.role, raw:t.raw, included:true}));
+    pendingParts--;
+    dirty = true;
+    const busy = pendingParts > 0 || streamingActive > 0;
+    fileStat.textContent = `${new Set(turns.map(t=>t.file)).size} ไฟล์ · ${turns.length} turns` + (busy ? ' · กำลังประมวลผล...' : '');
+    turnPage = Math.min(turnPage, Math.max(0, Math.ceil(turns.length/TURN_PAGE_SIZE)-1));
+    renderTurns();
+    if(!busy) progWrap.style.display = 'none';
+  } else if(msg.type === 'exported'){
+    const names = {md:'cleaned_turns.md', txt:'turns.txt', facts:'facts.jsonl'};
+    download(names[msg.format], msg.content);
+  } else if(msg.type === 'chunked'){
+    chunks = msg.chunks;
+    chunkPage = 0;
+    renderChunks();
+    simBusy = false;
+    document.getElementById('simulateBtn').disabled = false;
+    document.getElementById('simulateBtn').textContent = '▶ Simulate chunks';
+  }
+};
+
+dropEl.addEventListener('click', () => fileInput.click());
+dropEl.addEventListener('dragover', e => { e.preventDefault(); dropEl.classList.add('drag'); });
+dropEl.addEventListener('dragleave', () => dropEl.classList.remove('drag'));
+dropEl.addEventListener('drop', e => { e.preventDefault(); dropEl.classList.remove('drag'); handleFiles(e.dataTransfer.files); });
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+document.getElementById('clearAll').addEventListener('click', () => {
+  turns = []; chunks = []; idSeq = 0; turnPage = 0; chunkPage = 0;
+  fileStat.textContent = 'ยังไม่มีไฟล์'; warnMsg.textContent='';
+  renderTurns(); renderChunks();
+});
+
+function handleFiles(fileListObj){
+  const files = Array.from(fileListObj);
+  const warnLimitMB = Number(document.getElementById('warnSize').value) || 50;
+  const bigFiles = files.filter(f => f.size / (1024*1024) > warnLimitMB);
+  warnMsg.textContent = bigFiles.length
+    ? `⚠ ${bigFiles.length} ไฟล์ใหญ่กว่า ${warnLimitMB}MB — ไฟล์ .md/.txt จะถูกอ่านแบบ stream เป็น part (ไม่โหลดทั้งไฟล์เข้า memory ทีเดียว), .json ยังต้องอ่านทั้งไฟล์`
+    : '';
+  progWrap.style.display = 'block'; progBar.style.width = '0%';
+  const totalSize = files.reduce((s,f)=>s+f.size,0) || 1;
+  const sizeState = {loaded: 0};
+  const bumpProgress = () => { progBar.style.width = Math.min(100, Math.round((sizeState.loaded/totalSize)*100)) + '%'; };
+
+  files.forEach(f => {
+    if(f.name.toLowerCase().endsWith('.json')){
+      const reader = new FileReader();
+      pendingParts++;
+      reader.onprogress = (ev) => { if(ev.lengthComputable){ sizeState.loaded += ev.loaded; bumpProgress(); } };
+      reader.onload = () => { worker.postMessage({type:'parse', name:f.name, content: reader.result}); };
+      reader.readAsText(f);
+    } else {
+      streamingActive++;
+      streamTextFile(f, sizeState, bumpProgress).then(() => {
+        streamingActive--;
+        if(pendingParts === 0 && streamingActive === 0) progWrap.style.display = 'none';
+      });
+    }
+  });
+}
+
+// Reads a .md/.txt file in ~3MB parts via the Streams API, splitting only at safe
+// boundaries (right before a "## User"/"## Assistant" or "**You:**"/"**Assistant:**"
+// marker) so no single string ever holds the whole file. Each part is parsed
+// independently by the worker, same as a standalone mini-file.
+async function streamTextFile(file, sizeState, bumpProgress){
+  const FLUSH_SIZE = 3_000_000;   // try to flush a part once buffer passes this size
+  const HARD_CAP = 15_000_000;    // force-flush even without a safe split point (rare: one huge turn)
+  const SAFETY_MARGIN = 2000;     // don't trust a marker match this close to the unread edge
+  const splitRe = /\n(?=##\s+(?:User|Assistant)\b)|\n(?=\*\*(?:You|Assistant):\*\*)/g;
+  const stream = file.stream().pipeThrough(new TextDecoderStream());
+  const reader = stream.getReader();
+  let buffer = '';
+  while(true){
+    const {done, value} = await reader.read();
+    if(value){
+      buffer += value;
+      sizeState.loaded += value.length; // approx (chars ~= bytes for progress purposes)
+      bumpProgress();
+    }
+    if(buffer.length > FLUSH_SIZE || done){
+      let splitAt = buffer.length;
+      if(!done){
+        let lastIdx = -1, m;
+        splitRe.lastIndex = 0;
+        const limit = buffer.length - SAFETY_MARGIN;
+        while((m = splitRe.exec(buffer))){ if(m.index <= limit) lastIdx = m.index; else break; }
+        if(lastIdx > 0) splitAt = lastIdx;
+        else if(buffer.length >= HARD_CAP) splitAt = buffer.length; // forced fallback split
+        else splitAt = -1; // keep accumulating, no safe point yet
+      }
+      if(splitAt !== -1){
+        const part = buffer.slice(0, splitAt);
+        buffer = buffer.slice(splitAt);
+        if(part.trim()){ pendingParts++; worker.postMessage({type:'parse', name:file.name, content: part}); }
+      }
+    }
+    if(done) break;
+  }
+}
+
+// ---- Turn list (paginated) ----
+function renderTurns(){
+  if(!turns.length){ turnList.innerHTML = '<div class="empty">อัปโหลดไฟล์ก่อน</div>'; turnStat.textContent=''; document.getElementById('turnPager').innerHTML=''; return; }
+  const included = turns.filter(t=>t.included).length;
+  const totalPages = Math.max(1, Math.ceil(turns.length / TURN_PAGE_SIZE));
+  turnPage = Math.min(turnPage, totalPages-1);
+  turnStat.textContent = `${included}/${turns.length} turns ที่รวมอยู่ · หน้า ${turnPage+1}/${totalPages}`;
+  const start = turnPage * TURN_PAGE_SIZE;
+  const pageItems = turns.slice(start, start+TURN_PAGE_SIZE);
+  turnList.innerHTML = '';
+  pageItems.forEach(t => {
+    const div = document.createElement('div');
+    div.className = 'turn' + (t.included ? '' : ' excluded');
+    div.innerHTML = `
+      <div class="head">
+        <div class="row" style="gap:8px;">
+          <span class="badge ${t.role}">${t.role}</span>
+          <span class="filetag">${t.file}</span>
+          <span class="meta">${t.raw.length} chars</span>
+        </div>
+        <div class="turnbtns">
+          <button class="iconbtn" data-act="toggle" data-id="${t.id}">${t.included?'ซ่อน':'รวม'}</button>
+          <button class="iconbtn danger" data-act="del" data-id="${t.id}">ลบ</button>
+        </div>
+      </div>
+      <textarea data-id="${t.id}" rows="3">${t.raw.replace(/<\/textarea>/g,'')}</textarea>
+    `;
+    turnList.appendChild(div);
+  });
+  document.getElementById('turnPager').innerHTML = `
+    <button class="secondary iconbtn" id="tPrev" ${turnPage===0?'disabled':''}>‹ ก่อนหน้า</button>
+    <span class="stat">ไปหน้า</span><input type="number" id="tGoto" value="${turnPage+1}" min="1" max="${totalPages}">
+    <button class="secondary iconbtn" id="tNext" ${turnPage>=totalPages-1?'disabled':''}>ถัดไป ›</button>
+  `;
+  document.getElementById('tPrev').onclick = () => { turnPage--; renderTurns(); };
+  document.getElementById('tNext').onclick = () => { turnPage++; renderTurns(); };
+  document.getElementById('tGoto').onchange = (e) => { turnPage = Math.max(0, Math.min(totalPages-1, Number(e.target.value)-1)); renderTurns(); };
+}
+
+turnList.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  const id = Number(btn.dataset.id);
+  if(btn.dataset.act === 'toggle'){ const t = turns.find(x=>x.id===id); t.included = !t.included; renderTurns(); }
+  else if(btn.dataset.act === 'del'){ turns = turns.filter(x=>x.id!==id); renderTurns(); }
+});
+turnList.addEventListener('input', e => {
+  if(e.target.tagName === 'TEXTAREA'){
+    const t = turns.find(x=>x.id===Number(e.target.dataset.id));
+    if(t) t.raw = e.target.value;
+  }
+});
+
+// ---- Chunk simulation (delegated to worker) ----
+let simBusy = false, dirty = false, hasSimulated = false, refreshTimer = null;
+
+function runSimulate(){
+  if(simBusy) return;
+  const size = Math.max(100, Number(document.getElementById('chunkSize').value) || 1200);
+  const overlap = Math.max(0, Number(document.getElementById('chunkOverlap').value) || 0);
+  const mode = document.getElementById('chunkMode').value;
+  const opt = buildOpt();
+  const active = turns.filter(t=>t.included).map(t=>({file:t.file, role:t.role, raw:t.raw}));
+  const btn = document.getElementById('simulateBtn');
+  simBusy = true; dirty = false; hasSimulated = true;
+  btn.disabled = true; btn.textContent = '⏳ กำลังประมวลผล...';
+  worker.postMessage({type:'chunk', turns: active, size, overlap, mode, opt});
+}
+document.getElementById('simulateBtn').addEventListener('click', runSimulate);
+
+// Mark "dirty" whenever any setting/rule/turn changes (except the refresh box itself)
+const IGNORE_DIRTY = new Set(['refreshSec','fileInput','warnSize']);
+['input','change'].forEach(ev => document.addEventListener(ev, e => {
+  if(e.target && IGNORE_DIRTY.has(e.target.id)) return;
+  dirty = true;
+}));
+turnList.addEventListener('click', e => { if(e.target.closest('button')) dirty = true; });
+
+// Auto refresh: every N seconds, re-simulate only if something changed since last run
+function setupRefresh(){
+  if(refreshTimer){ clearInterval(refreshTimer); refreshTimer = null; }
+  const sec = Math.max(0, Number(document.getElementById('refreshSec').value) || 0);
+  if(sec > 0){
+    refreshTimer = setInterval(() => { if(hasSimulated && dirty && !simBusy) runSimulate(); }, sec * 1000);
+  }
+}
+document.getElementById('refreshSec').addEventListener('change', setupRefresh);
+
+function renderChunks(){
+  if(!chunks.length){ chunkGrid.innerHTML=''; chunkStat.textContent=''; document.getElementById('chunkPager').innerHTML=''; return; }
+  const totalChars = chunks.reduce((s,c)=>s+c.text.length,0);
+  const totalPages = Math.max(1, Math.ceil(chunks.length / CHUNK_PAGE_SIZE));
+  chunkPage = Math.min(chunkPage, totalPages-1);
+  chunkStat.textContent = `${chunks.length} chunks · รวม ${totalChars} chars · เฉลี่ย ~${Math.round(totalChars/chunks.length)} chars/chunk (~${Math.round(totalChars/chunks.length/4)} tokens โดยประมาณ) · หน้า ${chunkPage+1}/${totalPages}`;
+  const start = chunkPage * CHUNK_PAGE_SIZE;
+  chunkGrid.innerHTML = '';
+  chunks.slice(start, start+CHUNK_PAGE_SIZE).forEach((c,i) => {
+    const div = document.createElement('div');
+    div.className = 'chunk';
+    div.innerHTML = `<div class="idx">Chunk ${start+i+1}</div>
+      <div class="meta">${c.text.length} chars · ~${Math.round(c.text.length/4)} tokens</div>
+      <div class="preview">${escapeHtml(c.text.slice(0,220))}${c.text.length>220?'…':''}</div>`;
+    chunkGrid.appendChild(div);
+  });
+  document.getElementById('chunkPager').innerHTML = `
+    <button class="secondary iconbtn" id="cPrev" ${chunkPage===0?'disabled':''}>‹ ก่อนหน้า</button>
+    <span class="stat">ไปหน้า</span><input type="number" id="cGoto" value="${chunkPage+1}" min="1" max="${totalPages}">
+    <button class="secondary iconbtn" id="cNext" ${chunkPage>=totalPages-1?'disabled':''}>ถัดไป ›</button>
+  `;
+  document.getElementById('cPrev').onclick = () => { chunkPage--; renderChunks(); };
+  document.getElementById('cNext').onclick = () => { chunkPage++; renderChunks(); };
+  document.getElementById('cGoto').onchange = (e) => { chunkPage = Math.max(0, Math.min(totalPages-1, Number(e.target.value)-1)); renderChunks(); };
+}
+function escapeHtml(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// ---- Export ----
+function download(filename, text){
+  const blob = new Blob([text], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+document.getElementById('expJson').addEventListener('click', () => {
+  if(!chunks.length){ alert('ยังไม่มี chunk — กด Simulate ก่อน'); return; }
+  download('chunks.json', JSON.stringify(chunks.map((c,i)=>({index:i, chars:c.text.length, approx_tokens:Math.round(c.text.length/4), files:c.files, text:c.text})), null, 2));
+});
+document.getElementById('expMd').addEventListener('click', () => {
+  const active = turns.filter(t=>t.included).map(t=>({file:t.file, role:t.role, raw:t.raw}));
+  worker.postMessage({type:'export', format:'md', turns:active, opt: buildOpt()});
+});
+document.getElementById('expTxt').addEventListener('click', () => {
+  const active = turns.filter(t=>t.included).map(t=>({file:t.file, role:t.role, raw:t.raw}));
+  worker.postMessage({type:'export', format:'txt', turns:active, opt: buildOpt()});
+});
+document.getElementById('expFacts').addEventListener('click', () => {
+  const active = turns.filter(t=>t.included).map(t=>({file:t.file, role:t.role, raw:t.raw}));
+  worker.postMessage({type:'export', format:'facts', turns:active, opt: buildOpt()});
+});
+</script>
+</body>
+</html>

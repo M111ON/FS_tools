@@ -1,0 +1,11 @@
+# generated data / secrets — never commit
+__pycache__/
+*.pyc
+*.sqlite3
+*.log
+facts.jsonl
+dictionary.jsonl
+chatchunker.zip
+_zen_key.txt
+session-*.md
+.ingest_cache.json
