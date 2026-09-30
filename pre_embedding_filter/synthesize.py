@@ -541,7 +541,7 @@ BATCH_USER_TMPL = """เขียน definition ภาษาไทย 1-2 ปร
 
 {blocks}
 
-ตอบ: JSON array [{"term": "...", "definition": "..."}] เท่านั้น"""
+ตอบ: JSON array [{{"term": "...", "definition": "..."}}] เท่านั้น"""
 
 
 def build_batch_prompt(terms_gists):
@@ -604,7 +604,7 @@ def run_reduce(args, state: State, pool: LLMPool):
             try:
                 text, _llm = pool.chat_with_fallback(state, _ckey,
                     BATCH_SYSTEM + "\n/no_think", user,
-                    max_tokens=1600, temperature=0.3, use_cache=True)
+                    max_tokens=3200, temperature=0.3, use_cache=True)
             except Exception:
                 raise
         else:
@@ -613,7 +613,7 @@ def run_reduce(args, state: State, pool: LLMPool):
             cached = None if args.fresh else state.cached(key)
             try:
                 text = cached or llm.chat(BATCH_SYSTEM + "\n/no_think", user,
-                                          max_tokens=1600, temperature=0.3)
+                                           max_tokens=3200, temperature=0.3)
                 if not cached:
                     state.put_cache(key, llm.model, text)
             except Exception:
@@ -624,13 +624,17 @@ def run_reduce(args, state: State, pool: LLMPool):
         got = {}
         if arr:
             by_name = {t: d for t, d in pairs}
+            # models often normalize case/spacing ("Standby Replicas" vs
+            # "standby replicas") — match case-insensitively, keep our key
+            norm = {t.casefold().strip(): t for t in by_name}
             for obj in arr:
                 if not isinstance(obj, dict):
                     continue
                 term = str(obj.get("term", "")).strip()
                 definition = str(obj.get("definition", "")).strip()
-                if term in by_name and definition:
-                    got[term] = definition
+                key = norm.get(term.casefold().strip())
+                if key and definition:
+                    got[key] = definition
         if not got:
             raise ValueError(f"unparseable batch ({len(text)} chars)")
         for t, d in got.items():
