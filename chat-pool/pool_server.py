@@ -1698,7 +1698,15 @@ function pstep(){
   // square. Naming the two sides makes that an explicit fact instead of a
   // coincidence: a step that fits w columns still has to fit h rows.
   const span=Math.max(w,h);
-  const lo=w===144&&h===144?2:8,hi=w===144&&h===144?8:84;
+  //
+  // How LARGE a cell may be drawn is a property of the MODE, not of how many
+  // cells there happen to be. Reading it off the cell count meant any mode that
+  // was not 144 wide silently inherited the plane's 2..8 pitch range — and a
+  // future mode that WAS 144 wide would have been told it was the plane. The
+  // plane needs cells of 2px precisely because it has 144 of them across; the
+  // other two need room to be hit with a finger. PV.mode is the only thing
+  // that can answer that, and it is already asked everywhere else in this file.
+  const [lo,hi]=PV.mode==='plane'?[2,8]:[8,84];
   return Math.max(lo,Math.min(hi,Math.floor(avail/span)));
 }
 
@@ -1811,8 +1819,11 @@ function pvDerive(){
 function pvCenter(rk){
   const [x,y]=pvXY(rk);
   /* torus: edges may reference ghost-zone coords (-8..151), allow them */
-  const bx=PV.mode==='plane'&&PV.w===144?T144+8:PV.w,
-        by=PV.mode==='plane'&&PV.h===144?T144+8:PV.h;
+  // mode alone decides: in plane mode pvDerive has already set w and h to
+  // T144, so re-testing the count could only ever agree — or, the day a plane
+  // mode is not 144 wide, disagree and draw the wrong bound
+  const bx=PV.mode==='plane'?T144+8:PV.w,
+        by=PV.mode==='plane'?T144+8:PV.h;
   if(x<-8||y<-8||x>=bx||y>=by)return null;
   const step=pstep();
   return[x*step+step/2,y*step+step/2];

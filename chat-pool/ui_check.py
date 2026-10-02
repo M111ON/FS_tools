@@ -777,6 +777,18 @@ INVARIANTS = [
      "pvCellsUpTo counts the log's own order, so without the kind check it "
      "would rebuild a plane the filter is not describing — drag time back with "
      "'bonds only' on and the filtered kinds come straight back"),
+    ("a cell count never stands in for a mode",
+     lambda js, html: (not _code_matches(js, r"===\s*144")
+                       and re.search(r"PV\.mode\s*===\s*'plane'\s*\?\s*\[2,8\]", js)),
+     "pstep read its pitch range off the cell count (w===144&&h===144 picks "
+     "2..8 instead of 8..84), so the plane's rule was really 'if there are many "
+     "cells, make "
+     "them tiny'. Any mode that was not 144 wide inherited the plane's range by "
+     "accident, and any future mode that WAS 144 wide would have been told it "
+     "was the plane. How large a cell may be drawn is a property of the mode; "
+     "the mode is a name, and this is the only place that was guessing it from "
+     "a number. pvCenter re-tested the count after already testing the mode — "
+     "harmless today and wrong the day a plane mode is not 144 wide"),
     ("the plane's grid names both of its sides",
      lambda js, html: (not _code_matches(js, r"\bPV\.n\b")
                        and len(_code_matches(js, r"PV\.w\s*=")) == len(_code_matches(js, r"PV\.h\s*="))),

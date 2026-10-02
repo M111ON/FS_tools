@@ -1607,22 +1607,62 @@ verified in a browser, against ground truth read from the corpus:
   SCRUB  screen "สว่าง   943 ช่อง ·  1,421 บรรทัด"  =    943 cells /  1,421 lines
 ```
 
-### 20.6 What is still not answered
+### 20.6 The mode is a name, not a cell count
 
-The kind filter answers "which cells hold this kind". The two axes §19.1
-measured and rejected are still rejected, and one is still owed:
+`pstep()` decides how large a cell may be drawn, and it decided by asking how
+many cells there were:
 
-- **`pstep()` still infers the mode from the cell count** (`w===144&&h===144?2:8`).
-  §19 noticed this and §14.6 forbids fixing it as a side effect. The
-  prerequisite is now DONE: `PV.n` is split into `PV.w`/`PV.h` across all
-  eighteen call sites in its own commit, each named for what it means — the
-  ghost-zone bound, the half-window, the lens's wrap stride and the hit-test are
-  per-axis, while the canvas stays square and is sized by the longer side.
-  Behaviour is unchanged, which is the whole point of doing it before a mode
-  exists that would have made the inference wrong in front of someone. What
-  remains is the inference itself: it should read `PV.mode`, and now that the
-  cell count is two honest numbers rather than one coincidence, nothing is left
-  to hide behind.
+```js
+const lo=w===144&&h===144?2:8, hi=w===144&&h===144?8:84;
+```
+
+Read plainly, the plane's rule was **"if there are many cells, make them
+tiny"**. That is a coincidence that happens to hold for exactly one mode. Every
+mode that is not 144 wide inherits the plane's pitch range by accident, and the
+day a mode *is* 144 wide and is not the plane, it will be told it is. §19
+noticed it; §14.6 forbade fixing it as a side effect, because at the time
+`PV.n` was one number standing for two axes and the fix had nowhere honest to
+stand.
+
+Both of those are now behind us. `PV.n` is split into `PV.w`/`PV.h` across all
+eighteen call sites in its own commit — each named for what it means (the
+ghost-zone bound, the half-window, the lens's wrap stride and the hit-test are
+per-axis; the canvas stays square and is sized by the longer side) — so the
+cell count is two honest numbers rather than one coincidence. And the mode is
+already a name, already set by every mode switch in the file. The fix is two
+lines:
+
+```js
+const [lo,hi]=PV.mode==='plane'?[2,8]:[8,84];
+```
+
+`pvCenter()` had the same shape one line of truth away: it tested
+`PV.mode==='plane'&&PV.w===144` for the torus ghost-zone bound, after
+`pvDerive()` had *already* set `PV.w=PV.h=T144` in that mode. The second test
+could only ever agree with the first — or, the day a plane mode is not 144
+wide, disagree with it and clamp the wrong bound. It is now `PV.mode` alone.
+
+Rendered output is byte-identical in all three modes, which is the point: the
+inference was never load-bearing, it was load-bearing **only by accident**.
+
+The invariant that guards it is negative and structural — *a cell count never
+stands in for a mode* — because a positive test would just be a second copy of
+the rule that could drift from the first. It asserts no `=== 144` survives in
+executable code, and that `pstep` branches on `PV.mode`. Two mutations prove it
+is not self-satisfying: putting the inference back (`w===144&&h===144?2:8`) and
+tying the pitch range to a different mode name (`'blocks'`) are both caught,
+and the first is caught by the regex alone.
+
+```
+ui_check OK (174,914 bytes · 37/37 invariants)   pool.py demo 321/321
+run_all 12/12 suites PASS   ui_browser_check 18/18 PASS
+```
+
+### 20.7 What is still not answered
+
+The kind filter answers "which cells hold this kind". Both axes §19.1 measured
+are now settled — one rejected, one paid for — and one is still owed:
+
 - **app as swimlanes** — the one axis the corpus has and the plane does not.
   The corpus is three non-overlapping eras: hermes `0–11,655` · index
   `11,656–25,229` · chatdrop `25,521–32,635` = 79% of the log, and the plane
