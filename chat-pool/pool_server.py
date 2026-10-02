@@ -10,17 +10,94 @@ GET  /                             → dashboard (single file, no CDN)
 """
 import json
 import os
+import re
 import sys
 import time
 import threading
+import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool
+import taskboard
+import ws_bridge
 
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
+
+# ── task board page (the inbox dashboard, rebuilt over /tasks) ───────
+# Read-only: a task changes by POST /task /task/update, never from the page.
+# The inbox source stays authoritative for what was posted there; this page is
+# the shared, owner-aware view every platform can read from the pool directly.
+TASKS_PAGE = """<!DOCTYPE html>
+<html lang=\"th\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>chat-pool · task board</title>
+<style>
+  :root { --bg:#0d1117; --surface:#161b22; --border:#30363d; --text:#e6edf3;
+          --muted:#8b949e; --accent:#58a6ff; --green:#3fb950; --yellow:#d29922;
+          --red:#f85149; --grey:#6e7681; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'SF Mono','Cascadia Code',monospace; background:var(--bg);
+         color:var(--text); padding:20px; }
+  .header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:16px; }
+  .header h1 { font-size:16px; }
+  .header a { color:var(--accent); font-size:12px; text-decoration:none; }
+  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; margin-bottom:20px; }
+  .stat { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+          padding:10px 12px; text-align:center; }
+  .stat .num { font-size:22px; font-weight:700; }
+  .stat .label { font-size:10px; color:var(--muted); text-transform:uppercase; margin-top:2px; }
+  .col-pending .num{color:var(--accent)} .col-in_progress .num{color:var(--yellow)}
+  .col-done .num{color:var(--green)} .col-blocked .num{color:var(--red)}
+  .sec { margin-bottom:22px; }
+  .sec h2 { font-size:12px; color:var(--muted); text-transform:uppercase;
+            letter-spacing:0.5px; margin-bottom:10px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+          padding:12px 14px; margin-bottom:6px; }
+  .card .t { font-size:13px; font-weight:600; margin-bottom:4px; }
+  .card .d { color:var(--muted); font-size:11px; line-height:1.5; white-space:pre-wrap; }
+  .card .meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;
+                font-size:10px; color:var(--muted); align-items:center; }
+  .pill { padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;
+          text-transform:uppercase; background:#1f2937; }
+  .pill-pending{color:var(--accent)} .pill-in_progress{color:var(--yellow);background:#2d1f00}
+  .pill-done{color:var(--green);background:#0d2818} .pill-blocked{color:var(--red);background:#2d1214}
+  .pill-cancelled{color:var(--grey)}
+  .owner { color:var(--text); }
+  .sub { border-left:2px solid var(--border); margin-left:14px; padding-left:10px; }
+  .muted { color:var(--muted); }
+</style></head><body>
+<div class=\"header\"><h1>chat-pool · task board</h1>
+<a href=\"/\">← pool dashboard</a></div>
+<div class=\"stats\" id=\"stats\"></div>
+<div id=\"board\">loading…</div>
+<script>
+const S={pending:'pending',in_progress:'working',done:'done',blocked:'blocked',cancelled:'cancelled'};
+function esc(s){return (s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}
+fetch('/tasks').then(r=>r.json()).then(j=>{
+  const tasks=j.tasks||[];
+  const by={}; tasks.forEach(t=>{(by[t.parent||'']=by[t.parent||'']||[]).push(t)});
+  const st=j.summary||{counts:{},in_progress:[]};
+  document.getElementById('stats').innerHTML=
+    ['pending','in_progress','done','blocked','cancelled'].map(s=>
+      `<div class=\"stat col-${s}\"><div class=\"num\">${st.counts[s]||0}</div><div class=\"label\">${S[s]}</div></div>`
+    ).join('')+`<div class=\"stat\"><div class=\"num\">${tasks.length}</div><div class=\"label\">total</div></div>`;
+  function card(t,sub){
+    const who=t.owner?`<span class=\"owner\">@${esc(t.owner)}</span>`:'<span class=\"muted\">unclaimed</span>';
+    const kids=(by[t.id]||[]).map(k=>card(k,true)).join('');
+    return `<div class=\"card\"><div class=\"t\">${esc(t.title)}</div>`+
+      (t.desc?`<div class=\"d\">${esc(t.desc)}</div>`:'')+
+      `<div class=\"meta\"><span class=\"pill pill-${t.status}\">${S[t.status]||t.status}</span>${who}`+
+      `<span>${esc(t.id)}</span>${t.tags.map(x=>`<span>#${esc(x)}</span>`).join('')}`+
+      (t.revs>1?`<span>rev ${t.revs}</span>`:'')+`</div></div>`+(kids?`<div class=\"sub\">${kids}</div>`:'');
+  }
+  const roots=(by['']||[]);
+  document.getElementById('board').innerHTML=
+    roots.length?roots.map(t=>card(t,false)).join(''):'<div class=\"muted\">board is empty — POST /task to add one</div>';
+}).catch(e=>{document.getElementById('board').textContent='load failed: '+e});
+</script></body></html>"""
 
 # A query parameter that could not be read as a number: the 400 answer is
 # already written when these come back, so the caller only has to return.
@@ -40,6 +117,108 @@ def _get_token():
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(tok)
     return open(TOKEN_FILE, encoding="utf-8").read().strip()
+
+
+# ── inbox → pool task bridge ─────────────────────────────────────────
+# The inbox-manager board (.inbox_state.json board, status todo|in_progress|...)
+# is a local file one app owns. The pool is where every platform already meets,
+# so the bridge reads that file over the inbox dashboard's own /api/state and
+# writes each card into the chain as a task — owner-aware, deduped by source id.
+# The inbox board stays the source of record; the pool mirrors status so any
+# OTHER platform can see and claim work without touching that file.
+_INBOX_STATUS = {"todo": "pending", "in_progress": "in_progress", "done": "done",
+                 "blocked": "blocked", "cancelled": "cancelled"}
+
+
+def _inbox_board():
+    """Read the live inbox board. INBOX_STATE_FILE (a .inbox_state.json) is
+    tried first — no network, works even when the inbox dashboard is down —
+    then the dashboard's own /api/state at INBOX_STATE_URL (default
+    http://127.0.0.1:5000/api/state). Returns (board, err)."""
+    path = os.environ.get("INBOX_STATE_FILE", "")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            return (d.get("board") or []), None
+        except Exception as e:
+            return [], str(e)
+    url = os.environ.get("INBOX_STATE_URL", "http://127.0.0.1:5000/api/state")
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return (d.get("board") or []), None
+    except Exception as e:
+        return [], str(e)
+
+
+def _src_of(t):
+    return (t.get("tags") or [""])[0].startswith("src:")
+
+
+def _inbox_sync_tasks(apply=False):
+    """Diff the inbox board against pool tasks and return the plan; with
+    apply=True, execute it. Import rules:
+      - card status must map (unknown statuses are skipped, reported)
+      - title[:80] becomes the task title, deduped by the src:<id> tag
+      - in_progress cards get owner=inbox-manager (ใครกำลังทำอยู่)
+      - done/cancelled cards import as their terminal status (history)
+    Returns {cards, imported, updated, skipped, actions} — actions carry the
+    task id + what would happen, so a dry-run is the same shape as the result."""
+    board, err = _inbox_board()
+    if err:
+        return {"ok": False, "error": err, "imported": 0, "updated": 0, "actions": []}
+    # existing mirrored tasks by their src: tag
+    existing = {}
+    for t in taskboard.task_list():
+        for tag in t.get("tags", []):
+            if tag.startswith("src:"):
+                existing[tag] = t
+    actions, imported, updated, skipped = [], 0, 0, 0
+    app = "inbox-bridge"
+    for c in board:
+        cid = str(c.get("id", ""))
+        src = "src:inbox-%s" % cid
+        st = _INBOX_STATUS.get(c.get("status", ""))
+        title = (c.get("title") or "").strip()[:80]
+        if not cid or not title:
+            skipped += 1
+            actions.append({"card": cid, "op": "skip", "why": "missing id/title"})
+            continue
+        if st is None:
+            skipped += 1
+            actions.append({"card": cid, "op": "skip", "why": "unknown status %r" % c.get("status")})
+            continue
+        desc = (c.get("body") or "").strip()
+        cur = existing.get(src)
+        if cur is None:
+            actions.append({"card": cid, "op": "import", "status": st,
+                            "title": title,
+                            "owner": "inbox-manager" if st == "in_progress" else ""})
+            if apply:
+                row = taskboard.task_create(app, title, desc=desc,
+                                            tags=src, status=st,
+                                            owner="inbox-manager" if st == "in_progress" else "")
+                actions[-1]["id"] = row["id"]
+            imported += 1
+        elif cur["status"] != st:
+            actions.append({"card": cid, "op": "update", "id": cur["id"],
+                            "from": cur["status"], "to": st})
+            if apply:
+                taskboard.task_update(app, cur["id"], status=st,
+                                      note="sync from inbox card #%s" % cid)
+            updated += 1
+    if apply and (imported or updated):
+        try:
+            if not pool.is_registered(app):
+                pool.register_app(app)
+            else:
+                pool.touch_app(app)
+        except Exception:
+            pass
+    return {"ok": True, "cards": len(board), "imported": imported,
+            "updated": updated, "skipped": skipped,
+            "applied": bool(apply), "actions": actions}
 
 
 def _lan_ips():
@@ -575,11 +754,15 @@ button.send:disabled{opacity:.55;cursor:progress}
       <label class="clabel"><input type="checkbox" id="pv-bonds" checked style="accent-color:var(--acc2)"> เส้นเชื่อม</label>
       <label class="clabel"><input type="checkbox" id="pv-ctx" style="accent-color:var(--acc2)"> ความจำ</label>
       <label class="clabel" title="ให้สีตามความหมายของเส้น (uses/produces/...) — สีประจำความหมายไม่เปลี่ยนระหว่างการวาด"><input type="checkbox" id="pv-rel" checked style="accent-color:var(--acc2)"> สีตามความหมาย</label>
-      <select id="pv-colour" title="สีของช่อง = ข้อมูลที่กำลังดูอยู่ (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)">
+      <select id="pv-colour" title="สีของช่อง = ข้อมูลที่กำลังดูอยู่ (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ชนิดของบรรทัด / ล่าสุดเมื่อไร)">
         <option value="density">สี: จำนวนบรรทัด</option>
         <option value="heat">สี: ความร้อน</option>
         <option value="writer">สี: ใครเขียนล่าสุด</option>
+        <option value="kind">สี: ชนิดของบรรทัด</option>
         <option value="recent">สี: ล่าสุดเมื่อไร</option>
+      </select>
+      <select id="pv-kind" title="กรองตามชนิดของบรรทัด — สีและความสว่างของช่องจะเปลี่ยนไปตามชนิดที่เลือก ส่วนที่ไม่ใช่ชนิดนั้นจะจางลง (ยังนับรวมอยู่) · ตัวเลขที่ผู้อ่านเห็นยังนับทุกชนิด ไม่ใช่เฉพาะที่กรอง">
+        <option value="">ทุกชนิด</option>
       </select>
       <select id="pv-style" title="วิธีวาดเส้นเชื่อม" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
         <option value="auto">อัตโนมัติ (วัดแล้ว)</option>
@@ -662,6 +845,29 @@ const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&qu
 
 function fmt(t){const d=new Date(t*1000);return d.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'})+(d.getDate()!=new Date().getDate()?' '+d.toLocaleDateString('th-TH',{day:'2-digit',month:'short'}):'')}
 function hash8(h){return h?h.slice(0,8):''}
+const REL_TH={'x-uses-term':'อ้างถึงศัพท์ของอีกฝั่ง','x-hint-is-term':'หัวเรื่องคือศัพท์ของอีกฝั่ง',
+  'x-same-hint':'หัวเรื่องเดียวกัน','x-same-workspace':'พื้นที่ทำงานเดียวกัน',
+  'x-next-chunk':'ต่อเนื่องกัน','x-next-in-session':'ต่อเนื่องในเซสชันเดียวกัน',
+  'x-answers':'ตอบกลับ','uses':'ใช้','produces':'ผลิต','validates':'ยืนยัน',
+  'decides':'ตัดสิน','follows':'ตามหลัง','contradicts':'ขัดแย้ง'};
+// bond text `src rel dst` — space- or newline-separated (writers differ);
+// → human line; null when not a bond (caller falls back to raw text)
+function bondShort(full){
+  const p=String(full||'').match(/^\s*([0-9a-f]{64})\s+(\S+)\s+([0-9a-f]{64})\s*$/);
+  if(!p)return null;
+  return {html:'เชื่อมบันทึกสองชิ้น: '+esc(REL_TH[p[2]]||p[2])
+    +' <span style="color:var(--dim)">· '+hash8(p[1])+' → '+hash8(p[3])+'</span>',
+    title:String(full||'')};
+}
+// pointer text `point=N level=L` → human line; null otherwise
+function pointerShort(full){
+  const p=String(full||'').match(/^point=(\d+) level=(\d+)$/);
+  if(!p)return null;
+  const lv=['ช่อง','บล็อก 12×12','ทั้งระนาบ'][+p[2]]||('ชั้น '+p[2]);
+  return {html:'อ่าน'+esc(lv)+'ที่ '+p[1]
+    +' <span style="color:var(--dim)">· จุดวงฟ้าบนแผนที่ = ที่ที่แอปนี้กำลังดูอยู่</span>',
+    title:String(full||'')};
+}
 function tickOf(m){return m.seq==null?null:Math.floor(m.seq/CHUNK)}
 // what the filters admit, before the curator is consulted
 // a machine line is DATA ABOUT THE SYSTEM, not something someone said — a bond
@@ -672,6 +878,30 @@ function tickOf(m){return m.seq==null?null:Math.floor(m.seq/CHUNK)}
 // search that NAMES a hash must still find its card, which is why the filter
 // stays inside inScope() rather than the renderer.
 const MACHINE_KINDS=new Set(['bond','pointer','unbind']);
+/* ONE table for every kind on screen, read by BOTH the feed badge and the
+   plane's colour legend. Two tables for one job is the drift §17.5 already
+   paid for with the curator rules: add a kind to one and the other prints the
+   wire name, and the symptom is invisible because the page still renders.
+   The words are Thai because these are read by people who did not build it;
+   the wire keeps its own spelling underneath (§17.2).
+
+   `kindIsChat` is a FUNCTION, not a comparison, for the same reason
+   curator_protect() compares a kind by value: the corpus writes CHAT in caps
+   and bond/pointer/block in lower, so `kind==='chat'` matched none of the
+   13,746 chat lines — every one of them grew a badge reading "CHAT". A kind
+   is a value, never a spelling. */
+const KIND_TH={CHAT:'แชท',DECISION:'ข้อสรุป',bond:'เส้นเชื่อม',pointer:'รอยอ่าน',
+  block:'ความจำ',unbind:'ยกเลิกเส้นเชื่อม',msg:'ข้อความ',bridge:'สะพาน'};
+const kindIsChat=k=>String(k||'chat').trim().toLowerCase()==='chat';
+const kindLabel=k=>KIND_TH[k]||(kindIsChat(k)?KIND_TH.CHAT:'อื่น ๆ ('+(k||'?')+')');
+/* The plane's palette. Kinds are a CLOSED, tiny set — eight across 32,685
+   lines — so they get FIXED hues rather than the app hash: a hash is stable
+   but not learnable, and nothing would ever tell the reader that one hue means
+   "bonds" twice. Hand-spaced so no two sit next to each other: 20 · 60 · 135 ·
+   172 · 210 · 280 · 330. An unknown kind falls back to the app hash rather
+   than taking a colour that already means something else. */
+const KIND_HUE={DECISION:20,block:60,CHAT:135,bridge:172,bond:210,pointer:280,
+  msg:330,unbind:210};
 // which machine kinds the reader has ASKED to see. `all` is the old "show
 // everything": one state variable per question — "show bonds?", "show
 // pointers?" — instead of one boolean over both, because wanting to audit who
@@ -715,9 +945,9 @@ function parseBlockText(t){
 function card(m){
   const kind=m.kind||'chat';
   // the two card-shaped machine kinds get names a reader owns, not the wire's:
-  // a bond is a connection, a pointer is a record of a read
-  const KIND_TH={bond:'เส้นเชื่อม',pointer:'รอยอ่าน',unbind:'ยกเลิกเส้นเชื่อม',block:'ความจำ'};
-  const kbadge=kind==='chat'?'':`<span class="badge kind" title="${MACHINE_KINDS.has(kind)?'บันทึกของระบบ — เป็นข้อมูลที่แผนที่ใช้วาดเส้น/วง ไม่ใช่ข้อความคุย':''}">${KIND_TH[kind]||esc(kind)}</span>`;
+  // a bond is a connection, a pointer is a record of a read — from the one
+  // KIND_TH, so the feed badge and the plane legend cannot disagree on a word
+  const kbadge=kindIsChat(kind)?'':`<span class="badge kind" title="${MACHINE_KINDS.has(kind)?'บันทึกของระบบ — เป็นข้อมูลที่แผนที่ใช้วาดเส้น/วง ไม่ใช่ข้อความคุย':''}">${esc(kindLabel(kind))}</span>`;
   const arrow=m.to&&m.to!=='all'?`<span class="badge kind">→ ${esc(m.to)}</span>`:'';
   const quiet=!!(m.cur&&m.cur.h);
   const full=String(m.text==null?'':m.text);
@@ -734,11 +964,6 @@ function card(m){
     // longer the first thing the eye lands on.
     const p=full.match(/^([0-9a-f]{64}) (\S+) ([0-9a-f]{64})$/);
     if(p){
-      const REL_TH={'x-uses-term':'อ้างถึงศัพท์ของอีกฝั่ง','x-hint-is-term':'หัวเรื่องคือศัพท์ของอีกฝั่ง',
-        'x-same-hint':'หัวเรื่องเดียวกัน','x-same-workspace':'พื้นที่ทำงานเดียวกัน',
-        'x-next-chunk':'ต่อเนื่องกัน','x-next-in-session':'ต่อเนื่องในเซสชันเดียวกัน',
-        'x-answers':'ตอบกลับ','uses':'ใช้','produces':'ผลิต','validates':'ยืนยัน',
-        'decides':'ตัดสิน','follows':'ตามหลัง','contradicts':'ขัดแย้ง'};
       const rel=REL_TH[p[2]]||p[2];
       return `<div class="msg quiet" data-m="${esc(m.hash||'')}"><div class="top">`
         +`<span class="badge">${esc(m.app||'?')}</span>${kbadge}`
@@ -1159,6 +1384,9 @@ const SAY_ERRORS=[
   [/\?hash=/, ()=>'ต้องระบุบรรทัดที่จะเปิด'],
   // ── what was named, and whether it exists or is allowed
   [/^no such block: (\S+)/, m=>`ไม่พบบันทึกความจำชื่อ “${m[1]}”`],
+  [/^no such task: (\S+)/, m=>`ไม่พบ task ชื่อ “${m[1]}”`],
+  [/is not a task \(/, ()=>'บล็อกนี้ไม่ใช่ task — title ต้องขึ้นต้นด้วย [สถานะ]'],
+  [/^id required/, ()=>'ต้องระบุ id ของ task ที่จะอัปเดต'],
   [/^(\S+) not registered/, m=>`แอป “${m[1]}” ยังไม่ได้ลงทะเบียนไว้กับพูล — ลงทะเบียนก่อนจึงจะเขียนได้`],
   [/^invalid app name/, ()=>'ชื่อแอปใช้ไม่ได้ — ใช้ได้เฉพาะ a–z 0–9 _ - ยาว 1–32 ตัว'],
   [/^slug must be/, ()=>'ชื่อความจำ (slug) ใช้ไม่ได้ — ต้องขึ้นต้นด้วย a–z หรือ 0–9 แล้วตามด้วย a–z 0–9 . _ - ไม่เกิน 48 ตัว'],
@@ -1423,7 +1651,11 @@ const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
           bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
           style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
           autoAt:120,hubK:12,relColour:true,   // measured: past ~120 edges a full draw is mostly ink
-          colour:'density',cellApp:{},cellSeq:{},cellSeqMax:0,metaOn:false,rib:null,
+          colour:'density',cellApp:{},cellKind:{},cellSeq:{},cellSeqMax:0,metaOn:false,rib:null,
+          // the kind FILTER: a kind, or null for every kind. `kinds` is the whole
+          // map split by kind ({kind:{rkey:n}}), fetched with the meta layer and
+          // only when a filter is actually opened.
+          kinds:{},kindOnly:null,
           // prune: the PLANE drops the keeper's noise instead of dimming it, so
           // a cell that lived on nothing but tests leaves the map. Off = the
           // honest raw plane, refetched with &raw=1, for judging the rules.
@@ -1467,10 +1699,15 @@ function pstep(){
 // the plane at tick S: every line whose append ordinal is <= S, counted
 // straight from the log's own order — no wall clock is consulted anywhere
 function pvCellsUpTo(S){
-  const c={};
+  const c={},only=PV.kindOnly;
   for(let i=0;i<PV.timeline.length&&i<=S;i++){
-    const rk=PV.timeline[i][2];
-    if(rk!=null)c[rk]=(c[rk]||0)+1;
+    const row=PV.timeline[i],rk=row[2];
+    if(rk==null)continue;
+    // the scrub counts the log's own order, so it has to honour the filter the
+    // same way the live plane does — otherwise dragging time back paints a
+    // plane the filter is not describing
+    if(only&&row[3]!==only)continue;
+    c[rk]=(c[rk]||0)+1;
   }
   return c;
 }
@@ -1995,10 +2232,92 @@ const pvTopApps=()=>{
   const n={};Object.keys(PV.cellApp).forEach(k=>{const a=PV.cellApp[k]||'?';(n[a]=n[a]||0)});
   return Object.keys(n).length?n:null;
 };
+/* KIND_TH, KIND_HUE and kindLabel live at the top of the script, next to
+   MACHINE_KINDS, because the feed badge needs them too. Only the plane's ink
+   is here: the same hue formula pvAppInk uses, so a cell drawn by kind and a
+   bar drawn by writer share one ramp and one alpha curve. */
+function pvKindHue(k){const h=KIND_HUE[k];return h===undefined?pvAppHue(k):h}
+const pvKindInk=(k,rel)=>'hsla('+pvKindHue(k)+',72%,'+Math.round(38+26*Math.max(0,Math.min(1,rel)))
+  +'%,'+Math.min(1,0.34+0.62*rel).toFixed(2)+')';
+const pvTopKinds=()=>{
+  const n={};Object.keys(PV.cellKind).forEach(k=>{const a=PV.cellKind[k]||'?';(n[a]=(n[a]||0)+1)});  // the +1 is the whole function: `n[a]=n[a]||0` reads a count and writes it back, so every kind reported 0 cells and both the filter's list and the legend said "(0)". A label nobody checks is a label that lies quietly.
+  return Object.keys(n).length?n:null;
+};
+
+/* ── the kind filter ──────────────────────────────────────────────────
+   ONE function answers "what is the map drawing", because the base pass, the
+   torus ghost pass, the glass and the legend each used to ask their own
+   question and were free to answer it differently (§13: one value, one view).
+
+   Two numbers, on purpose, and never confused:
+
+   * the PICTURE is drawn from the filtered counts — otherwise the filter
+     tints the map without moving a single shade, and the busiest cell overall
+     still owns the whole ramp, so "filter to bonds" looks like nothing happened;
+   * the NUMBER a reader is told stays the TOTAL, and both are printed. A cell
+     that reports 0 while it holds 34 lines is the §18 failure wearing a filter,
+     and nothing on screen would be saying otherwise.
+
+   `null` for a kind with no cells in this view is NOT treated as "no filter":
+   the filter stays on and the status line says the kind is empty here, because
+   silently drawing the unfiltered map under a filter that claims to be on is the
+   one answer this must never give. */
+function pvFilt(){return(PV.kindOnly&&PV.kinds[PV.kindOnly])||null}
+function pvKindN(rk){const f=pvFilt();return f?(f[rk]||0):0}
+function pvInkAt(rk,rel){
+  const f=pvFilt();
+  // filtered out: a neutral grey, deliberately NOT a kind hue. A hashed hue for
+  // a cell that holds none of the asked-for kind would look like a seventh
+  // kind in the legend, which is a claim the data does not make.
+  if(f&&!f[rk])return 'rgba(139,148,158,0.13)';
+  return pvCellInk(rk,rel);
+}
+function pvDrawMax(){
+  const f=pvFilt(),vals=f?Object.values(f):Object.values(PV.cells);
+  return vals.length?Math.max(...vals):1;
+}
+function pvKindOptions(){
+  const sel=$('#pv-kind');if(!sel)return;
+  const ks=pvTopKinds();
+  // Build the html the reader SHOULD see, then compare. One comparison, and it
+  // is correct whether the list is empty, half-built, or already right.
+  //
+  // Both earlier versions compared the wrong thing and neither was caught. The
+  // first asked `ks.join('|')` of a COUNT OBJECT — undefined, so the guard
+  // itself threw a TypeError on every path that had kinds to show, and the list
+  // was never built at all. The second asked `have[0]!==''`, which is TRUE when
+  // the list is empty (have[0] is undefined), so it returned early on the one
+  // case it existed to handle. The maths probe stayed green through both: four
+  // correct functions behind an unreachable <select> look exactly like a pass to
+  // a check that only computes.
+  // The count beside each kind is what choosing it will LIGHT UP, not the colour
+  // layer's "cells whose last line was this" (pvTopKinds). They are different
+  // numbers and they disagreed on screen: the list said bonds (1961), the status
+  // line then said สว่าง 2,651 ช่อง. A filter's number has to predict the
+  // filter, or the reader is asked to trust two numbers about one click.
+  const nLit=k=>PV.kinds&&PV.kinds[k]?Object.keys(PV.kinds[k]).length:0;
+  const want=ks
+    ?'<option value="">ทุกชนิด</option>'
+      +Object.keys(ks).sort((a,b)=>nLit(b)-nLit(a)||ks[b]-ks[a])
+        .map(k=>'<option value="'+esc(k)+'">'+esc(kindLabel(k))+' ('+nLit(k)+')</option>').join('')
+    // No layer yet: the control must ASK for what it needs. It used to be
+    // disabled with a single option, so it could never fire the change handler
+    // that loads the very layer it needs — the only way in was to first pick a
+    // meta-backed COLOUR, a control the reader has no reason to touch.
+    :'<option value="">ทุกชนิด</option><option value="__load">โหลดรายชื่อชนิด… (ครั้งแรก)</option>';
+  // No churn per frame: this runs on every mode change, and rebuilding the
+  // options resets an open dropdown under the reader's cursor. The VALUE is
+  // still synced every call — an early `return` here (the first version) left
+  // the control showing yesterday's filter, which the probe caught.
+  if(sel._kindHtml!==want){sel.innerHTML=want;sel._kindHtml=want;}
+  sel.value=(PV.kindOnly&&ks&&ks[PV.kindOnly]!==undefined)?PV.kindOnly:'';
+  sel.disabled=false;
+}
 // rel is the value normalised to the busiest cell: how loud this cell is
 function pvCellInk(rk,rel){
   if(PV.colour==='heat')return pvHeatCSS(Math.sqrt(rel),0.95);
   if(PV.colour==='writer')return pvAppInk(PV.cellApp[rk],rel);
+  if(PV.colour==='kind')return pvKindInk(PV.cellKind[rk],rel);
   if(PV.colour==='recent'){
     // "when did this address last change": the ordinal of its newest line,
     // straight from the fold — no clock anywhere in the picture
@@ -2136,9 +2455,11 @@ function pvLensInfo(){
   if(!PV.lens.on){el.textContent='';return}
   const w=Math.floor(PV.lens.wedge),r=Math.floor(PV.lens.ring);
   const at=m?Math.round(100*z/m):0;
+  const f2=pvFilt(),ct=Math.floor(L.wedge)+Math.floor(L.ring)*144;
   el.textContent='🔍 ×'+z+(z>=m?' ⛔':'')+' · '+lv[1]+' · (คอลัมน์ '+w+', แถว '+r+')'
-    +' · ขยายแล้ว '+at+'% ของความละเอียดจริง';
-  el.title=lv[2];
+    +' · ขยายแล้ว '+at+'% ของความละเอียดจริง'
+    +(f2?(' · '+kindLabel(PV.kindOnly)+' '+pvKindN(ct)+' จาก '+pvValAt(ct)):'');
+  el.title=lv[2]+(f2?(' · กรอง: '+kindLabel(PV.kindOnly)+' — ตัวเลขในแว่นนับทุกชนิด'):'');
 }
 function pvLensDraw(c){
   const L=PV.lens;if(!L.on)return;
@@ -2156,8 +2477,8 @@ function pvLensDraw(c){
 function pvLensOne(c,ox,oy,r,primary){
   const L=PV.lens,step=pstep(),cs=pvLensCS();
   const z=pvLensZ(),lv=pvLensLevel(cs);
-  const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
-  const keep=pvKeep(),half=Math.ceil(r/cs)+1;
+  const max=pvDrawMax();
+  const keep=pvKeep(),filt=pvFilt(),half=Math.ceil(r/cs)+1;
   c.save();
   c.beginPath();c.arc(ox,oy,r,0,7);c.clip();
   c.fillStyle='#0a0e14';c.fillRect(ox-r,oy-r,2*r,2*r);
@@ -2170,8 +2491,9 @@ function pvLensOne(c,ox,oy,r,primary){
     for(let dx=-half;dx<=half;dx++){
       const px=ox+(dx-fw)*cs;if(px+cs<ox-r||px>ox+r)continue;        const P=pvLensPt(cw+dx,cr+dy),rk=P[1]*144+P[0],v=pvValAt(rk);
       if(!v&&cs<7)continue;
-      c.globalAlpha=(!keep||keep.has(rk))?1:0.15;
-      c.fillStyle=v?pvCellInk(rk,v/max):'#121821';
+      const gh=filt?(filt[rk]||0):v;          // the SHADE follows the filter
+      c.globalAlpha=((!keep||keep.has(rk))&&(!filt||gh>0))?1:0.15;
+      c.fillStyle=v?(filt&&!gh?'#121821':pvCellInk(rk,gh/max)):'#121821';
       c.fillRect(px+.5,py+.5,cs-1,cs-1);
       // at this size the NUMBER is the data — a colour ramp a reader has to
       // remember is worse than the count written where it happened
@@ -2312,7 +2634,8 @@ function pvBaseKey(px,bw){
     PV.showBonds,PV.ctxOn,PV.style,PV.hubK,PV.relColour,PV.prune,PV.cellSeqMax,
     o?o.wedge:null,o?o.ring:null,PV.bOrig.x,PV.bOrig.y,
     _idOf(PV.cells),_idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.sights),
-    _idOf(PV.cellApp),_idOf(PV.cellSeq)].join('|');
+    _idOf(PV.cellApp),_idOf(PV.cellSeq),_idOf(PV.cellKind),
+    _idOf(PV.kinds),PV.kindOnly].join('|');
 }
 let _baseKey=null,_baseCv=null;
 function pvBase(px,bw){
@@ -2332,27 +2655,32 @@ function pvBase(px,bw){
 function pvBasePaint(c,px){
   const n=PV.n,step=pstep();
   c.fillStyle='#0a0e14';c.fillRect(0,0,px,px);
-  const vals=Object.values(PV.cells),max=vals.length?Math.max(...vals):1;
-  const keep=pvKeep();
-  if(!vals.length){
+  const max=pvDrawMax();
+  const keep=pvKeep(),filt=pvFilt();
+  if(!Object.keys(PV.cells).length){
     c.fillStyle='#8b949e';c.font='12px monospace';c.textAlign='center';
     c.fillText('ยังไม่มีบรรทัดในมุมมองนี้',px/2,px/2);c.textAlign='left';
   }
   pvGrid(c,n,step,px);
   // the three busiest cells get a glow: at plane scale they are the only
   // landmarks, and "where is the weight" is the first question anyone asks
-  const hubs=new Set(Object.keys(PV.cells).map(Number)
-    .sort((a,b)=>PV.cells[b]-PV.cells[a]).slice(0,3).filter(k=>PV.cells[k]>1));
+  // the hubs are the busiest cells OF WHAT IS DRAWN: under a filter that is the
+  // busiest cell of the filtered kind, or the gold rings would crown cells that
+  // hold none of it
+  const hk=Object.keys(filt||PV.cells).map(Number);
+  const hv=k=>filt?filt[k]:PV.cells[k];
+  const hubs=new Set(hk.sort((a,b)=>hv(b)-hv(a)).slice(0,3).filter(k=>hv(k)>1));
   for(const k in PV.cells){
     const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
-    const near=!keep||keep.has(+k);
-    const rel=PV.cells[k]/max;
+    const hit=filt?(filt[k]||0):PV.cells[k];
+    const near=(!keep||keep.has(+k))&&(!filt||hit>0);
+    const rel=hit/max;
     // at plane scale one cell is ~3px, so a single line is nearly invisible;
     // every occupied cell gets a floor of 2px so the map is actually readable
     const w=Math.max(step,2),o=(w-step)/2;
     const gap=step>=6?1:0;                      // a hairline between cells
     c.globalAlpha=near?1:0.12;                  // masked = barely there
-    c.fillStyle=pvCellInk(+k,rel);
+    c.fillStyle=pvInkAt(+k,rel);
     c.fillRect(x*step-o+gap/2,y*step-o+gap/2,w-gap,w-gap);
     if(hubs.has(+k)){
       c.strokeStyle='rgba(255,212,121,.85)';c.lineWidth=1;
@@ -2370,7 +2698,8 @@ function pvBasePaint(c,px){
       const rk=+k,cx=rk%144,cy=Math.floor(rk/144);
       const ghosts=ghostOffsets(cx,cy);
       if(!ghosts.length)continue;
-      const near=!keep||keep.has(rk),rel=PV.cells[k]/max;
+      const gh=filt?(filt[k]||0):PV.cells[k];
+      const near=(!keep||keep.has(rk))&&(!filt||gh>0),rel=gh/max;
       const w=Math.max(step,2),o=(w-step)/2,gap=step>=6?1:0;
       c.globalAlpha=near?0.65:0.08;
       c.fillStyle=pvCellInk(rk,rel);
@@ -2521,11 +2850,16 @@ let _legendKey=null;   // redrawing a legend 16x/s during replay is pure waste
 function pvLegend(){
   const box=$('#pv-legend');if(!box)return;const cells=PV.cells;
   const hubs=Object.keys(cells).map(Number).sort((a,b)=>cells[b]-cells[a]).slice(0,3);
-  const key=[PV.colour,PV.metaOn,Object.keys(cells).length,hubs.join(','),PV.cellSeqMax].join('|');
+  const key=[PV.colour,PV.metaOn,Object.keys(cells).length,hubs.join(','),PV.cellSeqMax,
+    _idOf(PV.cellKind)].join('|');
   if(key===_legendKey)return;
   _legendKey=key;
   const end=(a,b)=>'<span>'+a+' → '+b+'</span>';
   let h='';
+  const f=pvFilt();
+  if(f)h+='<div style="color:var(--warn)">กรอง: '+esc(kindLabel(PV.kindOnly))
+    +' — <b>สีและความสว่าง</b> นับเฉพาะชนิดนี้ · ช่องที่ไม่มีชนิดนี้จางเป็นสีเทา'
+    +' · <b>ตัวเลขที่ผู้อ่านเห็น</b> (ช่อง / แว่น / ทิป) นับทุกชนิดเหมือนเดิม</div>';
   if(PV.colour==='writer'){
     const apps=pvTopApps();
     h='<div style="color:var(--fg)">สี = แอปที่เขียนล่าสุดในช่องนั้น</div>';
@@ -2533,6 +2867,18 @@ function pvLegend(){
       +'<span style="width:11px;height:11px;border-radius:3px;background:'+pvAppInk(a,1)+';display:inline-block"></span>'
       +esc(a)+'</span>').join('')
       :'<span style="color:var(--warn)">ยังโหลดข้อมูลผู้เขียนไม่เสร็จ — เลือกสีนี้ใหม่อีกครั้ง</span>';
+  }else if(PV.colour==='kind'){
+    // the count beside each swatch is how many CELLS carry that kind last, so
+    // the legend says what the picture is showing rather than how many lines
+    // exist — those two numbers are different and only one of them is drawn
+    const ks=pvTopKinds();
+    h='<div style="color:var(--fg)">สี = ชนิดของบรรทัดล่าสุดในช่องนั้น</div>';
+    h+=ks?Object.keys(ks).sort((a,b)=>ks[b]-ks[a]).map(k=>
+      '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:9px"'
+      +' title="'+esc(k)+' · '+ks[k]+' ช่อง">'
+      +'<span style="width:11px;height:11px;border-radius:3px;background:'+pvKindInk(k,1)+';display:inline-block"></span>'
+      +esc(kindLabel(k))+' <span style="color:var(--dim)">'+ks[k]+'</span></span>').join('')
+      :'<span style="color:var(--warn)">ยังโหลดข้อมูลชนิดไม่เสร็จ — เลือกสีนี้ใหม่อีกครั้ง</span>';
   }else if(PV.colour==='recent'){
     h='<div style="color:var(--fg)">สี = ช่องนี้เปลี่ยนล่าสุดเมื่อไร</div>'
       +'<span class="pvgrad" style="background:linear-gradient(90deg,'+pvRampCSS().join(',')+')"></span>'
@@ -2720,13 +3066,45 @@ function pvInfo(){
     ?(()=>{const owners=pvTopApps();return PV.metaOn
       ?(' · ข้อมูลผู้เขียน: '+(owners?Object.keys(owners).length:0)+' คน · ใหม่สุดที่บรรทัด '+Math.max(PV.cellSeqMax-1,0))
       :' · ข้อมูลผู้เขียน: ยังไม่โหลด'})()
-    :'';
+    :(PV.colour==='kind'
+    ?(()=>{const ks=pvTopKinds();return PV.metaOn
+      ?(' · ข้อมูลชนิด: '+(ks?Object.keys(ks).length:0)+' ชนิด · ใหม่สุดที่บรรทัด '+Math.max(PV.cellSeqMax-1,0))
+      :' · ข้อมูลชนิด: ยังไม่โหลด'})()
+    :'');
   // One line on screen, everything else in the tooltip. This used to be a single
   // 166-CHARACTER line, which on a 709px screen took a row of its own: the
   // header measured 108px tall — three rows — for a caption. The numbers are not
   // less true for being short; they were just the loudest thing in a modal whose
   // job is to show a map.
+  // A filter that is ON but matches nothing is a state the reader must be told
+  // about, never one the map quietly answers by drawing the unfiltered plane.
+  const f=pvFilt();
+  // Counted over `src` — the cells actually on screen — not over the whole-log
+  // map. Quoting PV.kinds here was right on the live plane and wrong the moment
+  // time was scrubbed back: the picture fell to 1,421 bond lines while this
+  // line still said 13,572. A number describing a different frame than the one
+  // drawn is the exact failure this section exists to prevent, and the prune
+  // figures a few lines above had already been fixed for the same reason ("say
+  // it only about the LIVE plane") — the filter had not learned it.
+  // The figures must describe THIS frame, and `src` means two different things:
+  // on the LIVE plane it is the unfiltered map, so the filter is an intersection
+  // with f. While scrubbing, pvCellsUpTo has ALREADY applied the filter, so src
+  // is the answer — and summing the whole-log f[k] over it added bonds that had
+  // not happened yet (the line said 7,938 while the picture held 1,421). Two
+  // branches, because one rule cannot honestly describe both frames.
+  const scrubbed=(PV.seq!==null&&PV.seq<PV.seqMax-1);
+  const filt=PV.kindOnly
+    ?(!f?(' · กรอง: '+kindLabel(PV.kindOnly)+' — ยังไม่มีข้อมูลชนิดนี้ในคลัง')
+        :(()=>{const lit=scrubbed?Object.keys(src):Object.keys(src).filter(k=>f[k]);
+          const n=scrubbed?Object.values(src).reduce((a,b)=>a+b,0)
+                          :lit.reduce((a,k)=>a+f[k],0);
+          return lit.length
+            ?(' · กรอง: '+kindLabel(PV.kindOnly)+' · สว่าง '+lit.length.toLocaleString()
+               +' ช่อง · '+n.toLocaleString()+' บรรทัดของชนิดนี้')
+            :(' · กรอง: '+kindLabel(PV.kindOnly)+' — ยังไม่มีข้อมูลชนิดนี้ในมุมมองนี้');})())
+    :'';
   const short='• '+Object.keys(src).length.toLocaleString()+'/20,736 ช่อง · '+tot.toLocaleString()+' บรรทัด'
+    +filt
     +(!PV.prune?' · 🧹 ตัดขยะ: ปิด':(PV.pruned&&PV.seq===null?' · 🧹 ตัด '+PV.pruned.toLocaleString():''))
     +(radius?(' · รัศมี '+PV.focus+' ทอด = '+radius.size.toLocaleString()+' ช่อง'):'');
   const info=$('#plane-info');
@@ -2747,6 +3125,7 @@ function pvMode(){
   if(PV_WINS.indexOf(PV.win)>=0)$('#pv-win').value=String(PV.win);
   _legendKey=null;                         // a new view is a new legend
   pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
+  pvKindOptions();pvLensInfo();
 }
 // One place that moves time, so the slider, the arrow keys, the strip and the
 // replay button can never disagree about where "now" is.
@@ -2767,9 +3146,10 @@ async function loadMeta(){
     // prune off we ask for the unpruned layer, or a colour mode would
     // attribute a cell to a writer whose only line in it was noise
     const m=await fetch('/plane/meta'+(PV.prune?'':'?raw=1'),{headers:H}).then(r=>r.json());
-    PV.cellApp=m.last_app||{};PV.cellSeq=m.last_seq||{};
+    PV.cellApp=m.last_app||{};PV.cellSeq=m.last_seq||{};PV.cellKind=m.last_kind||{};
+    PV.kinds=m.by_kind||{};
     PV.cellSeqMax=Math.max(m.seq_max||0,1);PV.metaOn=true;_legendKey=null;
-  }catch(e){toast('โหลดข้อมูลผู้เขียน/เวลาไม่สำเร็จ — เลือกสีนั้นอีกครั้ง')}
+  }catch(e){toast('โหลดข้อมูลผู้เขียน/ชนิด/เวลาไม่สำเร็จ — เลือกสีนั้นอีกครั้ง')}
 }
 function pvPNG(){
   const tick=PV.seq===null?Math.max(PV.seqMax-1,0):PV.seq;
@@ -2792,7 +3172,7 @@ async function loadPlane(){
     PV.timeline=t.lines||[];PV.seqMax=t.count||0;
     // the who/when layer changes with the log, so re-read it only when a mode
     // is actually drawing from it (never for the plain count map)
-    if(PV.colour==='writer'||PV.colour==='recent'){PV.metaOn=false;await loadMeta()}
+    if(PV.colour==='writer'||PV.colour==='recent'||PV.colour==='kind'){PV.metaOn=false;await loadMeta()}
     // place each edge on the plane and stamp it with the tick of its own line,
     // so scrubbing back in time hides edges that had not been written yet
     const seqOf={};PV.timeline.forEach(r=>{seqOf[r[4]]=r[0]});
@@ -3004,12 +3384,16 @@ function pvDetail(){
   h+=ls.length?'<div class="hoplevel" style="margin-top:9px">บรรทัดในเซลล์นี้ — กดที่บรรทัดเพื่อเดินตามมัน</div>'
     +ls.slice(0,40).map(m=>{
       const g=deg[m.hash],o=g?g.out:0,i=g?g.in:0;
+      const bs=(m.kind==='bond')?bondShort(m.text)
+              :(m.kind==='pointer')?pointerShort(m.text):null;
+      const body=bs?bs.html:esc((m.text||'').slice(0,240));
+      const btitle=bs?(' title="'+esc(bs.title||'')+'"'):'';
       return '<div class="pline"><span class="badge">'+esc(m.app||'?')
       +'</span> <span class="badge kind">'+esc(m.kind||'')+'</span> '
       +'<span class="shape" style="padding:1px 6px" title="มี '+i+' เส้นชี้เข้ามา · นำไป '+o+' เส้น">'+pvShape(o,i)+'</span> '
       +'<span class="ph" data-copy="'+(m.hash||'')+'">'+hash8(m.hash)+'</span>'
       +'<button class="pbtn" style="padding:0 6px;font-size:10px" data-walk="'+esc(m.hash||'')+'" title="🧭 เดินตามบรรทัดนี้ — ดูว่ามันไปเกี่ยวกับอะไร และอะไรอ้างถึงมัน">🧭</button>'
-      +'<div style="white-space:pre-wrap;margin-top:3px">'+esc((m.text||'').slice(0,240))+'</div></div>'
+      +'<div style="white-space:pre-wrap;margin-top:3px"'+btitle+'>'+body+'</div></div>'
     }).join('')
     :'<div style="margin-top:6px">เซลล์นี้ว่าง — ไม่มี line อยู่ตรงนี้</div>';
   el.innerHTML=h;
@@ -3079,7 +3463,13 @@ pcv.onmousemove=ev=>{
   const bx=PV.mode==='blocks'?pvB(PV.bOrig.x+x):x;
   const by=PV.mode==='blocks'?pvB(PV.bOrig.y+y):y;
   const who=PV.sights.filter(s=>s.point===rk).map(s=>s.app).join(',');
+  // the TOTAL and the FILTERED count, both, labelled. Printing only the
+  // filtered one would make a cell holding 34 lines read 0 with nothing on
+  // screen to contradict it; printing only the total would make the filter
+  // look like it did nothing.
+  const kn=pvKindN(rk),f=pvFilt();
   tip.textContent=(PV.mode==='blocks'?'ช่องย่อ ':'ที่อยู่ ')+rk+' (คอลัมน์ '+bx+', แถว '+by+') · '+n+' บรรทัด'
+    +(f?(' · '+kindLabel(PV.kindOnly)+' '+kn+' ('+(kn?'เหลือ '+(n-kn)+' ชนิดอื่น':'ไม่มีชนิดนี้ในช่องนี้')+')'):'')
     +(who?' · 👁 '+who:'');
   pvTopOpen(tip);
   const vw=window.innerWidth||document.documentElement.clientWidth;
@@ -3522,9 +3912,27 @@ $('#pv-f2').onclick=()=>setFocus(2);
 $('#pv-f3').onclick=()=>setFocus(3);
 $('#pv-seq').oninput=e=>pvSetSeq(+e.target.value);
 $('#pv-last').onclick=()=>pvSetSeq(PV.seqMax);          // "latest" = live plane
+$('#pv-kind').onchange=async e=>{
+  // "__load" is the control asking for its own layer, not a filter: the reader
+  // chose to look at kinds, so pay for them, then hand the list back and put
+  // the control where it was.
+  if(e.target.value==='__load'){
+    await loadMeta();pvKindOptions();pvMode();
+    toast(PV.metaOn?'โหลดรายชื่อชนิดแล้ว':'โหลดข้อมูลชนิดไม่สำเร็จ — ลองใหม่อีกครั้ง');
+    return;}
+  PV.kindOnly=e.target.value||null;
+  // the split map rides the meta layer, so a filter that has never been used
+  // costs nothing until someone opens it — same rule as the colour layers
+  if(PV.kindOnly)await loadMeta();
+  pvMode();
+};
 $('#pv-colour').onchange=async e=>{
   PV.colour=e.target.value;
-  if(PV.colour==='writer'||PV.colour==='recent')await loadMeta();
+  if(PV.colour==='writer'||PV.colour==='recent'||PV.colour==='kind')await loadMeta();
+  // the layer just arrived and the filter reads it too, so the list has to be
+  // rebuilt here or it keeps offering "โหลดรายชื่อชนิด" to someone who already
+  // paid for the kinds
+  pvKindOptions();
   _legendKey=null;pvDraw();pvInfo();
 };
 $('#pv-png2').onclick=pvPNG;
@@ -3897,6 +4305,32 @@ class PoolHandler(BaseHTTPRequestHandler):
             with _lock:
                 self._json(200, pool.block_timeline())
 
+        elif parsed.path == "/tasks":
+            # the task layer: status/owner/parent per task, derived from
+            # task-* blocks. ?status=&owner=&parent=&q= are AND filters.
+            status = qs.get("status", [None])[0]
+            owner = qs.get("owner", [None])[0]
+            parent = qs.get("parent", [None])[0]
+            query = qs.get("q", [None])[0]
+            with _lock:
+                tasks = taskboard.task_list(status=status, owner=owner,
+                                            parent=parent, query=query)
+            self._json(200, {"tasks": tasks, "summary": taskboard.task_summary()
+                             if not (status or owner or parent or query) else None})
+
+        elif parsed.path == "/tasks/summary":
+            with _lock:
+                self._json(200, taskboard.task_summary())
+
+        elif parsed.path == "/tasks/ui":
+            # read-only board page over /tasks — same data every platform reads
+            body = TASKS_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif parsed.path == "/inbox":
             app = qs.get("app", [""])[0]
             mark = qs.get("mark", ["1"])[0] != "0"
@@ -4211,6 +4645,13 @@ class PoolHandler(BaseHTTPRequestHandler):
                 return
             with _lock:
                 result = pool.append(app, kind, text, to=to)
+            try:
+                # bridge A: @<ws-id-prefix> in a LIVE line -> workspace inbox.
+                # After the append, never before it: cloud failure must not
+                # cost the caller their line.
+                ws_bridge.forward(app, kind, text, to=to)
+            except Exception as e:
+                print(f"ws-bridge: forward FAIL {e}")
             self._json(200, {"ok": True, "hash": result["hash"],
                              "tags": result.get("tags", [])})
         elif parsed.path == "/block":
@@ -4246,6 +4687,74 @@ class PoolHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "slug": row["slug"], "rev": row["rev"],
                              "hash": row["hash"], "t": row["t"],
                              "howto": {"read": f"GET /blocks?slug={row['slug']}&revs=1"}})
+        elif parsed.path == "/task":
+            # create a task — a task-* block on the shared chain, so every
+            # platform that can append can also post work here
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "body must be a JSON object",
+                                 "howto": {"header": "Content-Type: application/json"}})
+                return
+            app = body.get("app", "?")
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first",
+                                 "howto": {"method": "POST", "url": "/register", "body": {"app": app}}})
+                return
+            if not (body.get("title") or "").strip():
+                self._json(400, {"error": "title required"})
+                return
+            try:
+                with _lock:
+                    t = taskboard.task_create(
+                        app, body["title"], desc=body.get("desc", ""),
+                        parent=body.get("parent", ""), owner=body.get("owner", ""),
+                        due=body.get("due", ""), tags=body.get("tags", ""),
+                        status=body.get("status", "pending"),
+                        refs=body.get("refs", ""))
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._json(200, {"ok": True, "id": t["id"], "status": t["status"],
+                             "hash": t["hash"],
+                             "howto": {"claim": "POST /task/update {\"app\":\"…\",\"id\":\"%s\",\"action\":\"claim\"}" % t["id"]}})
+        elif parsed.path == "/task/update":
+            # advance a task: status/owner/note — a NEW rev, nothing edited
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "body must be a JSON object"})
+                return
+            app = body.get("app", "?")
+            if not pool.is_registered(app):
+                self._json(403, {"error": f"{app} not registered — POST /register first"})
+                return
+            tid = body.get("id", "")
+            if not tid:
+                self._json(400, {"error": "id required"})
+                return
+            try:
+                with _lock:
+                    if body.get("action") == "claim":
+                        t = taskboard.task_claim(app, tid)
+                    else:
+                        t = taskboard.task_update(
+                            app, tid, status=body.get("status", ""),
+                            owner=body.get("owner", ""),
+                            note=body.get("note", ""))
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._json(200, {"ok": True, "id": t["id"], "status": t["status"],
+                             "owner": t["owner"], "rev": t["rev"], "hash": t["hash"]})
+        elif parsed.path == "/tasks/sync":
+            # bridge: pull the inbox board into the pool as task blocks.
+            # POST {} → dry-run (what WOULD be imported, nothing written);
+            # POST {"apply": true} → writes; the inbox board stays the
+            # source of record for those cards, the pool mirrors status.
+            body = self._read_json() or {}
+            apply = body.get("apply", False)
+            with _lock:
+                result = _inbox_sync_tasks(apply=apply)
+            self._json(200, result)
         elif parsed.path == "/session-end":
             body = self._read_json()
             if body is None:
@@ -4325,6 +4834,9 @@ def main():
     except Exception:
         pass
     server = PoolServer(("0.0.0.0", PORT), PoolHandler)
+    threading.Thread(target=ws_bridge.loop, daemon=True,
+                     name="ws-bridge").start()
+    print("ws-bridge: chat-pool <-> workspace inbox bridge ON (poll 120s)")
     tok = _get_token()
     import socket
     try:
@@ -4355,6 +4867,11 @@ def main():
     print(f"  GET  /patterns           (whole plane's link shape: islands/springs/wells + hubs)")
     print(f"  GET  /curator?prune=1    (what the feed hides AND what the plane prunes)")
     print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
+    print(f"  GET  /tasks?q=&status=&owner= (task board: pending/in_progress/done/blocked/cancelled + owner)")
+    print(f"  GET  /tasks/ui      (read-only board page)     /tasks/summary")
+    print(f"  POST /task {{app, title, desc?, parent?, owner?, due?, tags?, refs?}}")
+    print(f"  POST /task/update {{app, id, status?|owner?|note?|action:'claim'}}")
+    print(f"  POST /tasks/sync {{apply?}}        (bridge: inbox board → pool tasks; dry-run by default)")
     print(f"  POST /session-end  {{app, force?}}   (auto-write a block on session close)")
     print(f"  POST /flush   (emit + push now)")
     try:

@@ -194,6 +194,80 @@ def pool_source():
         return f.read()
 
 
+def _code_matches(js, pattern):
+    """Regex matches that are CODE, not prose.
+
+    The §13.5 lesson, inverted. That rule stopped a check being satisfied BY a
+    comment; this stops a comment SATISFYING a check — the sentence explaining
+    why `kind==='chat'` is wrong contains `kind==='chat'`, so a naive scan
+    counts the explanation as a second live comparison and the check fails on
+    correct code. Block comments are blanked first (the explanation is a `/* */`
+    block), then a `//` earlier on the same line means prose.
+
+    Accepted limit: a `/*` inside a JS regex or string literal would be treated
+    as a comment. The dashboard has none, and the failure mode is a check that
+    under-reports — not one that passes something broken.
+    """
+    js = re.sub(r"/\*.*?\*/", lambda m: " " * len(m.group(0)), js, flags=re.S)
+    out = []
+    for m in re.finditer(pattern, js):
+        start = js.rfind("\n", 0, m.start()) + 1
+        if "//" in js[start:m.start()]:
+            continue
+        out.append(m)
+    return out
+
+
+def kind_words(js):
+    """The kind palette's words, checked against the kinds the server acts on.
+
+    Same shape as the curator-rule check (§17.5), for the same reason: the
+    kind names live on the wire and the plain words live in the dashboard, so
+    the join between two files is what can rot. A kind with no word is printed
+    raw — `bond` and `pointer` are exactly the words this project already ruled
+    off the screen, so a missing entry is not a cosmetic gap.
+
+    Compared case-insensitively, because that is the rule the server itself
+    follows: `curator_protect()` compares a kind by VALUE and never by
+    spelling, and it had to be fixed for exactly this reason (§6). A check that
+    matched `chat` against `CHAT` would demand a second entry for one kind and
+    teach the next reader that kinds are spellings.
+
+    The reverse direction cannot be sourced from pool.py — CHAT/DECISION/msg/
+    bridge are written by platforms, and the server never branches on them —
+    so it is checked where it IS knowable: every word in the table must have a
+    colour, or the legend spends a label on something the canvas cannot draw.
+    """
+    py = pool_source()
+    kinds = {k.lower() for k in re.findall(r'kind\s*==\s*"([\w-]+)"', py)}
+    for grp in re.findall(r'kind\s+in\s+\(([^)]*)\)', py):
+        kinds |= {w.strip('"\'').lower() for w in grp.replace('"', ' ').split()}
+    # ONE table for one job. Two KIND_TH tables is exactly the defect §17.5
+    # documents for the curator rules — the one that shipped as a silent
+    # `hex-blob 3` on screen — because whichever copy a renderer reads can lag
+    # the other and the page still renders perfectly.
+    tables = re.findall(r"const KIND_TH\s*=", js)
+    if len(tables) != 1:
+        return [("KIND_TH declared %d times" % len(tables),
+                 "one table, read by both the feed badge and the plane legend — "
+                 "two copies is how a word stops being translated on one of them")]
+    m = re.search(r"const KIND_TH\s*=\s*\{(.*?)\};", js, re.S)
+    if not m:
+        return ["kind word table", "<the whole KIND_TH table is gone>"]
+    table = dict(re.findall(r"'?([\w-]+)'?\s*:\s*'([^']*)'", m.group(1)))
+    mh = re.search(r"const KIND_HUE\s*=\s*\{(.*?)\};", js, re.S)
+    hues = {k.lower() for k in re.findall(r"([\w-]+)\s*:", mh.group(1))} if mh else set()
+    low = {k.lower() for k in table}
+    gaps = []
+    gaps += [("kind with no plain word", k) for k in sorted(kinds - low)]
+    # a word identical to the wire name is a word that was never translated
+    gaps += [("word is the wire name, not a translation", k)
+             for k, v in sorted(table.items()) if v.lower() == k.lower()]
+    gaps += [("plain word with no colour in the palette", k) for k in sorted(low - hues)]
+    gaps += [("colour in the palette with no plain word", k) for k in sorted(hues - low)]
+    return gaps
+
+
 def vocabulary_gaps(js):
     """(what, names) for every internal name the screen has no word for.
 
@@ -270,6 +344,22 @@ console.log(JSON.stringify(bad.slice(0,6))+' :: '+bad.length);
 """
 
 
+def _probe_count(out):
+    """(prose, count) from a probe's last line — the COUNT is what decides.
+
+    `.strip()` then `rpartition(" :: ")` was the old parser and it is wrong for
+    an empty result: stripping " :: 0" removes the leading space, so the
+    separator is gone and the whole line comes back as the tail — a probe that
+    passed everything read as a total failure. It only ever worked because the
+    other probes print something before the separator. Read the number.
+    """
+    line = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
+    m = re.search(r"::\s*(\d+)\s*$", line)
+    if not m:
+        return line, None
+    return line[:m.start()].rstrip(" :|"), int(m.group(1))
+
+
 def seam_roundtrip(js):
     """Run the block map's address functions and check that they agree.
 
@@ -310,8 +400,8 @@ def seam_roundtrip(js):
         shutil.rmtree(d, ignore_errors=True)
     if r.returncode != 0:
         return "the seam probe would not run: " + (r.stdout + r.stderr).strip()[:400]
-    bad, _, n = r.stdout.strip().rpartition(" :: ")
-    if n != "0":
+    bad, n = _probe_count(r.stdout)
+    if n != 0:
         return ("%s addresses read two different ways. Each line names what "
                 "disagreed, so the same square is drawn through one expression "
                 "and reported through another:\n    %s" % (n, bad[:600]))
@@ -405,8 +495,8 @@ def torus_edges(js):
         shutil.rmtree(d, ignore_errors=True)
     if r.returncode != 0:
         return "the torus probe would not run: " + (r.stdout + r.stderr).strip()[:400]
-    bad, _, n = r.stdout.strip().rpartition(" :: ")
-    if n != "0":
+    bad, n = _probe_count(r.stdout)
+    if n != 0:
         return ("%s edge placements disagree with the torus the map draws: "
                 "a line crossing the rim must take the shortest path and "
                 "re-enter on the far side of the FULL plane\n    %s" % (n, bad[:600]))
@@ -656,6 +746,71 @@ INVARIANTS = [
      "the open popup must RIDE the hand by raw delta (pvPopRide), never be "
      "rebuilt per move — a rebuild wipes its buttons, loses its scroll and "
      "jumps whole cells while the canvas glides"),
+    ("every kind the server writes has a plain word, and none is the wire name",
+     lambda js, html: not kind_words(js),
+     lambda js, html: "every kind on screen needs a plain word, and no word may be "
+                      "the wire name:\n    "
+                      + "; ".join("%s: %s" % g for g in kind_words(js))
+                      + "\n  The kind names ride the wire (`kind=\"bond\"`) and the "
+                        "words live in the dashboard's KIND_TH — two files, so "
+                        "only a check that reads both can see them disagree. "
+                        "`bond` and `pointer` are already ruled off the screen "
+                        "by the vocabulary rule above, so an untranslated entry "
+                        "puts a banned word back into the legend"),
+    ("a kind is read by value, never by spelling",
+     lambda js, html: (re.search(r"const kindIsChat=k=>String\(k\|\|'chat'\)", js)
+                       and "kindIsChat(kind)?''" in js
+                       # exactly ONE literal compare against 'chat' may exist in
+                       # the whole script, and it is inside kindIsChat itself. A
+                       # second one is a branch that quietly matches nothing.
+                       and len(_code_matches(js, r"(?<![!<>=])===\s*'chat'")) == 1),
+     "the corpus writes CHAT in caps and bond/pointer/block in lower, so a "
+     "`kind==='chat'` compare matched none of the 13,746 chat lines — every one "
+     "of them grew a badge reading \"CHAT\" on the feed, the one wire name the "
+     "screen has a plain word for. Same defect §6 already paid for in "
+     "curator_protect(): a kind is a value, never a spelling"),
+    ("the kind filter may show less, never more",
+     lambda js, html: kind_filter(js) == "",
+     lambda js, html: kind_filter(js)),
+    ("a filter on the time scrub is the same filter as on the live plane",
+     lambda js, html: re.search(r"if\s*\(\s*only\s*&&\s*row\[3\]\s*!==\s*only\s*\)\s*continue;", js),
+     "pvCellsUpTo counts the log's own order, so without the kind check it "
+     "would rebuild a plane the filter is not describing — drag time back with "
+     "'bonds only' on and the filtered kinds come straight back"),
+    ("the kind list is built, not only computed",
+     lambda js, html: kind_list(js) == "",
+     lambda js, html: kind_list(js)),
+    ("a control that needs a layer can ask for it",
+     lambda js, html: ("__load" in js
+                       and re.search(r"if\s*\(\s*e\.target\.value\s*===\s*'__load'\s*\)", js)
+                       and not re.search(r"sel\.disabled\s*=\s*!ks", js)),
+     "#pv-kind shipped DISABLED with a single option until the meta layer was "
+     "loaded — so it could never fire the change handler that loads the very "
+     "layer it needs, and the only way in was to first pick a meta-backed "
+     "COLOUR, a control the reader has no reason to touch. A disabled control "
+     "cannot ask for what it is missing; the kind filter offers to, and says "
+     "what it costs"),
+    ("a filter that matches nothing says so",
+     lambda js, html: ("ยังไม่มีข้อมูลชนิดนี้ในมุมมองนี้" in js
+                       and "ยังไม่มีข้อมูลชนิดนี้ในคลัง" in js
+                       and re.search(r"const filt=PV\.kindOnly", js)),
+     "a filter naming a kind with no cells here must be reported as empty. "
+     "Falling back to the unfiltered map would draw the whole plane under a "
+     "filter that claims to be on — the one answer this layer must never give"),
+    ("the filter's figures describe the frame on screen, not the whole log",
+     lambda js, html: (re.search(r"scrubbed\?Object\.keys\(src\):Object\.keys\(src\)\.filter\(k=>f\[k\]\)", js)
+                       and re.search(r"scrubbed\?Object\.values\(src\)", js)),
+     "the status line counted the filter over PV.kinds, which is the WHOLE log. "
+     "Correct on the live plane, wrong the moment time is scrubbed: the picture "
+     "fell to 1,421 bond lines and the line under it still said 13,572. The "
+     "FIRST fix then over-corrected the other way — it intersected src with the "
+     "whole-log f and summed f[k], but while scrubbing pvCellsUpTo has already "
+     "applied the filter, so src IS the answer and summing f[k] over it counts "
+     "bonds that have not happened yet (7,938 against a picture holding 1,421). "
+     "`src` means two different things in the two frames, so it takes two "
+     "branches, not one rule. Both must stay ARRAYS: the second version made the "
+     "scrubbed branch `lit=src` — an object — and then asked `lit.length`, which "
+     "is undefined, so the one frame the fix existed for reported itself EMPTY"),
     ("a blocks drag keeps the pointerdown anchor",
      lambda js, html: ("PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};" in js
                        and "bx:" not in block(js, "if(d.blocks){", "}else{")
@@ -669,7 +824,237 @@ INVARIANTS = [
 ]
 
 
+KIND_PROBE_HEAD = r"""
+// Stubs only. The four functions under test are EXTRACTED from the served
+// script below — a probe carrying its own copies of them would pass while the
+// page was broken, which is the one thing §13.5 says a test must not do.
+const PV={kindOnly:null,kinds:{},cells:{a:5,b:2,c:9}};
+function pvCellInk(rk,rel){return 'INK:'+rk+':'+rel}
+const esc=s=>s;
+"""
+
+KIND_PROBE_TAIL = r"""
+const bad=[];
+// 1. no filter: the picture is the plane, and no cell claims a kind count
+if(pvFilt()!==null)bad.push('an unfiltered plane returned a filter');
+if(pvKindN('a')!==0)bad.push('an unfiltered plane reported a filtered count');
+if(pvDrawMax()!==9)bad.push('unfiltered ramp ceiling = '+pvDrawMax()+' (want the busiest cell = 9)');
+// 2. filter on: the ramp ceiling moves to the BUSIEST CELL OF THE FILTER, or the
+//    filter tints the map without shifting a single shade
+PV.kinds={bond:{a:5,b:2}};
+PV.kindOnly='bond';
+if(pvDrawMax()!==5)bad.push('filtered ramp ceiling = '+pvDrawMax()+' (want 5, the busiest bond cell)');
+if(pvKindN('a')!==5||pvKindN('b')!==2)bad.push('filtered counts are wrong');
+if(pvKindN('c')!==0)bad.push('a cell holding none of the kind must count 0, not the total');
+// 3. THE contract: a filtered count can never exceed the total. A picture that
+//    shows more of one kind than the plane holds is worse than no filter at all
+for(const rk in PV.cells){
+  if(pvKindN(rk)>PV.cells[rk])
+    bad.push('cell '+rk+' claims '+pvKindN(rk)+' of a kind it holds only '+PV.cells[rk]);
+}
+// 4. filtered-out cells are drawn in the neutral grey, never a kind hue: a hue
+//    there would look like a seventh kind in the legend
+if(pvInkAt('c',0)!=='rgba(139,148,158,0.13)')bad.push('a filtered-out cell was painted as if it matched');
+if(pvInkAt('a',1)!=='INK:a:1')bad.push('a matching cell was greyed out');
+// 5. a filter naming a kind that is ABSENT stays absent - it never silently
+//    becomes "no filter", which would draw the unfiltered map under a filter
+//    that claims to be on
+PV.kindOnly='nosuchkind';
+if(pvFilt()!==null)bad.push('an absent kind produced a filter');
+console.log(bad.join(' | ')+' :: '+bad.length);
+"""
+
+
+def _js_function(js, name):
+    """The source of one `function name(...)` from the served script.
+
+    Same slicing as torus_edges(): from the declaration to whatever comes next
+    at top level. Used here because a probe that carries its own COPY of the
+    code under test is a probe of the copy.
+    """
+    marker = "function %s(" % name
+    i = js.find(marker)
+    if i < 0:
+        return ""
+    nl = chr(10)
+    ends = [x for x in (js.find(nl + "function ", i + 1),
+                        js.find(nl + "const ", i + 1),
+                        js.find(nl + "/* ", i + 1)) if x > 0]
+    return js[i:min(ends) if ends else len(js)].rstrip().rstrip(";")
+
+
+
+
+
+def kind_filter(js):
+    """Run the filter's REAL functions in node and check what they promise.
+
+    The filter has one contract a reader can be lied to about: the picture may
+    show less than the plane holds, never more, and the number printed stays the
+    total. A regex cannot see `pvKindN(rk) > PV.cells[rk]`, and that is the one
+    comparison that would let the map claim 12 bonds in a cell holding 3 — so
+    the functions are lifted out of the served script and run, like the block-map
+    seam. The FIRST version of this probe pasted its own copies of the four
+    functions, and three mutations of the real code passed it: a test that
+    cannot fail is not a test, and neither can one that tests a copy.
+    """
+    node = shutil.which("node")
+    if not node:
+        return ""
+    parts = [_js_function(js, n) for n in ("pvFilt", "pvKindN", "pvInkAt", "pvDrawMax")]
+    gone = [n for n, src in zip(("pvFilt", "pvKindN", "pvInkAt", "pvDrawMax"), parts)
+            if not src]
+    if gone:
+        return ("%s must still be in the script: it is the only thing deciding "
+                "what the picture counts when a kind filter is on" % ", ".join(gone))
+    d = tempfile.mkdtemp(prefix="ui-kind-")
+    tmp = os.path.join(d, "kind.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(chr(10).join([KIND_PROBE_HEAD] + parts + [KIND_PROBE_TAIL]))
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0:
+        return "the kind-filter probe would not run: " + (r.stdout + r.stderr).strip()[:400]
+    bad, n = _probe_count(r.stdout)
+    if n != 0:
+        return ("the filter's numbers do not hold (%s). Each clause names what " % n
+                + "disagreed:" + chr(10) + "    " + bad[:600])
+    return ""
+
+
+LIST_PROBE_HEAD = r"""
+// The four maths functions can all be right and the filter still never open:
+// what broke was the LIST, and a probe that only computes cannot see a list.
+const PV={kindOnly:null,kinds:{},cellKind:{}};
+const mk=()=>({value:'',disabled:false,options:[],_kindHtml:null,_sets:0,set innerHTML(h){
+  this._sets++;
+  this.options=h.split('</option>').filter(Boolean).map(s=>{
+    const v=/value="([^"]*)"/.exec(s);const t=/>([^<]*)</.exec(s);
+    return {value:v?v[1]:'',text:t?t[1]:''};});}});
+const sel=mk();
+// note the '#': the real $ receives it WITH the hash. A stub that compares
+// against 'pv-kind' returns null, the real code bails at `if(!sel)return`, and
+// the probe passes nothing while reporting every clause as broken — a check
+// that cannot see its own harness is worse than no check.
+const $=(id)=>id==='#pv-kind'?sel:null;
+const esc=s=>s;
+const kindLabel=k=>'K:'+k;
+"""
+LIST_PROBE_TAIL = r"""
+const bad=[];
+const run=()=>{try{pvKindOptions();return null}catch(e){return String(e)}};
+// 1 the layer is missing: the control must ASK for it, not sit there disabled
+//    with one option. A disabled <select> cannot fire the handler that loads
+//    the very layer it needs, so the filter is unreachable forever.
+PV.cellKind={};PV.kinds={};
+sel.innerHTML='<option value="">ทุกชนิด</option>';
+sel.disabled=true;
+let e=run();
+if(e)bad.push('building the empty prompt threw: '+e);
+if(sel.disabled)bad.push('the unloaded filter is disabled, so it can never be opened');
+if(sel.options.length<2)bad.push('the unloaded filter offers nothing to choose');
+if(!sel.options.some(o=>o.value==='__load'))bad.push('nothing in the list asks for the layer');
+// 2 the layer arrived: the list must ACTUALLY be built. pvTopKinds returns a
+//    COUNT OBJECT, so `ks.join('|')` is undefined and the guard line threw a
+//    TypeError on every path that had kinds to show — the filter was never
+//    openable and every check stayed green because they all do arithmetic.
+//    cellKind and kinds are given DIFFERENT numbers on purpose: the colour layer
+//    counts cells whose LAST line was the kind, the filter counts cells that
+//    HOLD one, and putting the wrong one in the list puts two different numbers
+//    on screen about a single click.
+PV.cellKind={a:'CHAT',b:'CHAT',c:'bond'};
+PV.kinds={CHAT:{a:1,b:1},bond:{a:1,b:1,c:1,d:1,e:1}};
+sel.innerHTML='<option value="">ทุกชนิด</option>';
+sel.disabled=true;
+e=run();
+if(e)bad.push('building the list THREW once the kinds were known: '+e);
+const vals=sel.options.map(o=>o.value);
+if(vals.length!==3)bad.push('expected ทุกชนิด + 2 kinds, got '+vals.length+' ('+vals.join(',')+')');
+if(vals.indexOf('CHAT')<0||vals.indexOf('bond')<0)bad.push('the kinds never made it into the list: '+vals.join(','));
+if(sel.disabled)bad.push('the loaded filter is still disabled');
+// 2b the NUMBERS beside each kind must be the ones the filter will LIGHT UP
+if(!/bond \(5\)/.test(sel._kindHtml||''))bad.push('the list must promise bond lights 5 cells, got '+String(sel._kindHtml).match(/bond \([0-9]+\)/));
+if(!/CHAT \(2\)/.test(sel._kindHtml||''))bad.push('the list must promise CHAT lights 2 cells, got '+String(sel._kindHtml).match(/CHAT \([0-9]+\)/));
+if(/bond \(1\)/.test(sel._kindHtml||''))bad.push('the list is quoting the COLOUR LAYER count (last kind) — that is a different number from what the filter lights');
+// 2c and sorted by that same promise: bond 5 must come before CHAT 2 even
+//     though the colour layer says CHAT is the bigger mass
+if(vals[1]!=='bond')bad.push('the kind that lights the most cells must come first, got '+vals[1]);
+// 3 no churn: this runs on every mode change, so an unchanged list must not be
+//    rebuilt — rebuilding resets the open dropdown and eats the reader's click
+const sets=sel._sets;pvKindOptions();
+if(sel._sets!==sets)bad.push('an unchanged list was rebuilt ('+sets+' -> '+sel._sets+')');
+// 4 a filter that has gone (or an absent kind) must not leave the control
+//    showing a value that is no longer in it
+PV.kindOnly='nosuchkind';pvKindOptions();
+if(sel.value!=='')bad.push('a filter with no cells left the control on "'+sel.value+'"');
+PV.kindOnly='bond';pvKindOptions();
+if(sel.value!=='bond')bad.push('a live filter was not restored, got "'+sel.value+'"');
+console.log(bad.join(' | ')+' :: '+bad.length);
+"""
+
+
+def _js_arrow(js, name):
+    """The source of a top-level `const NAME=...` — an arrow, not a `function`.
+
+    Same "slice the real thing" rule as _js_function(); it cannot reuse that one
+    because it looks for `function NAME(`. pvTopKinds is the arrow form, and it
+    is the one that decides what the filter's list and the legend PRINT — a
+    stubbed count would have passed a function that returns all zeros.
+    """
+    marker = "const %s=" % name
+    i = js.find(marker)
+    if i < 0:
+        return ""
+    nl = chr(10)
+    ends = [x for x in (js.find(nl + "const ", i + 1),
+                        js.find(nl + "function ", i + 1),
+                        js.find(nl + "/* ", i + 1)) if x > 0]
+    return js[i:min(ends) if ends else len(js)].rstrip().rstrip(";")
+
+
+def kind_list(js):
+    """Run the REAL pvKindOptions and check it builds a LIST a reader can use.
+
+    A filter has two halves: four functions that do the arithmetic, and one
+    that fills the <select>. The arithmetic was proved correct by a node probe
+    and the control was still unreachable — `ks.join` on a count OBJECT threw
+    inside the one-line no-churn guard, on every path, and the select sat on a
+    single option forever. Nothing was red. A check that only computes cannot
+    see a list, so this one builds one.
+    """
+    node = shutil.which("node")
+    if not node:
+        return ""
+    src = _js_function(js, "pvKindOptions")
+    if not src:
+        return ("pvKindOptions must still be in the script: it is the only thing "
+                "that makes the filter reachable at all")
+    top = _js_arrow(js, "pvTopKinds")
+    if not top:
+        return ("pvTopKinds must still be in the script: it is what the filter's "
+                "list and the legend print next to every kind")
+    d = tempfile.mkdtemp(prefix="ui-kindlist-")
+    tmp = os.path.join(d, "kindlist.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(chr(10).join([LIST_PROBE_HEAD, top, src, LIST_PROBE_TAIL]))
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0:
+        return "the kind-list probe would not run: " + (r.stdout + r.stderr).strip()[:400]
+    bad, n = _probe_count(r.stdout)
+    if n != 0:
+        return ("the filter's list does not open (%s). Each clause names what "
+                "disagreed:" % n + chr(10) + "    " + bad[:600])
+    return ""
+
+
 def broken_invariants(js, html):
+    return [(label, why(js, html) if callable(why) else why)
+            for label, test, why in INVARIANTS if not test(js, html)]
     return [(label, why(js, html) if callable(why) else why)
             for label, test, why in INVARIANTS if not test(js, html)]
 

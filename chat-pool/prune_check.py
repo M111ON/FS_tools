@@ -17,6 +17,7 @@ matter:
 
 Run:  python prune_check.py
 """
+import ast
 import json
 import os
 import shutil
@@ -29,7 +30,48 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-COPIES = ("pool.py", "pool_server.py", "ctx_plane.py")
+# Everything pool_server.py imports from THIS directory has to travel with it.
+# A list that misses one produces `No module named 'x'` out of a subprocess and
+# a failure that names neither the missing file nor the import that wants it —
+# which is exactly how these two suites died when `ws_bridge` was wired in and
+# this tuple was not updated with it.
+COPIES = ("pool.py", "pool_server.py", "ctx_plane.py", "taskboard.py",
+          "ws_bridge.py", "pool_cloud.py")
+
+
+def local_imports(start="pool_server.py"):
+    """Every module of THIS directory that `start` pulls in, transitively.
+
+    The closure matters, not the first hop: `pool_server` imports `ws_bridge`,
+    which imports `pool_cloud`, so a copy list that carries the first and not
+    the second still starts a server that cannot boot. `ast` over each local
+    file is the only source that cannot go stale — a hand-written tuple drifts
+    the moment anyone adds an import, and the failure arrives as a
+    ModuleNotFoundError from a child process that names nothing useful.
+    """
+    seen, want = set(), [start]
+    while want:
+        name = want.pop()
+        stem = os.path.splitext(name)[0]
+        if stem in seen or not os.path.exists(os.path.join(HERE, name)):
+            continue
+        seen.add(stem)
+        try:
+            tree = ast.parse(open(os.path.join(HERE, name), encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                names = [node.module.split(".")[0]]
+            else:
+                continue
+            for n in names:
+                if os.path.exists(os.path.join(HERE, n + ".py")) and n not in seen:
+                    want.append(n + ".py")
+    return sorted(seen - {os.path.splitext(c)[0] for c in COPIES})
+
 
 
 # ── harness ──────────────────────────────────────────────────────────────
@@ -129,6 +171,13 @@ def build_log(box):
 
 # ── checks ───────────────────────────────────────────────────────────────
 def main():
+    missing = local_imports()
+    if missing:
+        print("prune_check: FAILED — the sandbox would start a server that "
+              "cannot import:\n  %s\n  pool_server.py imports %s, and COPIES "
+              "does not carry it. Add it to COPIES above."
+              % (", ".join(m + ".py" for m in missing), ", ".join(missing)))
+        return 1
     box = tempfile.mkdtemp(prefix="prune-check-")
     results = []
     proc = None

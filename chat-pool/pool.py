@@ -233,26 +233,101 @@ CLI = r"I:\tools\cloud-workspace\hermes_pool_cli.py"
 VENV_PY = r"I:\tools\cloud-workspace\.venv\Scripts\python.exe"
 SESSION = "chat-pool"
 
+# ── index diet (2026-09-20): what the semantic index actually needs ──
+# Raw lines carry 11 envelope keys per message (prev/hash 64-hex, rkey, enc,
+# tags, v...) and machine kinds (bond/pointer) that drown the vector in
+# noise — a 16MB hourly file embedded as ONE chunk. The searchable index
+# keeps 5 keys; the raw log + outbox .pushed files stay the full record.
+INDEX_KEEP = ("app", "kind", "t", "to", "text")
+INDEX_SKIP_KINDS = ("bond", "pointer")  # graph data: query via /explore, not search
+INDEX_CHUNK_BYTES = 16384  # max ~16KB per chunk, split on line boundaries
+
+
+def index_pieces(msgs):
+    """Normalize raw pool lines into embed-ready pieces (pure, no I/O).
+    Drops envelope keys + machine kinds, splits on line boundaries."""
+    comp = []
+    if isinstance(msgs, dict):
+        msgs = [msgs]
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("kind") in INDEX_SKIP_KINDS:
+            continue
+        text = m.get("text") or ""
+        if not str(text).strip():
+            continue
+        comp.append({"app": m.get("app", "?"), "kind": m.get("kind", "chat"),
+                     "t": m.get("t", 0), "to": m.get("to", "all"),
+                     "text": text})
+    pieces, cur, size = [], [], 0
+    for m in comp:
+        s = len(json.dumps(m, ensure_ascii=False)) + 1
+        if cur and size + s > INDEX_CHUNK_BYTES:
+            pieces.append(cur)
+            cur, size = [], 0
+        cur.append(m)
+        size += s
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
+def _embed_piece(piece, session, topic):
+    """Embed one normalized piece via the pool CLI. Returns stderr or ''."""
+    import subprocess
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".json",
+        dir=os.path.join(DIR, "outbox"), delete=False)
+    try:
+        json.dump(piece, tmp, ensure_ascii=False)
+        tmp.close()
+        py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
+        r = subprocess.run(
+            [py, CLI, "embed", "--session", session,
+             "--topic", topic, "--file", tmp.name],
+            capture_output=True, text=True, timeout=300)
+        return "" if r.returncode == 0 else r.stderr.strip()[-300:]
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
 
 def push_outbox(session=SESSION):
     """Push pending outbox payloads via existing pool CLI, then archive.
-    Storage stays raw JSON (prev/hash intact for cloud restore).
-    Rendering to a readable chat log is view()'s job, not storage's.
+    Each file is normalized first (index_pieces: envelope stripped, machine
+    kinds dropped, split to ~16KB) so the vector sees chat, not schema.
+    Raw JSON stays the record (log.jsonl + outbox/*.pushed); rendering to a
+    readable chat log is view()'s job, not storage's.
     Returns (pushed, failed). Cloud/searchable afterwards via session-pool."""
-    import subprocess
-    py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
     pushed, failed = [], []
     for path in outbox_list():
-        r = subprocess.run(
-            [py, CLI, "embed", "--session", session,
-             "--topic", "hourly", "--file", path],
-            capture_output=True, text=True, timeout=300)
-        if r.returncode == 0:
+        try:
+            with open(path, encoding="utf-8") as f:
+                msgs = json.load(f)
+        except Exception as e:
+            failed.append((path, f"unreadable: {e}"[-300:]))
+            continue
+        pieces = index_pieces(msgs)
+        if not pieces:  # all machine noise — nothing to index, still archive
+            done = path + ".pushed"
+            os.replace(path, done)
+            pushed.append(done)
+            continue
+        err = ""
+        for piece in pieces:
+            err = _embed_piece(piece, session, "hourly")
+            if err:
+                break
+        if not err:
             done = path + ".pushed"
             os.replace(path, done)
             pushed.append(done)
         else:
-            failed.append((path, r.stderr.strip()[-300:]))
+            failed.append((path, err))
     return pushed, failed
 
 
@@ -911,12 +986,28 @@ def derived():
     # "who wrote here last" is the same question about the live edge of the log
     # and is exact after every single append.
     cell_app, cell_seq = {}, {}
+    # The same question about the last line instead of about its writer: what
+    # KIND of line landed here last. Free, for the same reason `cell_app` was —
+    # the live edge of the log answers it exactly after every append, and
+    # counting per kind would cost a dict per cell to say less.
+    cell_kind = {}
+    # The WHOLE map, split by kind: {kind: {rkey: count}}. This one costs a
+    # dict per kind and is the only layer that cannot be derived from a cell's
+    # last line — "how many BONDS live here" is a different question from "what
+    # landed here last", and a reader filtering to one kind needs the first.
+    # Measured on the live corpus: 13,210 occupied cells become 16,750
+    # (cell,kind) pairs = 1.27x, because 9,919 cells hold exactly one kind and
+    # only 3,291 are mixed. It rides the same fold, so it costs dicts and not
+    # a second walk over an already-streamed log.
+    by_kind = {}
     # The plane prunes what the feed merely hides (see CURATOR_PRUNE): a line
     # the curator calls noise contributes NO count to its cell, so an address
     # that lived on nothing but tests stops being occupied and the cell leaves
     # the map. Both maps fall out of the one pass we are already making, so
     # pruning costs a few dicts, not a second walk over an already-streamed log.
     cells_clean, cell_app_clean, cell_seq_clean = {}, {}, {}
+    cell_kind_clean = {}
+    by_kind_clean = {}
     # Which 12x12 blocks still hold a clean line. A sighting can be made at
     # level 1, which names a BLOCK rather than a cell — answering "does that
     # address live" for it would otherwise mean scanning every clean cell.
@@ -947,7 +1038,10 @@ def derived():
         is_noise = _ps >= CURATOR_PRUNE and not _pp
         if rk is not None:
             cells[rk] = cells.get(rk, 0) + 1
+            _bk = by_kind.setdefault(kind, {})
+            _bk[rk] = _bk.get(rk, 0) + 1
             cell_app[rk] = m.get("app")
+            cell_kind[rk] = kind
             cell_seq[rk] = len(timeline)      # this line's ordinal, before it lands
             if is_noise:
                 pruned += 1
@@ -957,7 +1051,10 @@ def derived():
                     pruned_by[_r] = pruned_by.get(_r, 0) + 1
             else:
                 cells_clean[rk] = cells_clean.get(rk, 0) + 1
+                _bk = by_kind_clean.setdefault(kind, {})
+                _bk[rk] = _bk.get(rk, 0) + 1
                 cell_app_clean[rk] = m.get("app")
+                cell_kind_clean[rk] = kind
                 cell_seq_clean[rk] = len(timeline)
                 if len(blocks_clean) < 144:     # 12x12 blocks tile the plane
                     blocks_clean.add(((rk % 144) // 12, (rk // 144) // 12))
@@ -981,10 +1078,14 @@ def derived():
             _block_visit(blocks_idx, m)
     _DERIVED.update({"key": key, "cells": cells, "hash_rkey": hash_rkey,
                      "cell_app": cell_app, "cell_seq": cell_seq,
+                     "cell_kind": cell_kind,
+                     "by_kind": by_kind,
                      # the pruned view of the same pass: what the plane draws
                      "cells_clean": cells_clean,
                      "cell_app_clean": cell_app_clean,
                      "cell_seq_clean": cell_seq_clean,
+                     "cell_kind_clean": cell_kind_clean,
+                     "by_kind_clean": by_kind_clean,
                      "blocks_clean": blocks_clean,
                      "pruned": pruned, "pruned_by": pruned_by,
                      "pruned_hashes": pruned_hashes,
@@ -1059,7 +1160,10 @@ def _derived_absorb(body, raw, key0):
         d["hash_rkey"][h] = rk
     if rk is not None:
         d["cells"][rk] = d["cells"].get(rk, 0) + 1
+        _bk = d.setdefault("by_kind", {}).setdefault(kind, {})
+        _bk[rk] = _bk.get(rk, 0) + 1
         d["cell_app"][rk] = body.get("app")
+        d.setdefault("cell_kind", {})[rk] = kind
         d["cell_seq"][rk] = len(d["timeline"])
         # The pruned view must fold WITH the raw one. Absorbing only `cells`
         # left cells_clean/pruned describing the previous log, and because the
@@ -1080,9 +1184,12 @@ def _derived_absorb(body, raw, key0):
             for _r in _pr:
                 _by[_r] = _by.get(_r, 0) + 1
         else:
+            _bk = d.setdefault("by_kind_clean", {}).setdefault(kind, {})
+            _bk[rk] = _bk.get(rk, 0) + 1
             _cc = d.setdefault("cells_clean", {})
             _cc[rk] = _cc.get(rk, 0) + 1
             d.setdefault("cell_app_clean", {})[rk] = body.get("app")
+            d.setdefault("cell_kind_clean", {})[rk] = kind
             d.setdefault("cell_seq_clean", {})[rk] = len(d["timeline"])
             d.setdefault("blocks_clean", set()).add(
                 ((rk % 144) // 12, (rk // 144) // 12))
@@ -1139,7 +1246,14 @@ def pretty(m):
         if bd:
             return "[%s] %s/block ▣ %s rev%d · %s: %s" % (
                 ts, m.get("app", "?"), bd["slug"], bd["rev"], bd["status"], bd["title"])
-    label = m.get("app", "?") if kind == "chat" else "%s/%s" % (m.get("app", "?"), kind)
+    label = (m.get("app", "?") if (kind or "chat").strip().lower() == "chat"
+             else "%s/%s" % (m.get("app", "?"), kind))
+    # The case-insensitive compare above is not decoration. This line compared
+    # `kind == "chat"` exactly, and the corpus writes "CHAT" — 13,746 lines of
+    # it — so the plain-chat label was dead code and every one of those lines
+    # rendered as `hermes/CHAT` instead of `hermes`. It is the same defect §6
+    # already paid for in curator_protect(): a kind is a value, never a
+    # spelling, and comparing it as a spelling silently disables the branch.
     to = m.get("to", "all")
     arrow = " → %s" % to if to not in ("all", None) else ""
     text = m.get("text", "").replace("\n", "\n    ")
@@ -2120,20 +2234,25 @@ def _axis(line, depth):
 
 
 def plane_meta(raw=False):
-    """The plane's second map: per occupied cell, who wrote there last and at
-    which tick. Deliberately NOT folded into _plane_map() — a reader that only
-    wants addresses and counts should not pay for a layer it will not draw.
-    Addresses and labels only: no line content reaches this.
+    """The plane's second map: per occupied cell, who wrote there last, what
+    KIND of line landed there last, and at which tick. Deliberately NOT folded
+    into _plane_map() — a reader that only wants addresses and counts should
+    not pay for a layer it will not draw. Addresses and labels only: no line
+    content reaches this.
 
     Follows the same pruning as the counts it is drawn over: with `raw=False`
-    the who/when layer describes the pruned plane, so a colour mode can never
-    attribute a cell to a writer whose only line in it was noise."""
+    the who/what/when layer describes the pruned plane, so a colour mode can
+    never attribute a cell to a writer whose only line in it was noise."""
     d = derived()
     if raw:
         return {"level": 2, "last_app": d["cell_app"],
+                "last_kind": d["cell_kind"],
+                "by_kind": d["by_kind"],
                 "last_seq": d["cell_seq"], "seq_max": len(d["timeline"]),
                 "raw": True, "pruned": 0}
     return {"level": 2, "last_app": d["cell_app_clean"],
+            "last_kind": d["cell_kind_clean"],
+            "by_kind": d["by_kind_clean"],
             "last_seq": d["cell_seq_clean"], "seq_max": len(d["timeline"]),
             "raw": False, "pruned": d.get("pruned", 0)}
 
@@ -2492,6 +2611,13 @@ def _demo_body():
     assert len(_pmr["fine_cells"]) >= len(_pm["fine_cells"]), "pruning removes cells, never invents them"
     assert _coarse_map(0, raw=True)["raw"] is True, "L1 follows the same switch as L2 — the levels cannot disagree"
     assert plane_meta(raw=True)["pruned"] == 0 and plane_meta()["raw"] is False, "the who/when layer prunes with the counts it describes"
+    # the kind map is a layer like the other two, so it inherits the same
+    # obligation: with the prune on it must not describe a cell whose only
+    # lines were removed, or a colour mode paints the kind of a line that is
+    # no longer on the plane.
+    _pk_all, _pk_clean = plane_meta(raw=True)["last_kind"], plane_meta()["last_kind"]
+    assert set(_pk_clean) <= set(_pk_all), "the pruned kind layer names a SUBSET of the raw one — never a cell the raw plane does not have"
+    assert set(_pk_clean) == set(_pm["fine_cells"]), "and exactly the cells the pruned counts kept — the layer follows the map it is drawn over"
     _pstats = plane_prune_stats()
     assert _pstats["cells_all"] >= _pstats["cells_clean"], "the stats report both maps, not just the pretty one"
     assert _pstats["kept"] + _pstats["pruned"] == _pstats["lines"], "and account for every line"
@@ -2548,6 +2674,16 @@ def _demo_body():
     assert tail(1)[0]["text"] == "test", "tail() stays raw — the curator is a display edge"
     assert view(3, clean=True)[-1] != view(3)[-1], "view(clean=True) hides it, the raw view still shows it"
     assert len(view(3, clean=True)) <= len(view(3)), "cleaning removes lines, never invents them"
+    # A kind is a VALUE, never a spelling. The corpus writes CHAT/DECISION in
+    # caps and bond/pointer/block in lower, so `kind == "chat"` was a compare
+    # that never matched anything: every plain chat line printed as
+    # `hermes/CHAT` instead of `hermes`. Both spellings must read as chat.
+    _pl_chat = pretty({"app": "hermes", "kind": "CHAT", "text": "hi", "t": 0})
+    _pl_low = pretty({"app": "hermes", "kind": "chat", "text": "hi", "t": 0})
+    assert "hermes/CHAT" not in _pl_chat and "hermes/chat" not in _pl_low, "a plain chat line is labelled by its writer alone, whatever the spelling"
+    assert _pl_chat == _pl_low, "the two spellings of the same kind produce the same line"
+    _pl_dec = pretty({"app": "hermes", "kind": "DECISION", "text": "x", "t": 0})
+    assert "hermes/DECISION" in _pl_dec, "and a kind that is NOT chat still says what it is"
     # living memory bridge (dry run — no db write in demo)
     append("opencode", "chat", "DECISION: pool stays file-first, server optional")
     lifted = memory_bridge(dry_run=True)
@@ -2717,14 +2853,39 @@ def _demo_body():
     assert sum(d1["cells"].values()) == cells0 + 1, "counted on the plane too"
     assert d1["cells"].get(fresh_rk, 0) >= 1, "in the cell its rkey says it is in"
     assert d1["cell_app"].get(fresh_rk) == "bench", "and the plane remembers WHO wrote here last"
+    assert d1["cell_kind"].get(fresh_rk) == "chat", "and WHAT KIND of line landed here last — the same question about the same edge of the log"
     assert d1["cell_seq"].get(fresh_rk) == len(d1["timeline"]) - 1, "and at which tick — recency is derived, never tracked"
     assert len(plane_meta()["last_app"]) == len(d1["cells"]), "one owner per occupied cell, no cell left unowned"
+    assert set(plane_meta()["last_kind"]) == set(d1["cells"]), "and one kind per cell from the same fold — a map that names some cells and not others is a map with a hole in it"
     assert set(plane_meta()["last_seq"]) == set(d1["cells"]), "and one tick per cell from the same fold"
     want_cells, want_tl = dict(d1["cells"]), len(d1["timeline"])
     want_app, want_seq = dict(d1["cell_app"]), dict(d1["cell_seq"])
+    want_kind = dict(d1["cell_kind"])
+    want_kind_c = dict(d1["cell_kind_clean"])
+    want_bk, want_bk_c = ({k: dict(v) for k, v in d1["by_kind"].items()},
+                          {k: dict(v) for k, v in d1["by_kind_clean"].items()})
+    # The per-kind maps must PARTITION the plane: every occupied cell appears
+    # under at least one kind, and no cell appears that the counts do not have.
+    # A per-kind map that loses a cell is a filter that hides a real address
+    # with nothing on screen saying so — the §18 failure in a new place.
+    _union = {rk for m_ in d1["by_kind"].values() for rk in m_}
+    assert _union == set(d1["cells"]), "every occupied cell appears under some kind, and none that is not occupied"
+    assert sum(sum(m_.values()) for m_ in d1["by_kind"].values()) == sum(d1["cells"].values()), "and the per-kind counts add up to the plane they were folded from"
+    _uc = {rk for m_ in d1["by_kind_clean"].values() for rk in m_}
+    assert _uc == set(d1["cells_clean"]), "the pruned per-kind map covers exactly the pruned cells"
+    _pk_raw, _pk_cl = plane_meta(raw=True)["by_kind"], plane_meta()["by_kind"]
+    assert {rk for m_ in _pk_cl.values() for rk in m_} <= {rk for m_ in _pk_raw.values() for rk in m_}, "the pruned per-kind map never names a cell the unpruned one does not"
     _DERIVED["key"] = None
     assert derived()["cells"] == want_cells, "incremental index equals a from-scratch rebuild"
     assert derived()["cell_app"] == want_app and derived()["cell_seq"] == want_seq, "the who/when maps rebuild to the same thing too"
+    assert derived()["cell_kind"] == want_kind, "the kind map rebuilds to the same thing too"
+    # the fold and the rebuild must ALSO agree on the PRUNED kind map: a fold
+    # that only filled the raw one leaves the pruned one describing the previous
+    # log while `key` claims it is current, and a colour mode then paints the
+    # kind of a line that is no longer on the plane (§6, lesson 2).
+    assert derived()["cell_kind_clean"] == want_kind_c, "and so does its pruned view — otherwise the kind layer outlives the prune that removed it"
+    assert derived()["by_kind"] == want_bk, "the per-kind map rebuilds to the same thing too"
+    assert derived()["by_kind_clean"] == want_bk_c, "and so does its pruned view — a filter must not outlive the prune"
     assert len(derived()["timeline"]) == want_tl, "timeline length agrees too"
     bhash = append("bench", "bond", "%s uses %s" % (hs[0], hs[1]))["hash"]
     assert any(e["hash"] == bhash for e in all_bonds()), "a fresh edge is in the graph without a rebuild"

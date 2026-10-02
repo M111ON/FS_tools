@@ -1303,3 +1303,323 @@ ui_check  OK (138,016 bytes · 15/15 invariants)     stream_check  14/14
 pool.py demo  306/306 PASS    ctx_plane  PASS     prune_check  13/13
 error_check  6/6 PASS   curator_check  37/37   reconnect_check 14/14   latency_check  8/8
 ```
+
+## 19. The kind layer — what KIND of line landed here, and two bugs it shook out
+
+Added 2026-10-03. A colour layer, not a mode: `PV.colour='kind'` joins
+`density`/`heat`/`writer`/`recent` and reads `cell_kind[rk]` — the kind of the
+**last** line to land on that address. Free, for the same reason `cell_app`
+was (§14.2's fold, already being made): the live edge of the log answers "what
+was this cell last" exactly after every append, while counting per kind would
+cost a dict per cell to say less.
+
+It is not decoration, because the plane cannot answer this without it. A cell
+holding 34 lines shows the number **34** whether those are 34 bonds (one hub)
+or 34 chats (one conversation) — the two are opposites to a reader, and §9.1
+already showed that a shape read off the wrong altitude is a claim the address
+does not support.
+
+### 19.1 What the corpus says, measured before building it
+
+```
+32,685 lines · CHAT 13,746 · bond 13,572 · DECISION 5,026 · pointer 302 · block 32
+cells occupied 13,210   (cell,kind) pairs 16,750 = 1.27×   1 kind: 9,919 · 2: 3,042 · 3: 249
+```
+
+Three candidate AXES were measured and two were rejected, which is why this
+shipped as a colour and not as a mode:
+
+| axis | verdict | the number |
+|---|---|---|
+| **kind as geometry** | rejected | CHAT centroid (71.6, 74.2), DECISION (71.9, 69.9) — **4.2 cells apart** of 144. Two views of the same picture. |
+| **time as geometry** | rejected | 32,685 lines need **227 rows** of 144; the plane has 144, so it wraps at row 83 and paints over itself — an image that lies about its own extent. |
+| **app as swimlanes** | **kept for later** | the corpus is three non-overlapping eras: hermes `0–11,655` · index `11,656–25,229` · chatdrop `25,521–32,635` = 79% of the log. The plane shows **none** of it, because it sums every line into one number per cell. |
+
+`bond` is the one kind that does separate on its own: its own median spread is
+**16** cells against CHAT's 49 and DECISION's 51, and its centroid sits 42.2
+from CHAT's. It is a distinct mass on the plane that nothing could name — which
+is exactly what a missing label looks like.
+
+### 19.2 The bug the layer shook out, twice, in the same shape
+
+**`pretty()` compared `kind == "chat"` exactly** ([pool.py](pool.py)), and the
+corpus writes `CHAT`. Every one of **13,746** plain chat lines rendered as
+`hermes/CHAT` instead of `hermes`. It is the defect §6 already paid for in
+`curator_protect()`, in a function nobody was looking at.
+
+**The feed badge did the same thing.** `kind==='chat'?'':` is false for `CHAT`,
+so all 13,746 chat lines grew a badge reading **"CHAT"** — the one wire name
+the screen has a plain Thai word for. And while fixing it: `KIND_TH` existed
+**twice**, one inside `card()` for the feed and one for the plane. Two tables
+for one job is the §17.5 drift in miniature — whichever copy a renderer reads
+can lag the other, and the page renders perfectly either way. There is now one
+table, at the top of the script, read by both, and a check that fails if a
+second one appears.
+
+> A kind is a **value**, never a spelling. The rule was already written down,
+> in a different file, about a different function — which is what "the rule
+> lives in the code and not in the reader's head" costs.
+
+### 19.3 The check's own comment satisfied the check
+
+The new invariant counts literal `==='chat'` comparisons and requires exactly
+one. Its first run failed on **correct** code: the sentence explaining why
+`kind==='chat'` is wrong *contains* `kind==='chat'`. That is §13.5 inverted —
+that rule stopped a check being satisfied **by** a comment, and this one was
+satisfied **by** one. `_code_matches()` blanks `/* */` blocks and skips any
+match preceded by `//` on its line, so prose can neither pass nor fail a rule.
+
+Accepted limit, stated rather than hidden: a `/*` inside a JS regex or string
+would be read as a comment. The dashboard has none, and the failure direction
+is a check that under-reports — never one that passes broken code.
+
+### 19.4 The whole map, per kind, is the NEXT step and it is cheap
+
+```
+cells occupied 13,210  →  (cell,kind) pairs 16,750   = 1.27× the current map
+per-kind payload as JSON ≈ 187 KB vs ≈ 147 KB now
+```
+
+A `kind → {rkey: count}` fold answers "show me only bonds, dim the rest"
+without a second walk, and the cells that are pure (`1 kind: 9,919`) dominate
+precisely because the mixture is in the **minority**: 3,291 cells hold more
+than one kind, so a per-kind map is 1.27× rather than 8×. The cost is not
+storage — it is that "dim the rest" needs `PV.cells` to keep BOTH maps at once,
+which is a decision about what the plane is allowed to forget.
+
+```
+ui_check  OK (164,554 bytes · 29/29 invariants)      pool.py demo  315/315
+stream_check 14/14   error_check 6/6   curator_check 37/37
+reconnect_check 14/14   latency_check 8/8   ctx_plane PASS   taskboard 16/16
+mutations: drop a word / add a table / revert the badge / drop a colour /
+           leave a word untranslated                            → 5 of 5 CAUGHT
+```
+
+## 20. The kind filter — showing less, never more
+
+Added 2026-10-03. §19 shipped the *label* of a cell ("what KIND of line landed
+here last"). §19.4 named the NEXT step and its price; this is that step. One
+`<select>` beside the colour picker: pick a kind, and the plane draws only the
+cells holding it, everything else in neutral grey.
+
+It is a filter and **not** a mode, and that distinction is the whole design.
+§18's modes (`plane`/`blocks`/`window`) answer *where is this address*; a filter
+answers *how much of the picture is this*. It touches no addressing function,
+inherits §18's "one address space, or none" rule for free, and cannot disagree
+with the counts because it reads the same `rkey` keys.
+
+### 20.1 The map, split by kind — measured, not estimated
+
+```
+cells 13,210 (122 KB)  →  (cell,kind) pairs 16,750 (155 KB)  = 1.26×
+
+kind        lines  cells  lines/cell   %lines   %cells
+CHAT        13746   9532       1.44     42.0%    56.9%
+bond        13572   2651       5.12     41.5%    15.8%
+DECISION     5026   4452       1.13     15.4%    26.6%
+pointer       309     77       4.01      0.9%     0.5%
+block          32     32       1.00      0.1%     0.2%
+msg             6      6       1.00      0.0%     0.0%
+bridge          1      1       1.00      0.0%     0.0%
+```
+
+The fold is inside the one that was already running (§19.2's `derived()`), so
+there is no new pass and no new walk — the same §14.2 argument that made the
+kind *layer* free makes the kind *filter* 26% cheaper than a second map would
+have been, because it rides the same dict walk.
+
+The table is the finding, and it is not what §19 predicted. `bond` holds **41.5%
+of all lines in 15.8% of the cells** — 5.12 lines per cell against CHAT's 1.44.
+§19 measured bond's centroid as 42.2 cells from CHAT's and called it "a distinct
+mass"; the filter makes that concrete, because filtering to bonds does not
+dim 16% of the picture, it **deletes 84% of the cells and keeps the loudest
+ones**. A reader switching kinds is not recolouring a map, they are seeing a
+different map: 9,532 scattered cells become 2,651 hubs.
+
+> Two thirds of the extra payload is `bond` and `pointer` — 2,728 cells costing
+> 33 KB. The cheap kinds are the ones nobody filters for.
+
+### 20.2 The contract: the picture may show LESS, never more
+
+A filter is the one feature that can make a map lie in a new direction. Not by
+crashing, not by showing nothing — by showing **more** of something than the
+plane holds, which no reader has any way to catch. Three rules, each one a
+function so it can be run and not merely read:
+
+```js
+function pvFilt(){return(PV.kindOnly&&PV.kinds[PV.kindOnly])||null}   // absent kind ⇒ NO filter, never a phantom one
+function pvKindN(rk){const f=pvFilt();return f?(f[rk]||0):0}        // a cell holding none counts 0, not the total
+function pvInkAt(rk,rel){                                             // filtered-out ⇒ grey, never a kind hue
+  const f=pvFilt();
+  if(f&&!f[rk])return 'rgba(139,148,158,0.13)';
+  return pvCellInk(rk,rel);}
+function pvDrawMax(){                                                  // ramp ceiling = busiest cell OF THE FILTER
+  const f=pvFilt(),vals=f?Object.values(f):Object.values(PV.cells);
+  return vals.length?Math.max(...vals):1;}
+```
+
+`pvDrawMax()` is the one that is easy to leave out and impossible to notice.
+Without it the colour ramp is still normalised to the *unfiltered* busiest cell,
+so filtering to `pointer` — 4.01 lines/cell but only 77 cells — tints the map
+without moving a single shade: the filter appears to do nothing on the one kind
+where it would help most.
+
+**The numbers a reader sees stay TOTAL.** The picture counts the filter; the
+printed counts do not. This is not a compromise, it is the only choice that
+keeps both true: a cell holding 34 lines printed as `0` while the screen shows
+something there is a contradiction, and printed as `34` while the screen shows
+nothing of it says the filter did nothing. So the tooltip carries **both**,
+labelled — `ที่อยู่ 0a81e5cf (คอลัมน์ 12, แถว 99) · 34 บรรทัด · เส้นเชื่อม 12
+(เหลือ 22 ชนิดอื่น)` — and the legend states the split outright:
+*สีและความสว่าง นับเฉพาะชนิดนี้ · ช่องที่ไม่มีชนิดนี้จางเป็นสีเทา ·
+ตัวเลขที่ผู้อ่านเห็น (ช่อง / แว่น / ทิป) นับทุกชนิดเหมือนเดิม.*
+
+The status line counts what is lit (`สว่าง 2,651 ช่อง · 13,572 บรรทัดของชนิดนี้`)
+so a reader can always see the denominator without hovering.
+
+### 20.3 Three places the filter had to be threaded, and one it nearly wasn't
+
+A filter that reaches the main paint but not the rest is a filter that works
+on the picture you are looking at *now* and lies the moment you move.
+
+| surface | what had to change | what happens without it |
+|---|---|---|
+| base + ghost passes ([pool_server.py](pool_server.py)) | both call `pvInkAt()` and size their ramp with `pvDrawMax()` | the ghosted under-layer would stay fully coloured under a greyed filter |
+| the magnifier ([pool_server.py](pool_server.py)) | `pvLensOne()` reads the filtered count for its caption | the lens zooms in on a map that is not the one on screen |
+| the **time scrub** (`pvCellsUpTo()`) | `if(only&&row[3]!==only)continue;` | drag time back with "bonds only" on and every other kind comes straight back |
+
+The scrub is the one that matters. It rebuilds the plane from `PV.timeline`
+rather than from `PV.cells`, so it is a second implementation of the same
+counting rule — and it is the only surface whose numbers a reader can watch go
+backwards. The invariant that guards it is one line of regex:
+
+```
+a filter on the time scrub is the same filter as on the live plane
+```
+
+And the honest failure mode is stated rather than designed out:
+`PV.kindOnly` naming a kind with no cells **keeps the filter on and says the
+kind is empty here**. Falling back to the unfiltered map would draw the whole
+plane under a filter that claims to be on — the one answer this layer must
+never give.
+
+### 20.4 The probe that tested a copy of the code
+
+`ui_check` gained a node probe for the filter, and its **first version pasted
+its own copies** of the four functions. Three mutations of the real code passed
+it: `pvKindN` returning the total, filtered-out cells painted as if they
+matched, the ramp ceiling ignoring the filter.
+
+> A test that cannot fail is not a test. Neither is one that tests a copy of
+> the thing — §13.5 again, from the other direction: that rule stopped a check
+> being satisfied **by** a comment, and this one was satisfied **by** itself.
+
+`_js_function()` now slices the four functions out of the **served script** and
+runs those. Two supporting fixes were needed first, both of which had been
+failing silently in the three existing node probes:
+
+- `_probe_count()` reads the trailing number off `bad.join(' | ') + ' :: ' + n`
+  instead of stripping the line and testing it for emptiness — `.strip()` +
+  `rpartition(" :: ")` ate the leading space, so **every probe reported failure
+  on passing code**. Three call sites replaced.
+- the probe writes its source with `chr(10)`, because `"\n"` inside the Python
+  heredoc that builds it arrives as a real newline and splices the JS string
+  across two lines. It bit three times.
+
+With the real functions running, the invariant is one sentence and it is the
+section title: **the kind filter may show less, never more** — asserted by
+comparing `pvKindN(rk) > PV.cells[rk]` for every cell, which no regex can see.
+
+```
+ui_check  OK (169,392 bytes · 32/32 invariants)       pool.py demo  321/321
+stream_check 14/14   prune_check 13/13   reconnect_check 14/14   error_check 6/6
+curator_check 37/37   latency_check 8/8   ctx_plane PASS   taskboard 16/16
+taskboard_check 17/17
+mutations: pvKindN returns the total / filtered-out painted as a match /
+           ramp ceiling ignores the filter / an absent kind becomes no filter
+                                                       → 4 of 4 CAUGHT
+run_all  11/11 suites PASS (26.7s)
+```
+
+### 20.5 The browser found five, and every check was green
+
+Everything above was written before the feature was ever **opened**. A sandbox
+server (a copy of the corpus on its own port, never the reader's 8390) then
+drove the real control. It did not work on the first try, and not on the fifth.
+
+| # | what a reader saw | why every check was green |
+|---|---|---|
+| 1 | **the dropdown never opened at all** | `pvKindOptions` guarded its one line with `ks.join('|')`, and `ks` is a **count object**. `ks.join` is `undefined`, so the guard itself threw a `TypeError` on every path that had kinds to show. Four correct maths functions sat behind an unreachable `<select>` |
+| 2 | it was **disabled with one option** before the layer loaded | a disabled `<select>` cannot fire the handler that loads the layer it needs. The only way in was to first pick a meta-backed **colour** — a control the reader has no reason to touch |
+| 3 | the fix for 1 wrote `if(have[0]!=='')return` | true when the list is **empty** (`have[0]` is `undefined`), so it returned early on the one case it existed to handle |
+| 4 | every kind read **`(0)`** | `pvTopKinds` counted with `n[a]=n[a]||0` — read a count, wrote it back, added nothing. Sorting a column of zeros still looks sorted |
+| 5 | the list said **`เส้นเชื่อม (1961)`**, selecting it lit **2,651** | the list quoted the **colour layer** ("cells whose last line was this") while the filter counts cells that **hold** one. Two numbers about one click |
+
+and then, once it worked, two more that only exist under time:
+
+| # | what a reader saw | why |
+|---|---|---|
+| 6 | scrub time back and the line still said **13,572** while the picture held 1,421 | the status line counted the filter over the **whole log**. The prune figures three lines above had already been fixed for exactly this reason ("say it only about the LIVE plane"); the filter had not learned it |
+| 7 | the first fix for 6 said **7,938** against a picture holding 1,421 | while scrubbing `pvCellsUpTo` has **already** applied the filter, so `src` *is* the answer — summing the whole-log `f[k]` over it counts bonds that have not happened yet |
+| 8 | the fix for 7 reported **"no data in this view"** while 943 cells were lit | `lit=scrubbed?src:Object.keys(src).filter(…)` makes `lit` an **array** on one branch and an **object** on the other, then asks `lit.length`. An object has no `.length` |
+
+**The pattern is one bug, eight times.** Every one of them is a *wiring* fault
+between correct arithmetic and a `<select>`/a caption — and every check in this
+file is arithmetic or a regex. `kind_filter()` runs the four maths functions and
+proves `pvKindN(rk) ≤ PV.cells[rk]` for every cell; that is a true statement
+about a feature that could not be opened once.
+
+So two checks were added, both of which failed on the code that shipped:
+
+- **`kind_list()`** builds a `<select>` in node out of the **real**
+  `pvKindOptions` and the **real** `pvTopKinds`, then asks whether the reader
+  gets a list they can use. `_js_arrow()` slices the arrow-shaped one, because a
+  stubbed count passes a function that returns zeros.
+- **"a control that needs a layer can ask for it"** — the static rule that no
+  `sel.disabled=!ks` may come back.
+
+Its first run failed on **correct** code for the third time in this file, and
+the reason was its own harness: the stub compared `$` against `'pv-kind'` while
+the real `$` receives `'#pv-kind'`, so `if(!sel)return` fired and the probe
+reported every clause broken while testing nothing.
+
+> A check that cannot see its own harness is worse than no check, because it
+> looks like coverage.
+
+```
+ui_check  OK (173,486 bytes · 35/35 invariants)       pool.py demo  321/321
+stream_check 14/14   prune_check 13/13   reconnect_check 14/14   error_check 6/6
+curator_check 37/37   latency_check 8/8   ctx_plane PASS   taskboard 16/16
+taskboard_check 17/17   run_all 11/11 suites PASS
+
+mutations  11 attempted · 11 CAUGHT
+  arithmetic: pvKindN returns the total / filtered-out painted as a match /
+              ramp ceiling ignores the filter / an absent kind becomes no filter
+  the list:  ks.join guard reverted / the select disabled again /
+              __load option dropped / no-churn guard back to an early return /
+              pvTopKinds counting without the +1 /
+              nLit quoting the colour layer / sorting by the colour layer
+  the frame: figures counted over the whole log / the scrubbed branch summing
+              f[k] / either branch ceasing to be an array
+
+verified in a browser, against ground truth read from the corpus:
+  LIVE   screen "สว่าง 2,651 ช่อง · 13,572 บรรทัด"  =  2,651 cells / 13,572 lines
+  SCRUB  screen "สว่าง   943 ช่อง ·  1,421 บรรทัด"  =    943 cells /  1,421 lines
+```
+
+### 20.6 What is still not answered
+
+The kind filter answers "which cells hold this kind". The two axes §19.1
+measured and rejected are still rejected, and one is still owed:
+
+- **app as swimlanes** — the corpus is three non-overlapping eras (hermes
+  `0–11,655` · index `11,656–25,229` · chatdrop `25,521–32,635`, 79% of the
+  log). The kind filter is the same *mechanism* `by_kind` is: a fold that
+  partitions cells by a second value. `by_app` is the identical line of code
+  with a different key, and the measured cost is already known (26%). It is a
+  filter on identity, not a mode, so it needs none of the six addressing
+  functions §18 demanded.
+- **`pstep()` infers the mode from the cell count** (`n===144?2:8`) — §19
+  noticed this and §14.6 forbids fixing it as a side effect. `PV.n` → `PV.w`/
+  `PV.h` is 18 call sites and wants its own commit, before any new mode exists
+  to make the inference wrong in front of someone.

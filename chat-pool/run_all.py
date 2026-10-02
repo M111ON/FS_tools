@@ -17,12 +17,18 @@ SUITES = [
     ("pool.py demo",      [sys.executable, "pool.py", "demo"]),
     ("ctx_plane",         [sys.executable, "ctx_plane.py", "demo"]),
     ("ui_check",          [sys.executable, "ui_check.py"]),
+    # Drives the real dashboard in a real browser and grades what it RENDERED
+    # against the corpus. Eight wiring bugs reached a green run_all because
+    # every other check here is arithmetic or a regex; this one clicks.
+    ("ui_browser_check",  [sys.executable, "ui_browser_check.py"]),
     ("stream_check",      [sys.executable, "stream_check.py"]),
     ("prune_check",       [sys.executable, "prune_check.py"]),
     ("reconnect_check",   [sys.executable, "reconnect_check.py"]),
     ("error_check",       [sys.executable, "error_check.py"]),
     ("curator_check",     [sys.executable, "curator_check.py"]),
     ("latency_check",     [sys.executable, "latency_check.py"]),
+    ("taskboard demo",    [sys.executable, "taskboard.py"]),
+    ("taskboard_check",   [sys.executable, "taskboard_check.py"]),
 ]
 
 
