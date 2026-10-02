@@ -1972,3 +1972,85 @@ back to `w===144&&h===144` renders every pixel identically, because the plane is
 144 wide and the other two modes are not. No browser can see it. `ui_check` can,
 and does — which is the right division of labour and worth stating rather than
 hiding behind a green row.
+
+## 23. The composition strip — what the corpus is made of, without opening anything
+
+Added 2026-10-03. §22 gave the plane a second filter, but the question
+underneath both filters still had no home. The plane answers "which cell is
+thick". It has never answered "out of 32,705 lines, what is this?" — which is
+the question a reader opens it with.
+
+### 23.1 The answer existed, behind a button
+
+`pattern_census()` already computed all four breakdowns — and returned them to
+the 📊 แพทเทิน button, which fetched on press, rendered into the detail panel,
+and was therefore only reachable by a reader who had already guessed that the
+question was supported. So the corpus could be described, but not *read*. This
+section moves the same numbers somewhere they are always visible.
+
+Measured on the live corpus (32,705 lines · 13,572 edges):
+
+| axis | groups | largest groups |
+|---|---|---|
+| ชนิด (kind) | 7 | CHAT 13,746 · bond 13,572 · DECISION 5,026 · pointer 322 |
+| ผู้เขียน (app) | 12 | chatdrop 7,115 · opencode 6,079 · hermes 5,056 · dashboard 843 |
+| ความสัมพันธ์ (relation) | 9 | x-next-in-session 5,579 · x-related-term 2,613 · x-uses-term 2,594 |
+| รูปของกราฟ (shape) | 5 | edge 13,572 · isolated 10,475 · chain 6,327 |
+
+Every one of them is worth a look and none of them was one keystroke away. The
+census payload with the fourth axis added is **6.6 KB**.
+
+Two of the four are new *as a breakdown* and two are new *as a control*: `kinds`
+is folded from the same `by_kind` pass the filter reads (so the strip and a
+filter click cannot disagree about what "แชท 13,746 บรรทัด" means), and the
+writer axis reuses §22's numbers rather than inventing a second count of
+writers.
+
+### 23.2 Two axes are read-only, and say so
+
+Only kind and writer can be clicked. Relation and shape describe the *graph*,
+not the individual line in log order, so there is no per-line property for the
+scrub to honour — the same reason `pvCellsUpTo` exists. A row that looked
+clickable and silently ignored the time slider is a frame that lies about
+itself, which is what §20.2 is about; so those rows carry no pointer cursor,
+and the strip's footer says อ่านอย่างเดียว instead of offering the gesture.
+
+The strip also labels its own total รวม N and does **not** reuse the plane's
+numbers, which count the scrubbed frame. Dragging the slider back to line 40
+leaves the strip describing all 32,705 lines on purpose: the composition of the
+corpus is not a function of when you are standing.
+
+### 23.3 It rides in with the plane
+
+`/patterns` is fetched in the same `Promise.all` as the plane, the timeline and
+the bonds. 6.6 KB against a plane payload two orders of magnitude larger is not
+a cost worth a button press, and the button (`pvCensus`) now reuses the copy it
+has instead of re-fetching. The strip is a **sibling** of `#plane-side`, not a
+child of `#plane-detail`, so opening a cell cannot destroy it.
+
+### 23.4 The bug the strip's own author caused
+
+The first version adopted the strip with `pvAdoptLegends` like the two legends,
+and put it inside the panel. `insertBefore(strip, legendBox)` then throws the
+moment `innerHTML` has already detached the legend — so the call that exists to
+repair the panel became a second thing that broke it, and the symptom was the
+legend vanishing again, in a session where that had already been fixed once. A
+container that can be destroyed should not be rebuilt by the code that is
+destroying it.
+
+### 23.5 What the check grades
+
+`ui_browser_check` clicks all four axis buttons and grades every row against
+the census the *server* computed, each axis against its own map — the writer
+axis counts lines while the writer legend counts last-writers, and using the
+wrong one is bug 5 of §20 at a new address. A row must state a number the
+corpus actually has, and the rows must come back in size order. Kind and writer
+rows are then clicked and the filter they claim to set is read off `PV.filt`;
+the other two are asserted to be unclickable rather than merely unclicked.
+
+```
+ui_browser_check  36/36 PASS
+ui_check          40/40
+pool.py demo      327/327
+run_all           12/12 suites
+```

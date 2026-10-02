@@ -821,7 +821,7 @@ button.send:disabled{opacity:.55;cursor:progress}
         <div id="plane-tip" popover="manual"></div>
         <div id="plane-pop" popover="manual"></div>
       </div>
-      <div id="plane-side"><div id="plane-detail"><div id="pv-legend"></div><b style="color:var(--fg)">แผนที่นี้คือที่อยู่ของทุกบรรทัด</b> — หนึ่งช่อง = หนึ่งที่อยู่ ตัวเลขในช่อง = มีกี่บรรทัดอยู่ตรงนั้น<br><br>▸ <b>คลิกช่อง</b> = ดูว่ามีอะไรอยู่ตรงนั้น<br>▸ <b>🔍 แว่นขยาย</b> = ถือไปดูใกล้ ๆ (ลาก = เลื่อนแว่น)<br>▸ ปุ่ม <b>+ −</b> มุมขวาล่าง = ซูมเข้า/ออก · <b>⟲</b> = กลับไปทั้งแผนที่<br>▸ <b>บนจอสัมผัส</b>: ลาก = เลื่อนมุมมอง · บีบสองนิ้วออก = ซูมเข้า · บีบสองนิ้วเข้า = ซูมออก (หยุดที่ทั้งระนาบ และที่กรอบ 12×12)<br>▸ <b>⚙ ตัวเลือก</b> ด้านบน = เปิดตัวกรอง (ตัดขยะ · เส้นเชื่อม · ความจำ · รัศมี · แพทเทิน)<br><br><span style="color:var(--dim)">◌ สีของช่อง = ข้อมูลที่เลือกไว้ด้านบน (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)<br>◌ วงฟ้า = ช่องที่มีคนบันทึกไว้ว่าอ่านแล้ว<br>◌ เส้นฟ้า = เส้นเชื่อมระหว่างบรรทัด · เส้นขาว = เส้นที่แตะจุดที่เลือกไว้<br>◌ จุดฟ้า = ความจำกลางที่แชร์ไว้ · เส้นม่วงประ = เส้นที่เชื่อมข้ามระบบ<br>◌ แถบเวลาด้านบน = ใครเขียนเมื่อไร · ลากที่แถบหรือลากสไลเดอร์เพื่อย้อนดูแผนที่ค่อย ๆ ประกอบ<br>◌ คีย์บอร์ด: ← → เลื่อนทีละบรรทัด · space เล่น/หยุด · Esc ปิด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
+      <div id="plane-side"><div id="pv-comp"></div><div id="plane-detail"><div id="pv-legend"></div><b style="color:var(--fg)">แผนที่นี้คือที่อยู่ของทุกบรรทัด</b> — หนึ่งช่อง = หนึ่งที่อยู่ ตัวเลขในช่อง = มีกี่บรรทัดอยู่ตรงนั้น<br><br>▸ <b>คลิกช่อง</b> = ดูว่ามีอะไรอยู่ตรงนั้น<br>▸ <b>🔍 แว่นขยาย</b> = ถือไปดูใกล้ ๆ (ลาก = เลื่อนแว่น)<br>▸ ปุ่ม <b>+ −</b> มุมขวาล่าง = ซูมเข้า/ออก · <b>⟲</b> = กลับไปทั้งแผนที่<br>▸ <b>บนจอสัมผัส</b>: ลาก = เลื่อนมุมมอง · บีบสองนิ้วออก = ซูมเข้า · บีบสองนิ้วเข้า = ซูมออก (หยุดที่ทั้งระนาบ และที่กรอบ 12×12)<br>▸ <b>⚙ ตัวเลือก</b> ด้านบน = เปิดตัวกรอง (ตัดขยะ · เส้นเชื่อม · ความจำ · รัศมี · แพทเทิน)<br><br><span style="color:var(--dim)">◌ สีของช่อง = ข้อมูลที่เลือกไว้ด้านบน (จำนวนบรรทัด / ความร้อน / ใครเขียนล่าสุด / ล่าสุดเมื่อไร)<br>◌ วงฟ้า = ช่องที่มีคนบันทึกไว้ว่าอ่านแล้ว<br>◌ เส้นฟ้า = เส้นเชื่อมระหว่างบรรทัด · เส้นขาว = เส้นที่แตะจุดที่เลือกไว้<br>◌ จุดฟ้า = ความจำกลางที่แชร์ไว้ · เส้นม่วงประ = เส้นที่เชื่อมข้ามระบบ<br>◌ แถบเวลาด้านบน = ใครเขียนเมื่อไร · ลากที่แถบหรือลากสไลเดอร์เพื่อย้อนดูแผนที่ค่อย ๆ ประกอบ<br>◌ คีย์บอร์ด: ← → เลื่อนทีละบรรทัด · space เล่น/หยุด · Esc ปิด</span><div id="rel-legend" style="margin-top:7px"></div></div></div>
     </div>
   </div>
 </div>
@@ -1686,7 +1686,7 @@ const PV={mode:'plane',w:144,h:144,sel:null,path:[],plane:{},cells:{},origin:nul
           // never written to the pool — exploring is not a sighting (a
           // sighting says "someone read here"; a trail says "I got lost here"
           // and would drown the real ones)
-          walk:null,census:null,showCensus:false,trail:[],
+          walk:null,census:null,showCensus:false,trail:[],cmp:0,
           // 🔍 the magnifier: a lens you CARRY over the plane, not another
           // plane scale you switch to. It is an overlay for two reasons — the
           // base view keeps its landmarks (so you can see WHICH patch is
@@ -1700,11 +1700,20 @@ const pcv=$('#plane-cv');
 // is why nothing ever said so: the legend simply stopped existing. Holding the
 // nodes here, once, is what lets them be put BACK; a re-query after the write
 // would find nothing left to find.
-const _pvLegendBox=$('#pv-legend'),_pvRelBox=$('#rel-legend');
+const _pvLegendBox=$('#pv-legend'),_pvRelBox=$('#rel-legend'),_pvCompBox=$('#pv-comp');
 // one writer for every path that replaces the panel, so the legends cannot be
 // remembered on the main path and forgotten on the census one. The order is the
 // original one — colour legend above the prose, relation legend below it — so
 // nothing moves on screen the day this was fixed.
+//
+// The composition strip is deliberately NOT adopted: it is a SIBLING of
+// #plane-side, not a child of the panel, so nothing here can destroy it. The
+// first version adopted it anyway and put it inside the panel, where
+// `insertBefore(strip, legendBox)` throws the moment innerHTML has already
+// detached the legend — so the call this file exists to make was itself
+// breaking the panel, and the symptom was a legend that had vanished again.
+// `el.firstChild` is the only reference node that is always valid, because
+// null means "append".
 function pvAdoptLegends(el){
   if(_pvRelBox)el.appendChild(_pvRelBox);
   if(_pvLegendBox)el.insertBefore(_pvLegendBox,el.firstChild);
@@ -3243,7 +3252,7 @@ function pvMode(){
   if(PV_WINS.indexOf(PV.win)>=0)$('#pv-win').value=String(PV.win);
   _legendKey=null;                         // a new view is a new legend
   pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
-  pvFilterOptions();pvLensInfo();
+  pvFilterOptions();pvComposition();pvLensInfo();
 }
 // One place that moves time, so the slider, the arrow keys, the strip and the
 // replay button can never disagree about where "now" is.
@@ -3278,12 +3287,17 @@ function pvPNG(){
 }
 async function loadPlane(){
   try{
-    const [d,s,b,t]=await Promise.all([
+    // /patterns rides along with the plane: 6.6 KB, and it is the read that
+    // fills the composition strip, which used to need a button press before it
+    // would admit what the corpus is made of
+    const [d,s,b,t,c]=await Promise.all([
       fetch('/neighbors?rkey=0&level=2'+(PV.prune?'':'&raw=1'),{headers:H}).then(r=>{if(r.status===401)throw 401;return r.json()}),
       fetch('/pointers',{headers:H}).then(r=>r.json()),
       fetch('/bonds?fields=plane',{headers:H}).then(r=>r.json()),
-      fetch('/plane/timeline',{headers:H}).then(r=>r.json())
+      fetch('/plane/timeline',{headers:H}).then(r=>r.json()),
+      fetch('/patterns',{headers:H}).then(r=>r.json()).catch(()=>null)
     ]);
+    if(c)PV.census=c;
     PV.plane=d.fine_cells||{};PV.budget=d.budget||64;
     PV.pruned=d.pruned||0;PV.prunedCells=d.pruned_cells||0;
     PV.sights=s.pointers||[];
@@ -3401,6 +3415,61 @@ function pvHopSection(title,hint,levels,tone){
 }
 // The census: proportions have to be SEEN. "3,001 islands" beside "13,572
 // edges" reads as two comparable numbers, and they are not.
+/* ── the composition strip ────────────────────────────────────────────
+   "What is this corpus MADE OF", asked without opening anything.
+
+   It used to be answerable only from inside the census button, behind a
+   fetch, in a panel that REPLACED the cell detail — so the one question a
+   reader opens the plane with ("out of 32,705 lines, what is this?") was
+   the hardest one to ask. /patterns is 6.6 KB with the kind axis added,
+   which is cheap enough to fetch WITH the plane, so this is simply always
+   there.
+
+   Four axes, one row shape, so they can be compared by eye. Two of them —
+   kind and writer — are the two the plane already carries per line in the
+   log's own order, so clicking a row filters. The other two are not, and
+   the row says so rather than pretending: a filter the scrub cannot honour
+   is a frame that lies about itself, which is what §20.2 is about. */
+const PV_CMP=[
+  {dim:'kind', label:'ชนิด', get:c=>c.kinds, lab:kindLabel},
+  {dim:'app', label:'ผู้เขียน', get:c=>(c.by_app&&Object.fromEntries(Object.entries(c.by_app).map(([k,v])=>[k,v.lines]))), lab:appLabel},
+  {dim:null, label:'ความสัมพันธ์', get:c=>c.rels, lab:r=>r},
+  {dim:null, label:'รูปของกราฟ', get:c=>c.shapes, lab:(s,c)=>((c&&c.shape_meta&&c.shape_meta[s])?c.shape_meta[s].label:s)},
+];
+function pvComposition(){
+  const box=_pvCompBox;if(!box)return;
+  const c=PV.census;
+  if(!c){box.innerHTML='<div style="color:var(--dim);font:10px var(--mono)">องค์ประกอบ: กำลังโหลด…</div>';return}
+  const a=PV_CMP[PV.cmp||0],rows=a.get(c)||{};
+  const entries=Object.keys(rows).sort((x,y)=>rows[y]-rows[x]||String(x).localeCompare(String(y)));
+  const tot=entries.reduce((s,k)=>s+rows[k],0)||1;
+  let h='<div style="display:flex;align-items:center;gap:4px;margin-bottom:5px">'
+    +'<span style="color:var(--fg);font-size:11px">องค์ประกอบ</span>'
+    +'<span style="color:var(--dim);font:9px var(--mono)">รวม '+tot.toLocaleString()+'</span></div>'
+    +'<div style="display:flex;gap:3px;margin-bottom:5px">';
+  PV_CMP.forEach((ax,i)=>{
+    h+='<button class="pbtn" data-cmp="'+i+'" style="font:9px var(--mono);padding:2px 5px;'
+      +(i===(PV.cmp||0)?'box-shadow:inset 0 0 0 1px var(--acc2);':'')+'">'+esc(ax.label)+'</button>';
+  });
+  h+='</div>';
+  entries.forEach(k=>{
+    const pct=100*rows[k]/tot,on=PV.filt&&PV.filt.dim===a.dim&&PV.filt.key===k;
+    const clickable=!!a.dim;
+    h+='<div class="cenrow" data-cmp-dim="'+(a.dim||'')+'" data-cmp-key="'+esc(k)+'"'
+      +' style="grid-template-columns:84px 1fr 58px;'+(clickable?'cursor:pointer;':'')+(on?'background:var(--panel2);border-radius:6px;':'')+'"'
+      +(clickable?'':' title="แกนนี้ไม่ใช่คุณสมบัติของแต่ละบรรทัดตามลำดับเวลา จึงกรองเฟรมที่ลากย้อนไม่ได้ — ดูอย่างเดียว"')+'>'
+      +'<span style="font-size:10px;overflow:hidden;text-overflow:ellipsis'+(on?';color:var(--acc2);font-weight:600':'')+'">'+esc(a.lab(k,c))+'</span>'
+      +'<span class="cenbar"><i style="width:'+Math.max(1.5,pct).toFixed(1)+'%"></i></span>'
+      +'<span class="cennum">'+rows[k].toLocaleString()+' · '+(pct>=1?pct.toFixed(0):'<1')+'%</span></div>';
+  });
+  h+='<div style="color:var(--dim);font:9px var(--mono);margin-top:4px">'
+    +(PV_CMP.some(x=>x.dim)?'คลิกแถวของชนิดหรือผู้เขียนเพื่อกรองแผนที่':'อ่านอย่างเดียว')
+    +'</div>';
+  const same=box._cmpHtml===h;
+  if(!same){box.innerHTML=h;box._cmpHtml=h;}
+  return same;
+}
+
 function pvCensusHTML(){
   const c=PV.census;
   if(!c)return '<div>…</div>';
@@ -3567,7 +3636,9 @@ async function pvWalkLine(h,sameTrail){
 }
 async function pvCensus(){
   try{
-    PV.census=await fetch('/patterns',{headers:H}).then(r=>r.json());
+    // already in hand from the plane load — refetching 6.6 KB because someone
+    // pressed a button is the kind of thing that makes an opener slow
+    if(!PV.census)PV.census=await fetch('/patterns',{headers:H}).then(r=>r.json());
     PV.showCensus=true;PV.walkSel=null;PV.trail=[];pvDetail();
   }catch(e){toast('โหลดแพทเทินไม่สำเร็จ — ลองอีกครั้ง')}
 }
@@ -4024,6 +4095,18 @@ $('#pv-census').onclick=()=>{
   // how a panel becomes unreadable
   if(PV.showCensus){PV.showCensus=false;pvDetail();return}
   pvCensus();
+};
+// one delegation point for the whole strip, because the rows are rebuilt on
+// every repaint and a handler bound to each row would die with the row
+if(_pvCompBox)_pvCompBox.onclick=ev=>{
+  const btn=ev.target.closest('[data-cmp]');
+  if(btn){PV.cmp=+btn.dataset.cmp;pvComposition();return}
+  const row=ev.target.closest('[data-cmp-dim]');
+  if(!row)return;
+  const dim=row.dataset.cmpDim,key=row.dataset.cmpKey;
+  if(!dim)return;                       // an axis the scrub cannot honour
+  const on=PV.filt&&PV.filt.dim===dim&&PV.filt.key===key;
+  pvPickFilt(dim,on?'':key);
 };
 $('#pv-f0').onclick=()=>setFocus(0);
 $('#pv-f1').onclick=()=>setFocus(1);

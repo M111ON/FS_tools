@@ -119,9 +119,19 @@ def build_log(box):
         for j in range(n):
             # the subject repeats on purpose: without it every line would land in
             # a cell of its own and nothing would ever hold two kinds — or two
-            # writers, which is what the second axis needs to be interesting
-            pool.append(app, kind,
-                        "%s line %d about subject %d" % (kind, j, j % 7))
+            # writers, which is what the second axis needs to be interesting.
+            #
+            # A bond is the ONE kind whose text is a grammar, not a sentence:
+            # "src rel dst". Every recipe line used to be prose, so every bond
+            # was malformed and the corpus had NO EDGES AT ALL — which meant the
+            # relation axis of the composition strip had nothing to draw and no
+            # check could grade it. An axis nothing in the corpus exercises is an
+            # axis nobody has tested.
+            text = ("subj%d %s subj%d" % (j % 7, ["uses", "next", "answers",
+                                                  "same"][j % 4], (j + 3) % 7)
+                    if kind == "bond" else
+                    "%s line %d about subject %d" % (kind, j, j % 7))
+            pool.append(app, kind, text)
             i += 1
 
     d = pool.derived()
@@ -181,6 +191,15 @@ def build_log(box):
         "lines_total": sum(d["cells"].values()),
         "mixed_cells": sum(1 for v in by_kind.values() if len(v) > 1),
         "mixed_apps": sum(1 for v in by_app.values() if len(v) > 1),
+        # the composition strip reads /patterns, so its truth is the census —
+        # and each axis is graded against its OWN map, because "who wrote this
+        # LAST" and "which cells hold this writer" are different numbers (bug 5)
+        "census": {
+            "kinds": dict(pool.pattern_census()["kinds"]),
+            "writers": {a: v["lines"] for a, v in pool.pattern_census()["by_app"].items()},
+            "rels": pool.pattern_census()["rels"],
+            "shapes": pool.pattern_census()["shapes"],
+        },
         "pruned_differs": len(d["cells"]) != len(d["cells_clean"]),
     }
     for i, row in enumerate(d["timeline"]):
@@ -508,6 +527,41 @@ const bye = () => { try { if (WS) WS.close(); } catch (x) {} };
     // 'if(!box)return', and nothing on screen ever said a word about it. Clicking
     // "▢ กรอบเลื่อน" calls openPoint, so the tour is what finds it.
     R.legendBeforeClicks = !!document.querySelector('#pv-legend');
+    // ── the composition strip: the four axes, through their own buttons ──
+    PH('composition');
+    const readStrip = () => [...document.querySelectorAll('#pv-comp .cenrow')].map(el => ({
+      label: ((el.querySelector('span') || {}).textContent || '').trim(),
+      text: ((el.querySelector('.cennum') || {}).textContent || '').trim(),
+      dim: el.dataset.cmpDim || null,
+      clickable: el.style.cursor === 'pointer',
+    }));
+    R.strip = {};
+    const AXES = ['kind', 'app', 'rel', 'shape'];
+    for (let i = 0; i < AXES.length; i++) {
+      document.querySelector('#pv-comp [data-cmp="' + i + '"]').click();
+      await new Promise(r => setTimeout(r, 250));
+      R.strip[AXES[i]] = readStrip();
+    }
+    // click a KIND row and confirm the filter it claims to set is the one on.
+    // Back to axis 0 first: after the tour the strip is showing shape, and a
+    // query for a kind row in a shape listing finds nothing — which would have
+    // been reported as "the row does not work".
+    document.querySelector('#pv-comp [data-cmp="0"]').click();
+    await new Promise(r => setTimeout(r, 250));
+    const krow = document.querySelector('#pv-comp [data-cmp-dim="kind"]');
+    R.stripClick = null;
+    if (krow) {
+      krow.click();
+      await new Promise(r => setTimeout(r, 450));
+      R.stripClick = Object.assign({dim: PV.filt && PV.filt.dim,
+                                    key: PV.filt && PV.filt.key}, readFrame());
+      // clicking it again clears it — re-query, because the strip re-renders
+      // and a detached row's click never reaches the delegation point
+      const krow2 = document.querySelector('#pv-comp [data-cmp-dim="kind"]');
+      if (krow2) krow2.click();
+      await new Promise(r => setTimeout(r, 450));
+      R.stripUnclick = PV.filt === null;
+    }
     PH('legend'); const col = document.querySelector('#pv-colour');
     col.value = 'kind'; col.dispatchEvent(new Event('change'));
     R.legendLoaded = await waitFor(
@@ -892,6 +946,61 @@ def check(report, truth):
         add("the view does not change what the filter says", one_answer,
             "status per mode: %s (the filter was %r throughout)" % (
                 said, (modes.get("plane") or {}).get("filt")))
+    # ── the composition strip ──────────────────────────────────────────────
+    # The reader opens the plane and cannot answer "what is this made of"
+    # without a button press, so the strip is graded against the census the
+    # server computed — every axis against its OWN map, because the writer axis
+    # counts lines while the writer LEGEND counts last-writers, and using the
+    # wrong one is bug 5 with a new address.
+    strip = page.get("strip") or {}
+    want = {"kind": truth["census"]["kinds"], "app": truth["census"]["writers"],
+            "rel": truth["census"]["rels"], "shape": truth["census"]["shapes"]}
+    wrong = []
+    for ax, rows in sorted(want.items()):
+        got = strip.get(ax)
+        if not got:
+            wrong.append("%s: the strip drew no rows" % ax)
+            continue
+        if len(got) != len(rows):
+            wrong.append("%s: %d rows for %d groups" % (ax, len(got), len(rows)))
+        # Each row must state a number, and it must be one the corpus has.
+        # Comparing the LABEL would be weaker: two kinds can share a count, and
+        # the strip renames them for the reader, so the label is not an identity.
+        ns = []
+        for row in got:
+            m = re.match(r"^([\d,]+)\s*·\s*<?\d+%$", row["text"] or "")
+            if not m:
+                wrong.append("%s: row %r reads %r, which states no count"
+                             % (ax, row["label"], row["text"]))
+                continue
+            n_ = int(m.group(1).replace(",", ""))
+            ns.append(n_)
+            if n_ not in rows.values():
+                wrong.append("%s: %s shows %s, a number the corpus does not have"
+                             % (ax, row["label"], n_))
+        if ns != sorted(ns, reverse=True):
+            wrong.append("%s: rows are not sorted by size: %s" % (ax, ns))
+    add("every composition axis matches the census", not wrong,
+        "; ".join(wrong)[:400] or " · ".join(
+            "%s %d groups" % (a, len(strip.get(a) or [])) for a in sorted(strip)))
+
+    clickable = {"kind", "app"}
+    plain = [ax for ax in strip if ax not in clickable
+             and any(r["clickable"] for r in strip[ax] or [])]
+    add("an axis the scrub cannot honour does not pretend it filters",
+        not plain,
+        "clickable on: %s" % plain if plain
+        else "relation and shape are read-only, and say so in their tooltip")
+
+    sc = page.get("stripClick")
+    add("clicking a strip row sets exactly the filter it names",
+        bool(sc) and sc.get("dim") == "kind" and bool(sc.get("key"))
+        and isinstance(sc.get("statusCells"), int) and sc["statusCells"] > 0,
+        "row click -> %r · status lit %s cells%s" % (
+            (sc or {}).get("key"), (sc or {}).get("statusCells"),
+            "" if page.get("stripUnclick") else " · clicking it again did NOT clear"))
+    add("clicking the same row again clears the filter", page.get("stripUnclick") is True,
+        "PV.filt after a second click: %r" % (page.get("stripUnclick"),))
     return r
 
 
@@ -1010,7 +1119,7 @@ def main():
         bad += not ok
     if os.environ.get("UI_BROWSER_DUMP"):
         print("---- raw report ----")
-        print(json.dumps(report, ensure_ascii=False, indent=1)[:4000])
+        print(json.dumps(report, ensure_ascii=False, indent=1)[:12000])
     print("ui_browser_check: %d/%d PASS" % (len(results) - bad, len(results)))
     if bad:
         print("  (the dashboard is judged against the corpus computed in "

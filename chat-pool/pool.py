@@ -2095,7 +2095,15 @@ def pattern_census():
     cell, which is why reading the plane cell by cell never reveals them.
 
     Counted from the adjacency maps so it is O(lines + edges), and cached with
-    them: the shape of the graph only moves when an edge or a prune does."""
+    them: the shape of the graph only moves when an edge or a prune does.
+
+    `kinds` was added for the composition strip (SPEC §23): the corpus grouped
+    by what KIND of line landed in it, counted from the SAME fold the filter
+    reads. It is the raw map, like everything else here — shapes, rels and
+    by_app are all computed over the unpruned graph, and a breakdown whose four
+    axes answered four different questions would be worse than no breakdown.
+    The strip says "ทั้งคลัง" on its own header rather than the map's numbers.
+    """
     out, inn = _adj()
     brief = _brief()
     shapes, by_app = {}, {}
@@ -2142,6 +2150,12 @@ def pattern_census():
                            for k, v in SHAPES.items()},
             "by_app": dict(sorted(by_app.items(), key=lambda kv: -kv[1]["lines"])),
             "rels": dict(sorted(rels.items(), key=lambda kv: -kv[1])),
+            # the fourth axis, and the one the plane already had: same fold, same
+            # counts the filter lights, so the strip and a filter click cannot
+            # disagree about what "แชท 13,746 บรรทัด" means
+            "kinds": {k: sum(v.values())
+                      for k, v in sorted(derived()["by_kind"].items(),
+                                         key=lambda kv: -sum(kv[1].values()))},
             "cross": cross, "edges": sum(len(v) for v in out.values()),
             "hubs": top, "hub_at": HUB_AT}
 
