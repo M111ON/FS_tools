@@ -1612,14 +1612,116 @@ verified in a browser, against ground truth read from the corpus:
 The kind filter answers "which cells hold this kind". The two axes §19.1
 measured and rejected are still rejected, and one is still owed:
 
-- **app as swimlanes** — the corpus is three non-overlapping eras (hermes
-  `0–11,655` · index `11,656–25,229` · chatdrop `25,521–32,635`, 79% of the
-  log). The kind filter is the same *mechanism* `by_kind` is: a fold that
-  partitions cells by a second value. `by_app` is the identical line of code
-  with a different key, and the measured cost is already known (26%). It is a
-  filter on identity, not a mode, so it needs none of the six addressing
-  functions §18 demanded.
-- **`pstep()` infers the mode from the cell count** (`n===144?2:8`) — §19
-  noticed this and §14.6 forbids fixing it as a side effect. `PV.n` → `PV.w`/
-  `PV.h` is 18 call sites and wants its own commit, before any new mode exists
-  to make the inference wrong in front of someone.
+- **`pstep()` still infers the mode from the cell count** (`w===144&&h===144?2:8`).
+  §19 noticed this and §14.6 forbids fixing it as a side effect. The
+  prerequisite is now DONE: `PV.n` is split into `PV.w`/`PV.h` across all
+  eighteen call sites in its own commit, each named for what it means — the
+  ghost-zone bound, the half-window, the lens's wrap stride and the hit-test are
+  per-axis, while the canvas stays square and is sized by the longer side.
+  Behaviour is unchanged, which is the whole point of doing it before a mode
+  exists that would have made the inference wrong in front of someone. What
+  remains is the inference itself: it should read `PV.mode`, and now that the
+  cell count is two honest numbers rather than one coincidence, nothing is left
+  to hide behind.
+- **app as swimlanes** — the one axis the corpus has and the plane does not.
+  The corpus is three non-overlapping eras: hermes `0–11,655` · index
+  `11,656–25,229` · chatdrop `25,521–32,635` = 79% of the log, and the plane
+  sums every line into one number per cell, so it shows none of it. The kind
+  filter is the same *mechanism* `by_kind` is — a fold that partitions cells by
+  a second value — so `by_app` is the identical line of code with a different
+  key, and the measured cost is already known (26%). It is a filter on identity,
+  not a mode, and needs none of the six addressing functions §18 demanded.
+
+## 21. The browser check — a suite that clicks something
+
+Added 2026-10-03. `ui_browser_check.py` boots a sandbox pool-server, opens the
+real dashboard in headless Chrome, **drives the real control**, and grades what
+the page *rendered* against the corpus read independently in Python. It is the
+twelfth suite in [run_all.py](run_all.py) and costs about ten seconds.
+
+§20.5 recorded eight bugs that reached a green `run_all`, all of them between
+correct arithmetic and a `<select>`. This is the check that class of bug needed.
+
+### 21.1 No dependencies, on purpose
+
+There is no playwright, no selenium, no jsdom and nothing to install. Chrome is
+launched with `--remote-debugging-port=0`, which makes it **print** the
+DevTools socket rather than be told where to listen, and that socket is driven
+with node's **built-in** `WebSocket` (node ≥ 22). A hard-coded debugging port is
+a collision waiting for the day `run_all` is run twice; that is why the port is
+read out of the child's stderr rather than chosen.
+
+The search for a browser is deliberately broad — five Windows paths plus five
+bare names — because a check that only knows one browser path is a check that
+silently stops running on the other machine. If neither Chrome nor Edge can be
+found it **SKIPS, loudly, naming what it did not run**. It never reports a pass
+it did not earn (§13: a check that cannot fail is not a check, and one that
+pretends to have passed is worse).
+
+### 21.2 The truth is computed on the other side of the process
+
+The page reports what it saw; Python decides whether that was right. The corpus
+is read with `pool.derived()` in the sandbox — the same library that will serve
+it — and the sandbox's own log is built with a deliberate kind mix, so the
+filter has something to choose *between* and the cells that hold two kinds are
+not a hoped-for accident.
+
+That split is the whole design. A page grading itself proves only that its
+arithmetic agrees with itself, which is the defect §20.5 shipped: four correct
+functions behind an unreachable `<select>`. Here the dropdown's number, the
+status line's number and the frame's own cell map are each compared to a
+figure derived from the log, and "the picture may show less than the corpus
+holds, never more" is asserted per kind against that figure.
+
+Two numbers are graded against **two different truths**, because they answer
+two different questions and the corpus disagrees with itself about them:
+
+```
+filter   by_kind        "which cells HOLD this kind"      CHAT 28 · bond 18
+layer    cell_kind      "which cell was LAST this kind"   CHAT 21 · bond 16
+```
+
+Shipping the layer's number in the filter's box is one of the eight bugs, and a
+check that used one truth for both would not have caught it.
+
+### 21.3 It was wrong three times before it was right
+
+The first version printed **4/15 PASS** on a dashboard that had opened, loaded
+its layer and listed every kind correctly — because it read the steps off the
+wrong level of the driver's answer (node wraps the page's reply as
+`out.report`), so every field came back `None` and `None` compared equal to
+nothing. Three checks passed on absent data:
+
+> The lesson from §20.5 again, one level up. A check that cannot see its own
+> harness is worse than no check, because it looks like coverage.
+
+Absence is now failure everywhere: a frame that reports no count fails the
+comparison, a driver that answers nothing fails before any number is read, and
+`the browser actually ran` asserts the dashboard's own script executed rather
+than that Chrome started. The suite also learned to wait for **the app**
+(`typeof PV === 'object'` and the plane button's `onclick` attached) rather
+than for `document.readyState`, which is `'complete'` on the blank page it
+started from — polling it alone clicks the button before the script has run and
+reports a dashboard that will not open, which is the failure it exists to catch.
+
+### 21.4 What it proves
+
+```
+ui_browser_check  18/18 PASS   (chrome headless, sandbox corpus of 93 lines)
+mutations 8 attempted · 8 CAUGHT — every bug §20.5 lists, reintroduced one at a
+  time: the ks.join guard / the disabled control / the missing __load option /
+  the count that never increments / the box quoting the colour layer / the
+  figures counted over the whole log / the scrubbed branch summing f[k] /
+  `lit` an object asked for .length
+
+run_all  12/12 suites PASS (41.1s)   ui_check 36/36 invariants
+```
+
+One of the eight was **missed on the first pass** and is worth recording: the
+count that never increments. Zeroing `pvTopKinds` no longer breaks the
+dropdown, because the dropdown counts a *different* map — so the browser check
+was blind to it while `ui_check` was not. Adding the legend assertion closed
+it, and the legend was worth grading anyway: it is user-visible text that said
+`(0)` for every kind for as long as the bug lived.
+
+```
