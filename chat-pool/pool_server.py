@@ -761,8 +761,11 @@ button.send:disabled{opacity:.55;cursor:progress}
         <option value="kind">สี: ชนิดของบรรทัด</option>
         <option value="recent">สี: ล่าสุดเมื่อไร</option>
       </select>
-      <select id="pv-kind" title="กรองตามชนิดของบรรทัด — สีและความสว่างของช่องจะเปลี่ยนไปตามชนิดที่เลือก ส่วนที่ไม่ใช่ชนิดนั้นจะจางลง (ยังนับรวมอยู่) · ตัวเลขที่ผู้อ่านเห็นยังนับทุกชนิด ไม่ใช่เฉพาะที่กรอง">
+      <select id="pv-kind" title="กรองตามชนิดของบรรทัด — สีและความสว่างของช่องจะเปลี่ยนไปตามชนิดที่เลือก ส่วนที่ไม่ใช่ชนิดนั้นจะจางลง (ยังนับรวมอยู่) · ตัวเลขที่ผู้อ่านเห็นยังนับทั้งคลัง ไม่ใช่เฉพาะที่กรอง · เลือกที่นี่จะแทนที่การกรองด้วยผู้เขียน (กรองได้ทีละแกน)">
         <option value="">ทุกชนิด</option>
+      </select>
+      <select id="pv-app" title="กรองตามผู้เขียน — ดูคลังข้อมูลในแว่นของแอปหนึ่ง ๆ เช่นตอน chatdrop เป็นคนเขียนอย่างเดียว · เลือกที่นี่จะแทนที่การกรองด้วยชนิด (กรองได้ทีละแกน)">
+        <option value="">ทุกผู้เขียน</option>
       </select>
       <select id="pv-style" title="วิธีวาดเส้นเชื่อม" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px">
         <option value="auto">อัตโนมัติ (วัดแล้ว)</option>
@@ -1652,10 +1655,21 @@ const PV={mode:'plane',w:144,h:144,sel:null,path:[],plane:{},cells:{},origin:nul
           style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
           autoAt:120,hubK:12,relColour:true,   // measured: past ~120 edges a full draw is mostly ink
           colour:'density',cellApp:{},cellKind:{},cellSeq:{},cellSeqMax:0,metaOn:false,rib:null,
-          // the kind FILTER: a kind, or null for every kind. `kinds` is the whole
-          // map split by kind ({kind:{rkey:n}}), fetched with the meta layer and
-          // only when a filter is actually opened.
-          kinds:{},kindOnly:null,
+          // the FILTER: exactly ONE axis at a time, or none. `filt` says which
+          // ({dim:'kind'|'app',key:...}); `kinds` and `apps` are the two whole
+          // maps ({name:{rkey:n}}) that ride the meta layer and are only
+          // fetched when a filter is actually opened.
+          //
+          // One axis, not two, and the reason is arithmetic rather than taste:
+          // "bond AND chatdrop" is an intersection NEITHER map can answer.
+          // by_kind[bond][rk] counts every bond in the cell and
+          // by_app[chatdrop][rk] counts every chatdrop line in it; the lines
+          // that are both live in a third map nobody has kept, and a second
+          // <select> writing a second field would have the status line print a
+          // number it cannot compute — the one answer a filter must never give
+          // (§20.7). Choosing one axis therefore REPLACES the other, and both
+          // controls are a view of this one field.
+          kinds:{},apps:{},filt:null,
           // prune: the PLANE drops the keeper's noise instead of dimming it, so
           // a cell that lived on nothing but tests leaves the map. Off = the
           // honest raw plane, refetched with &raw=1, for judging the rules.
@@ -1680,6 +1694,21 @@ const PV={mode:'plane',w:144,h:144,sel:null,path:[],plane:{},cells:{},origin:nul
           // under it can never disagree with the map around it.
           lens:{on:false,wedge:0,ring:0,z:4,drag:null,moved:false}};
 const pcv=$('#plane-cv');
+// The two legend boxes live INSIDE #plane-detail, and pvDetail rewrites that
+// container's innerHTML every time a cell is opened. So the first click of the
+// session destroyed them, and their painters begin with `if(!box)return` — which
+// is why nothing ever said so: the legend simply stopped existing. Holding the
+// nodes here, once, is what lets them be put BACK; a re-query after the write
+// would find nothing left to find.
+const _pvLegendBox=$('#pv-legend'),_pvRelBox=$('#rel-legend');
+// one writer for every path that replaces the panel, so the legends cannot be
+// remembered on the main path and forgotten on the census one. The order is the
+// original one — colour legend above the prose, relation legend below it — so
+// nothing moves on screen the day this was fixed.
+function pvAdoptLegends(el){
+  if(_pvRelBox)el.appendChild(_pvRelBox);
+  if(_pvLegendBox)el.insertBefore(_pvLegendBox,el.firstChild);
+}
 // Cell size adapts to the space the panel actually has: a 12x12 map drawn at a
 // fixed 36px used a quarter of the canvas and looked broken on a laptop, while
 // the same map on a phone needs the cells to be thumb-sized. Everything that
@@ -1713,14 +1742,20 @@ function pstep(){
 // the plane at tick S: every line whose append ordinal is <= S, counted
 // straight from the log's own order — no wall clock is consulted anywhere
 function pvCellsUpTo(S){
-  const c={},only=PV.kindOnly;
+  const c={},f=PV.filt,ki=f&&f.dim==='kind'?f.key:null,ap=f&&f.dim==='app'?f.key:null;
   for(let i=0;i<PV.timeline.length&&i<=S;i++){
     const row=PV.timeline[i],rk=row[2];
     if(rk==null)continue;
     // the scrub counts the log's own order, so it has to honour the filter the
     // same way the live plane does — otherwise dragging time back paints a
     // plane the filter is not describing
-    if(only&&row[3]!==only)continue;
+    if(ki&&row[3]!==ki)continue;
+    // the WIRE row is [ordinal,t,rkey,kind,hash8,writer] — six columns, not the
+    // eight the fold keeps. row[5] is the writer, and the fold already
+    // normalised a missing one to '?' so this is a comparison and not a second
+    // copy of that rule. (row[7] is the fold's index; asking for it here reads
+    // undefined, which silently filters to "nothing matches")
+    if(ap&&row[5]!==ap)continue;
     c[rk]=(c[rk]||0)+1;
   }
   return c;
@@ -2280,8 +2315,18 @@ const pvTopKinds=()=>{
    the filter stays on and the status line says the kind is empty here, because
    silently drawing the unfiltered map under a filter that claims to be on is the
    one answer this must never give. */
-function pvFilt(){return(PV.kindOnly&&PV.kinds[PV.kindOnly])||null}
-function pvKindN(rk){const f=pvFilt();return f?(f[rk]||0):0}
+function pvFilt(){return PV.filt?((PV.filt.dim==='app'?PV.apps:PV.kinds)[PV.filt.key]||null):null}
+function pvFiltN(rk){const f=pvFilt();return f?(f[rk]||0):0}
+// What the reader is being shown, in words. Both controls print these, so the
+// status line, the lens, the tooltip and the legend cannot describe two
+// different pictures from one click.
+function pvFiltLabel(){return PV.filt?(PV.filt.dim==='app'?appLabel(PV.filt.key):kindLabel(PV.filt.key)):null}
+function pvFiltWord(){return PV.filt?(PV.filt.dim==='app'?'ผู้เขียนนี้':'ชนิดนี้'):''}
+function pvFiltAxisName(){return PV.filt&&PV.filt.dim==='app'?'ผู้เขียน':'ชนิด'}
+// app names are already the reader's own words ("chatdrop", "opencode"); the one
+// that is not is a whole sentence, and a 40-character dropdown entry is a
+// control nobody can scan. The VALUE is never shortened.
+function appLabel(a){a=String(a);return a.length>26?a.slice(0,25)+'…':a}
 function pvInkAt(rk,rel){
   const f=pvFilt();
   // filtered out: a neutral grey, deliberately NOT a kind hue. A hashed hue for
@@ -2328,9 +2373,53 @@ function pvKindOptions(){
   // still synced every call — an early `return` here (the first version) left
   // the control showing yesterday's filter, which the probe caught.
   if(sel._kindHtml!==want){sel.innerHTML=want;sel._kindHtml=want;}
-  sel.value=(PV.kindOnly&&ks&&ks[PV.kindOnly]!==undefined)?PV.kindOnly:'';
+  // TWO controls, ONE state: each shows the filter when it is ITS axis and "no
+  // filter" when it is the other one. Two independent <select>s syncing
+  // themselves is how a reader ends up looking at "ทุกชนิด" and "ทุกผู้เขียน"
+  // while a live filter is dimming half the map.
+  //
+  // The key is checked against the MAP as well as the axis. A real <select>
+  // silently reverts an unknown value to "", so the control would have said
+  // "no filter" while PV.filt was still filtering — the browser papering over
+  // the disagreement instead of proving there is none. The list probe caught
+  // this the day the second axis was added.
+  sel.value=(PV.filt&&PV.filt.dim==='kind'&&PV.kinds[PV.filt.key])?PV.filt.key:'';
   sel.disabled=false;
 }
+// The writer control is the SAME control with a different axis, so it is built
+// by the same shape and pinned by the same rule: the number beside each app is
+// what choosing it will light up.
+function pvAppOptions(){
+  const sel=$('#pv-app');if(!sel)return;
+  const nLit=a=>PV.apps&&PV.apps[a]?Object.keys(PV.apps[a]).length:0;
+  const as=Object.keys(PV.apps||{});
+  const want=as.length
+    ?'<option value="">ทุกผู้เขียน</option>'
+      +as.sort((a,b)=>nLit(b)-nLit(a)||a.localeCompare(b))
+        .map(a=>'<option value="'+esc(a)+'">'+esc(appLabel(a))+' ('+nLit(a)+')</option>').join('')
+    :'<option value="">ทุกผู้เขียน</option><option value="__load">โหลดรายชื่อผู้เขียน… (ครั้งแรก)</option>';
+  if(sel._appHtml!==want){sel.innerHTML=want;sel._appHtml=want;}
+  sel.value=(PV.filt&&PV.filt.dim==='app'&&PV.apps[PV.filt.key])?PV.filt.key:'';
+  sel.disabled=false;
+}
+// One picker for both axes, because choosing an axis REPLACES the filter and
+// two copies of the __load dance would be two places to get it wrong.
+async function pvPickFilt(dim,val){
+  if(val==='__load'){
+    await loadMeta();pvFilterOptions();pvMode();
+    toast(PV.metaOn?'โหลดรายชื่อ'+pvFiltAxisNameFor(dim)+'แล้ว'
+                 :'โหลดข้อมูล'+pvFiltAxisNameFor(dim)+'ไม่สำเร็จ — ลองใหม่อีกครั้ง');
+    return;}
+  const was=PV.filt;
+  PV.filt=val?{dim:dim,key:val}:null;
+  if(PV.filt)await loadMeta();
+  pvMode();
+  if(was&&was.dim!==dim)toast('กรองได้ทีละแกน — เปลี่ยนจาก'+pvFiltAxisNameFor(was.dim)+' “'
+    +(was.dim==='app'?appLabel(was.key):kindLabel(was.key))+'” เป็น '
+    +pvFiltAxisNameFor(dim)+' “'+(val?(dim==='app'?appLabel(val):kindLabel(val)):'ทุกชนิด')+'”');
+}
+function pvFiltAxisNameFor(dim){return dim==='app'?'ผู้เขียน':'ชนิด'}
+function pvFilterOptions(){pvKindOptions();pvAppOptions()}
 // rel is the value normalised to the busiest cell: how loud this cell is
 function pvCellInk(rk,rel){
   if(PV.colour==='heat')return pvHeatCSS(Math.sqrt(rel),0.95);
@@ -2476,8 +2565,8 @@ function pvLensInfo(){
   const f2=pvFilt(),ct=Math.floor(L.wedge)+Math.floor(L.ring)*144;
   el.textContent='🔍 ×'+z+(z>=m?' ⛔':'')+' · '+lv[1]+' · (คอลัมน์ '+w+', แถว '+r+')'
     +' · ขยายแล้ว '+at+'% ของความละเอียดจริง'
-    +(f2?(' · '+kindLabel(PV.kindOnly)+' '+pvKindN(ct)+' จาก '+pvValAt(ct)):'');
-  el.title=lv[2]+(f2?(' · กรอง: '+kindLabel(PV.kindOnly)+' — ตัวเลขในแว่นนับทุกชนิด'):'');
+    +(f2?(' · '+pvFiltLabel()+' '+pvFiltN(ct)+' จาก '+pvValAt(ct)):'');
+  el.title=lv[2]+(f2?(' · กรอง: '+pvFiltLabel()+' — ตัวเลขในแว่นนับทุกชนิด'):'');
 }
 function pvLensDraw(c){
   const L=PV.lens;if(!L.on)return;
@@ -2657,7 +2746,7 @@ function pvBaseKey(px,bw){
     o?o.wedge:null,o?o.ring:null,PV.bOrig.x,PV.bOrig.y,
     _idOf(PV.cells),_idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.sights),
     _idOf(PV.cellApp),_idOf(PV.cellSeq),_idOf(PV.cellKind),
-    _idOf(PV.kinds),PV.kindOnly].join('|');
+    _idOf(PV.kinds),_idOf(PV.apps),PV.filt&&PV.filt.dim,PV.filt&&PV.filt.key].join('|');
 }
 let _baseKey=null,_baseCv=null;
 function pvBase(px,bw){
@@ -2757,7 +2846,13 @@ function pvBasePaint(c,px){
   // per cell), so the marker is a RING sized in pixels, not in cells — it
   // stays a circle at every zoom, which is what the legend promises.
   PV.sights.forEach(s=>{
-    const [x,y]=pvXY(s.point);if(x<0||y<0||x>=n||y>=n)return;
+    // `n` was a parameter of a signature this function no longer has, so both
+    // of these bounds threw a ReferenceError the moment the list ran — and a
+    // paint that throws leaves the canvas showing the PREVIOUS frame while
+    // everything after the throw (the "you are here" marker, and the caller
+    // that was going to open the popup) silently never happened. Found by
+    // ui_browser_check clicking a mode button, not by any arithmetic.
+    const [x,y]=pvXY(s.point);if(x<0||y<0||x>=w||y>=h)return;
     const cx=x*step+step/2, cy=y*step+step/2;
     c.save();
     c.strokeStyle='#79c0ff';c.lineWidth=1.2;
@@ -2773,7 +2868,7 @@ function pvBasePaint(c,px){
   });
   if(PV.sel!=null){
     const [x,y]=pvXY(PV.sel);
-    if(x>=0&&y>=0&&x<n&&y<n){
+    if(x>=0&&y>=0&&x<w&&y<h){
       const o=step>=6?3:1;
       c.strokeStyle='#ffa657';c.lineWidth=2;
       c.strokeRect(x*step+o,y*step+o,step-2*o,step-2*o);
@@ -2879,9 +2974,10 @@ function pvLegend(){
   const end=(a,b)=>'<span>'+a+' → '+b+'</span>';
   let h='';
   const f=pvFilt();
-  if(f)h+='<div style="color:var(--warn)">กรอง: '+esc(kindLabel(PV.kindOnly))
-    +' — <b>สีและความสว่าง</b> นับเฉพาะชนิดนี้ · ช่องที่ไม่มีชนิดนี้จางเป็นสีเทา'
-    +' · <b>ตัวเลขที่ผู้อ่านเห็น</b> (ช่อง / แว่น / ทิป) นับทุกชนิดเหมือนเดิม</div>';
+  if(f)h+='<div style="color:var(--warn)">กรอง: '+esc(pvFiltLabel())
+    +' — <b>สีและความสว่าง</b> นับเฉพาะ'+esc(pvFiltWord())+' · ช่องที่ไม่มี'+esc(pvFiltWord())
+    +'จางเป็นสีเทา'
+    +' · <b>ตัวเลขที่ผู้อ่านเห็น</b> (ช่อง / แว่น / ทิป) นับทั้งคลังเหมือนเดิม</div>';
   if(PV.colour==='writer'){
     const apps=pvTopApps();
     h='<div style="color:var(--fg)">สี = แอปที่เขียนล่าสุดในช่องนั้น</div>';
@@ -3115,15 +3211,15 @@ function pvInfo(){
   // not happened yet (the line said 7,938 while the picture held 1,421). Two
   // branches, because one rule cannot honestly describe both frames.
   const scrubbed=(PV.seq!==null&&PV.seq<PV.seqMax-1);
-  const filt=PV.kindOnly
-    ?(!f?(' · กรอง: '+kindLabel(PV.kindOnly)+' — ยังไม่มีข้อมูลชนิดนี้ในคลัง')
+  const filt=PV.filt
+    ?(!f?(' · กรอง: '+pvFiltLabel()+' — ยังไม่มีข้อมูล'+pvFiltWord()+'ในคลัง')
         :(()=>{const lit=scrubbed?Object.keys(src):Object.keys(src).filter(k=>f[k]);
           const n=scrubbed?Object.values(src).reduce((a,b)=>a+b,0)
                           :lit.reduce((a,k)=>a+f[k],0);
           return lit.length
-            ?(' · กรอง: '+kindLabel(PV.kindOnly)+' · สว่าง '+lit.length.toLocaleString()
-               +' ช่อง · '+n.toLocaleString()+' บรรทัดของชนิดนี้')
-            :(' · กรอง: '+kindLabel(PV.kindOnly)+' — ยังไม่มีข้อมูลชนิดนี้ในมุมมองนี้');})())
+            ?(' · กรอง: '+pvFiltLabel()+' · สว่าง '+lit.length.toLocaleString()
+               +' ช่อง · '+n.toLocaleString()+' บรรทัดของ'+pvFiltWord())
+            :(' · กรอง: '+pvFiltLabel()+' — ยังไม่มีข้อมูล'+pvFiltWord()+'ในมุมมองนี้');})())
     :'';
   const short='• '+Object.keys(src).length.toLocaleString()+'/20,736 ช่อง · '+tot.toLocaleString()+' บรรทัด'
     +filt
@@ -3147,7 +3243,7 @@ function pvMode(){
   if(PV_WINS.indexOf(PV.win)>=0)$('#pv-win').value=String(PV.win);
   _legendKey=null;                         // a new view is a new legend
   pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
-  pvKindOptions();pvLensInfo();
+  pvFilterOptions();pvLensInfo();
 }
 // One place that moves time, so the slider, the arrow keys, the strip and the
 // replay button can never disagree about where "now" is.
@@ -3169,7 +3265,7 @@ async function loadMeta(){
     // attribute a cell to a writer whose only line in it was noise
     const m=await fetch('/plane/meta'+(PV.prune?'':'?raw=1'),{headers:H}).then(r=>r.json());
     PV.cellApp=m.last_app||{};PV.cellSeq=m.last_seq||{};PV.cellKind=m.last_kind||{};
-    PV.kinds=m.by_kind||{};
+    PV.kinds=m.by_kind||{};PV.apps=m.by_app||{};
     PV.cellSeqMax=Math.max(m.seq_max||0,1);PV.metaOn=true;_legendKey=null;
   }catch(e){toast('โหลดข้อมูลผู้เขียน/ชนิด/เวลาไม่สำเร็จ — เลือกสีนั้นอีกครั้ง')}
 }
@@ -3342,9 +3438,9 @@ function pvCensusHTML(){
 }
 function pvDetail(){
   const d=PV.lines,el=$('#plane-detail');
-  if(!d){el.textContent='…';return}
+  if(!d){el.textContent='…';pvAdoptLegends(el);return}
   PV.hops=[];
-  if(PV.showCensus){el.innerHTML=pvCensusHTML();pvWireDetail();return}
+  if(PV.showCensus){el.innerHTML=pvCensusHTML();pvAdoptLegends(el);pvWireDetail();return}
   let h=pvCrumbs();
   if(PV.walkSel!=null&&PV.walk&&!PV.walk.gone){
     const f=PV.walk.shape||{};
@@ -3419,6 +3515,7 @@ function pvDetail(){
     }).join('')
     :'<div style="margin-top:6px">เซลล์นี้ว่าง — ไม่มี line อยู่ตรงนี้</div>';
   el.innerHTML=h;
+  pvAdoptLegends(el);
   pvWireDetail();
 }
 // Wires what the render emitted. Handlers are attached here rather than inlined
@@ -3489,9 +3586,9 @@ pcv.onmousemove=ev=>{
   // filtered one would make a cell holding 34 lines read 0 with nothing on
   // screen to contradict it; printing only the total would make the filter
   // look like it did nothing.
-  const kn=pvKindN(rk),f=pvFilt();
+  const kn=pvFiltN(rk),f=pvFilt();
   tip.textContent=(PV.mode==='blocks'?'ช่องย่อ ':'ที่อยู่ ')+rk+' (คอลัมน์ '+bx+', แถว '+by+') · '+n+' บรรทัด'
-    +(f?(' · '+kindLabel(PV.kindOnly)+' '+kn+' ('+(kn?'เหลือ '+(n-kn)+' ชนิดอื่น':'ไม่มีชนิดนี้ในช่องนี้')+')'):'')
+    +(f?(' · '+pvFiltLabel()+' '+kn+' ('+(kn?'เหลือ '+(n-kn)+' อีก':(PV.filt.dim==='app'?'ไม่มีผู้เขียนคนนี้ในช่องนี้':'ไม่มีชนิดนี้ในช่องนี้'))+')'):'')
     +(who?' · 👁 '+who:'');
   pvTopOpen(tip);
   const vw=window.innerWidth||document.documentElement.clientWidth;
@@ -3934,27 +4031,18 @@ $('#pv-f2').onclick=()=>setFocus(2);
 $('#pv-f3').onclick=()=>setFocus(3);
 $('#pv-seq').oninput=e=>pvSetSeq(+e.target.value);
 $('#pv-last').onclick=()=>pvSetSeq(PV.seqMax);          // "latest" = live plane
-$('#pv-kind').onchange=async e=>{
-  // "__load" is the control asking for its own layer, not a filter: the reader
-  // chose to look at kinds, so pay for them, then hand the list back and put
-  // the control where it was.
-  if(e.target.value==='__load'){
-    await loadMeta();pvKindOptions();pvMode();
-    toast(PV.metaOn?'โหลดรายชื่อชนิดแล้ว':'โหลดข้อมูลชนิดไม่สำเร็จ — ลองใหม่อีกครั้ง');
-    return;}
-  PV.kindOnly=e.target.value||null;
-  // the split map rides the meta layer, so a filter that has never been used
-  // costs nothing until someone opens it — same rule as the colour layers
-  if(PV.kindOnly)await loadMeta();
-  pvMode();
-};
+// Both controls are one function's two arguments, not two states: choosing an
+// axis REPLACES whatever the other one was filtering (pvPickFilt explains why
+// on screen), and pvFilterOptions repaints both from PV.filt.
+$('#pv-kind').onchange=async e=>{await pvPickFilt('kind',e.target.value)};
+$('#pv-app').onchange=async e=>{await pvPickFilt('app',e.target.value)};
 $('#pv-colour').onchange=async e=>{
   PV.colour=e.target.value;
   if(PV.colour==='writer'||PV.colour==='recent'||PV.colour==='kind')await loadMeta();
   // the layer just arrived and the filter reads it too, so the list has to be
   // rebuilt here or it keeps offering "โหลดรายชื่อชนิด" to someone who already
   // paid for the kinds
-  pvKindOptions();
+  pvFilterOptions();
   _legendKey=null;pvDraw();pvInfo();
 };
 $('#pv-png2').onclick=pvPNG;

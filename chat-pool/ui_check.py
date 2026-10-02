@@ -773,7 +773,7 @@ INVARIANTS = [
      lambda js, html: kind_filter(js) == "",
      lambda js, html: kind_filter(js)),
     ("a filter on the time scrub is the same filter as on the live plane",
-     lambda js, html: re.search(r"if\s*\(\s*only\s*&&\s*row\[3\]\s*!==\s*only\s*\)\s*continue;", js),
+     lambda js, html: re.search(r"if\s*\(\s*ki\s*&&\s*row\[3\]\s*!==\s*ki\s*\)\s*continue;", js),
      "pvCellsUpTo counts the log's own order, so without the kind check it "
      "would rebuild a plane the filter is not describing — drag time back with "
      "'bonds only' on and the filtered kinds come straight back"),
@@ -806,21 +806,55 @@ INVARIANTS = [
      lambda js, html: kind_list(js)),
     ("a control that needs a layer can ask for it",
      lambda js, html: ("__load" in js
-                       and re.search(r"if\s*\(\s*e\.target\.value\s*===\s*'__load'\s*\)", js)
-                       and not re.search(r"sel\.disabled\s*=\s*!ks", js)),
+                       and re.search(r"if\s*\(\s*val\s*===\s*'__load'\s*\)", js)
+                       and not re.search(r"sel\.disabled\s*=\s*!ks", js)
+                       and not re.search(r"sel\.disabled\s*=\s*!as", js)),
      "#pv-kind shipped DISABLED with a single option until the meta layer was "
      "loaded — so it could never fire the change handler that loads the very "
      "layer it needs, and the only way in was to first pick a meta-backed "
      "COLOUR, a control the reader has no reason to touch. A disabled control "
-     "cannot ask for what it is missing; the kind filter offers to, and says "
+     "cannot ask for what it is missing; both filter controls offer to, and say "
      "what it costs"),
     ("a filter that matches nothing says so",
-     lambda js, html: ("ยังไม่มีข้อมูลชนิดนี้ในมุมมองนี้" in js
-                       and "ยังไม่มีข้อมูลชนิดนี้ในคลัง" in js
-                       and re.search(r"const filt=PV\.kindOnly", js)),
-     "a filter naming a kind with no cells here must be reported as empty. "
-     "Falling back to the unfiltered map would draw the whole plane under a "
-     "filter that claims to be on — the one answer this layer must never give"),
+     lambda js, html: (re.search(r"' — ยังไม่มีข้อมูล'\+pvFiltWord\(\)\+'ในคลัง'", js)
+                       and re.search(r"' — ยังไม่มีข้อมูล'\+pvFiltWord\(\)\+'ในมุมมองนี้'", js)
+                       and re.search(r"const filt=PV\.filt", js)),
+     "a filter naming a kind or a writer with no cells here must be reported as "
+     "empty. Falling back to the unfiltered map would draw the whole plane "
+     "under a filter that claims to be on — the one answer this layer must "
+     "never give. The sentence is now built from pvFiltWord() so the WRITER "
+     "axis says the same thing in its own words instead of claiming a kind"),
+    ("the filter is one axis, not two",
+     lambda js, html: (not _code_matches(js, r"PV\.(kindOnly|appOnly)")
+                       and len(_code_matches(js, r"PV\.filt\s*=")) == 1
+                       and re.search(r"PV\.filt=val\?\{dim:dim,key:val\}:null", js)),
+     "two <select>s writing two fields is how a reader ends up looking at "
+     "'ทุกชนิด' AND 'ทุกผู้เขียน' while a live filter is dimming half the map. "
+     "It is one field with a dimension because 'bond AND chatdrop' is an "
+     "intersection NEITHER by_kind nor by_app can answer — the lines that are "
+     "both live in a third map nobody has kept — and two fields would have "
+     "printed a number the plane cannot compute. So choosing one axis "
+     "REPLACES the other, and both controls are a view of PV.filt"),
+    ("the writer axis is a partition like the kind axis",
+     lambda js, html: (re.search(r"PV\.apps=m\.by_app\|\|\{\}", js)
+                       and _js_function(js, "pvAppOptions")
+                       and re.search(r"nLit=a=>PV\.apps&&PV\.apps\[a\]", js)),
+     "by_app is the same fold as by_kind with a different key, so the writer "
+     "filter has to owe the same promises: cells that HOLD this writer, "
+     "counted from by_app and not borrowed from the colour layer "
+     "(cellApp, which is who wrote there LAST — the mistake that shipped as "
+     "bug 5 for kinds). A control built over the wrong map shows a number the "
+     "filter does not light"),
+    ("the scrub honours the writer axis too",
+     lambda js, html: (re.search(r"if\(ap&&row\[5\]!==ap\)continue;", js)
+                       and re.search(r"ap=f&&f\.dim==='app'\?f\.key:null", js)),
+     "pvCellsUpTo walks the log's own order, so it has to apply whatever axis "
+     "the live plane is applying. A scrub that honoured the kind axis but not "
+     "the writer axis would repaint an unfiltered plane under a filter that "
+     "claims to be on — bug 6 for kinds, reproduced by adding a second axis "
+     "and forgetting one of the two comparisons. The column is 5, not 7: the "
+     "fold's row has eight entries and the WIRE row has six, and row[7] reads "
+     "undefined here, which compares unequal to everything and lights nothing"),
     ("the filter's figures describe the frame on screen, not the whole log",
      lambda js, html: (re.search(r"scrubbed\?Object\.keys\(src\):Object\.keys\(src\)\.filter\(k=>f\[k\]\)", js)
                        and re.search(r"scrubbed\?Object\.values\(src\)", js)),
@@ -852,29 +886,29 @@ KIND_PROBE_HEAD = r"""
 // Stubs only. The four functions under test are EXTRACTED from the served
 // script below — a probe carrying its own copies of them would pass while the
 // page was broken, which is the one thing §13.5 says a test must not do.
-const PV={kindOnly:null,kinds:{},cells:{a:5,b:2,c:9}};
+const PV={filt:null,kinds:{},apps:{},cells:{a:5,b:2,c:9}};
 function pvCellInk(rk,rel){return 'INK:'+rk+':'+rel}
 const esc=s=>s;
 """
 
 KIND_PROBE_TAIL = r"""
 const bad=[];
-// 1. no filter: the picture is the plane, and no cell claims a kind count
+// 1. no filter: the picture is the plane, and no cell claims a filtered count
 if(pvFilt()!==null)bad.push('an unfiltered plane returned a filter');
-if(pvKindN('a')!==0)bad.push('an unfiltered plane reported a filtered count');
+if(pvFiltN('a')!==0)bad.push('an unfiltered plane reported a filtered count');
 if(pvDrawMax()!==9)bad.push('unfiltered ramp ceiling = '+pvDrawMax()+' (want the busiest cell = 9)');
 // 2. filter on: the ramp ceiling moves to the BUSIEST CELL OF THE FILTER, or the
 //    filter tints the map without shifting a single shade
 PV.kinds={bond:{a:5,b:2}};
-PV.kindOnly='bond';
+PV.filt={dim:'kind',key:'bond'};
 if(pvDrawMax()!==5)bad.push('filtered ramp ceiling = '+pvDrawMax()+' (want 5, the busiest bond cell)');
-if(pvKindN('a')!==5||pvKindN('b')!==2)bad.push('filtered counts are wrong');
-if(pvKindN('c')!==0)bad.push('a cell holding none of the kind must count 0, not the total');
+if(pvFiltN('a')!==5||pvFiltN('b')!==2)bad.push('filtered counts are wrong');
+if(pvFiltN('c')!==0)bad.push('a cell holding none of the kind must count 0, not the total');
 // 3. THE contract: a filtered count can never exceed the total. A picture that
 //    shows more of one kind than the plane holds is worse than no filter at all
 for(const rk in PV.cells){
-  if(pvKindN(rk)>PV.cells[rk])
-    bad.push('cell '+rk+' claims '+pvKindN(rk)+' of a kind it holds only '+PV.cells[rk]);
+  if(pvFiltN(rk)>PV.cells[rk])
+    bad.push('cell '+rk+' claims '+pvFiltN(rk)+' of a kind it holds only '+PV.cells[rk]);
 }
 // 4. filtered-out cells are drawn in the neutral grey, never a kind hue: a hue
 //    there would look like a seventh kind in the legend
@@ -883,8 +917,25 @@ if(pvInkAt('a',1)!=='INK:a:1')bad.push('a matching cell was greyed out');
 // 5. a filter naming a kind that is ABSENT stays absent - it never silently
 //    becomes "no filter", which would draw the unfiltered map under a filter
 //    that claims to be on
-PV.kindOnly='nosuchkind';
+PV.filt={dim:'kind',key:'nosuchkind'};
 if(pvFilt()!==null)bad.push('an absent kind produced a filter');
+// 6. the WRITER axis runs through the same four functions. It is a partition of
+//    the same plane, so it owes the same contract — and if it did NOT share the
+//    code, "cells holding none of this app" would quietly mean something else
+PV.kinds={};PV.apps={chatdrop:{a:5,b:1},index:{a:3,c:9}};
+PV.filt={dim:'app',key:'chatdrop'};
+if(pvFilt()!==PV.apps.chatdrop)bad.push('the writer axis did not read the writer map');
+if(pvDrawMax()!==5)bad.push('writer ramp ceiling = '+pvDrawMax()+' (want 5, the busiest chatdrop cell)');
+if(pvFiltN('a')!==5||pvFiltN('b')!==1||pvFiltN('c')!==0)bad.push('writer counts are wrong');
+if(pvInkAt('c',1)!=='rgba(139,148,158,0.13)')bad.push('a cell no writer wrote in was not greyed out');
+for(const rk in PV.cells){
+  if(pvFiltN(rk)>PV.cells[rk])
+    bad.push('cell '+rk+' claims '+pvFiltN(rk)+' lines of a writer it holds only '+PV.cells[rk]);
+}
+PV.filt={dim:'app',key:'nosuchapp'};
+if(pvFilt()!==null)bad.push('an absent writer produced a filter');
+PV.filt=null;
+if(pvFilt()!==null)bad.push('clearing the filter left one behind');
 console.log(bad.join(' | ')+' :: '+bad.length);
 """
 
@@ -925,8 +976,8 @@ def kind_filter(js):
     node = shutil.which("node")
     if not node:
         return ""
-    parts = [_js_function(js, n) for n in ("pvFilt", "pvKindN", "pvInkAt", "pvDrawMax")]
-    gone = [n for n, src in zip(("pvFilt", "pvKindN", "pvInkAt", "pvDrawMax"), parts)
+    parts = [_js_function(js, n) for n in ("pvFilt", "pvFiltN", "pvInkAt", "pvDrawMax")]
+    gone = [n for n, src in zip(("pvFilt", "pvFiltN", "pvInkAt", "pvDrawMax"), parts)
             if not src]
     if gone:
         return ("%s must still be in the script: it is the only thing deciding "
@@ -951,32 +1002,34 @@ def kind_filter(js):
 LIST_PROBE_HEAD = r"""
 // The four maths functions can all be right and the filter still never open:
 // what broke was the LIST, and a probe that only computes cannot see a list.
-const PV={kindOnly:null,kinds:{},cellKind:{}};
-const mk=()=>({value:'',disabled:false,options:[],_kindHtml:null,_sets:0,set innerHTML(h){
+const PV={filt:null,kinds:{},apps:{},cellKind:{}};
+const mk=()=>({value:'',disabled:false,options:[],_kindHtml:null,_appHtml:null,_sets:0,set innerHTML(h){
   this._sets++;
   this.options=h.split('</option>').filter(Boolean).map(s=>{
     const v=/value="([^"]*)"/.exec(s);const t=/>([^<]*)</.exec(s);
     return {value:v?v[1]:'',text:t?t[1]:''};});}});
-const sel=mk();
+const sel=mk(),selApp=mk();
 // note the '#': the real $ receives it WITH the hash. A stub that compares
 // against 'pv-kind' returns null, the real code bails at `if(!sel)return`, and
 // the probe passes nothing while reporting every clause as broken — a check
 // that cannot see its own harness is worse than no check.
-const $=(id)=>id==='#pv-kind'?sel:null;
+const $=(id)=>id==='#pv-kind'?sel:(id==='#pv-app'?selApp:null);
 const esc=s=>s;
 const kindLabel=k=>'K:'+k;
+const appLabel=a=>'A:'+a;
 """
 LIST_PROBE_TAIL = r"""
 const bad=[];
 const run=()=>{try{pvKindOptions();return null}catch(e){return String(e)}};
+const runApp=()=>{try{pvAppOptions();return null}catch(e){return String(e)}};
 // 1 the layer is missing: the control must ASK for it, not sit there disabled
 //    with one option. A disabled <select> cannot fire the handler that loads
 //    the very layer it needs, so the filter is unreachable forever.
 PV.cellKind={};PV.kinds={};
 sel.innerHTML='<option value="">ทุกชนิด</option>';
 sel.disabled=true;
-let e=run();
-if(e)bad.push('building the empty prompt threw: '+e);
+const e0=run();
+if(e0)bad.push('building the empty prompt threw: '+e0);
 if(sel.disabled)bad.push('the unloaded filter is disabled, so it can never be opened');
 if(sel.options.length<2)bad.push('the unloaded filter offers nothing to choose');
 if(!sel.options.some(o=>o.value==='__load'))bad.push('nothing in the list asks for the layer');
@@ -992,7 +1045,7 @@ PV.cellKind={a:'CHAT',b:'CHAT',c:'bond'};
 PV.kinds={CHAT:{a:1,b:1},bond:{a:1,b:1,c:1,d:1,e:1}};
 sel.innerHTML='<option value="">ทุกชนิด</option>';
 sel.disabled=true;
-e=run();
+const e=run();
 if(e)bad.push('building the list THREW once the kinds were known: '+e);
 const vals=sel.options.map(o=>o.value);
 if(vals.length!==3)bad.push('expected ทุกชนิด + 2 kinds, got '+vals.length+' ('+vals.join(',')+')');
@@ -1011,10 +1064,38 @@ const sets=sel._sets;pvKindOptions();
 if(sel._sets!==sets)bad.push('an unchanged list was rebuilt ('+sets+' -> '+sel._sets+')');
 // 4 a filter that has gone (or an absent kind) must not leave the control
 //    showing a value that is no longer in it
-PV.kindOnly='nosuchkind';pvKindOptions();
+PV.filt={dim:'kind',key:'nosuchkind'};pvKindOptions();
 if(sel.value!=='')bad.push('a filter with no cells left the control on "'+sel.value+'"');
-PV.kindOnly='bond';pvKindOptions();
+PV.filt={dim:'kind',key:'bond'};pvKindOptions();
 if(sel.value!=='bond')bad.push('a live filter was not restored, got "'+sel.value+'"');
+// 5 the WRITER list, which is the same contract over a different partition
+PV.apps={};selApp.innerHTML='<option value="">ทุกผู้เขียน</option>';selApp.disabled=true;
+let eA=runApp();
+if(eA)bad.push('building the empty writer prompt threw: '+eA);
+if(selApp.disabled)bad.push('the unloaded writer filter is disabled, so it can never be opened');
+if(!selApp.options.some(o=>o.value==='__load'))bad.push('nothing in the writer list asks for the layer');
+PV.apps={chatdrop:{a:1,b:1,c:1},index:{a:1,b:1,c:1,d:1,e:1}};
+selApp.innerHTML='<option value="">ทุกผู้เขียน</option>';selApp.disabled=true;
+eA=runApp();
+if(eA)bad.push('building the writer list THREW once the writers were known: '+eA);
+const av=selApp.options.map(o=>o.value);
+if(av.length!==3)bad.push('expected ทุกผู้เขียน + 2 writers, got '+av.length+' ('+av.join(',')+')');
+if(av.indexOf('chatdrop')<0||av.indexOf('index')<0)bad.push('the writers never made it into the list: '+av.join(','));
+if(!/index \(5\)/.test(selApp._appHtml||''))bad.push('the writer list must promise index lights 5 cells, got '+String(selApp._appHtml).match(/index \([0-9]+\)/));
+if(av[1]!=='index')bad.push('the writer that lights the most cells must come first, got '+av[1]);
+if(selApp.disabled)bad.push('the loaded writer filter is still disabled');
+// 6 ONE state, TWO controls. A filter belongs to its own axis and the other
+//    control must read "no filter" — two selects syncing themselves is how a
+//    reader ends up with "ทุกชนิด" AND "ทุกผู้เขียน" showing while a live
+//    filter is dimming half the map.
+PV.filt={dim:'app',key:'chatdrop'};pvKindOptions();pvAppOptions();
+if(sel.value!=='')bad.push('the kind control shows "'+sel.value+'" while the WRITER axis is filtered');
+if(selApp.value!=='chatdrop')bad.push('the writer control lost the filter, got "'+selApp.value+'"');
+PV.filt={dim:'kind',key:'bond'};pvKindOptions();pvAppOptions();
+if(sel.value!=='bond')bad.push('the kind control lost the filter, got "'+sel.value+'"');
+if(selApp.value!=='')bad.push('the writer control shows "'+selApp.value+'" while the KIND axis is filtered');
+PV.filt=null;pvKindOptions();pvAppOptions();
+if(sel.value!==''||selApp.value!=='')bad.push('clearing the filter left a control showing "'+(sel.value||selApp.value)+'"');
 console.log(bad.join(' | ')+' :: '+bad.length);
 """
 
@@ -1047,6 +1128,10 @@ def kind_list(js):
     inside the one-line no-churn guard, on every path, and the select sat on a
     single option forever. Nothing was red. A check that only computes cannot
     see a list, so this one builds one.
+
+    It now builds BOTH lists. The writer control is the same shape over a
+    different partition, and "the same shape" is a claim that decays the first
+    time someone adds a guard to one of them.
     """
     node = shutil.which("node")
     if not node:
@@ -1055,6 +1140,11 @@ def kind_list(js):
     if not src:
         return ("pvKindOptions must still be in the script: it is the only thing "
                 "that makes the filter reachable at all")
+    src2 = _js_function(js, "pvAppOptions")
+    if not src2:
+        return ("pvAppOptions must still be in the script: without it the writer "
+                "filter has no list, and an <select> with one option is a "
+                "control that cannot be chosen")
     top = _js_arrow(js, "pvTopKinds")
     if not top:
         return ("pvTopKinds must still be in the script: it is what the filter's "
@@ -1062,7 +1152,7 @@ def kind_list(js):
     d = tempfile.mkdtemp(prefix="ui-kindlist-")
     tmp = os.path.join(d, "kindlist.js")
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(chr(10).join([LIST_PROBE_HEAD, top, src, LIST_PROBE_TAIL]))
+        f.write(chr(10).join([LIST_PROBE_HEAD, top, src, src2, LIST_PROBE_TAIL]))
     try:
         r = subprocess.run([node, tmp], capture_output=True, text=True)
     finally:

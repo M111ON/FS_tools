@@ -1000,6 +1000,20 @@ def derived():
     # only 3,291 are mixed. It rides the same fold, so it costs dicts and not
     # a second walk over an already-streamed log.
     by_kind = {}
+    # The same split by WHO: {app: {rkey: count}}. One more line in the fold we
+    # are already making — a dict per app — and the answer to "what did this
+    # corpus look like when only chatdrop was writing", which is the one axis
+    # the plane shows nothing of: it sums every era into one number per cell.
+    # Measured on the live corpus this is the COARSER of the two partitions:
+    # 13,210 occupied cells become 18,327 (cell,app) pairs = 1.39x, against
+    # 16,751 = 1.27x for kinds. Kinds cluster (index writes 5.12 lines into
+    # every cell it touches) and apps spread out, so the same two facts cost
+    # more to index by writer than by meaning. The 26% quoted in §20.7 before
+    # this was measured was low.
+    #
+    # `m.get("app") or "?"` because a line with no writer has to land SOMEWHERE:
+    # a None key is a JSON "null" and a dropdown entry that reads "null".
+    by_app = {}
     # The plane prunes what the feed merely hides (see CURATOR_PRUNE): a line
     # the curator calls noise contributes NO count to its cell, so an address
     # that lived on nothing but tests stops being occupied and the cell leaves
@@ -1008,6 +1022,7 @@ def derived():
     cells_clean, cell_app_clean, cell_seq_clean = {}, {}, {}
     cell_kind_clean = {}
     by_kind_clean = {}
+    by_app_clean = {}
     # Which 12x12 blocks still hold a clean line. A sighting can be made at
     # level 1, which names a BLOCK rather than a cell — answering "does that
     # address live" for it would otherwise mean scanning every clean cell.
@@ -1040,6 +1055,8 @@ def derived():
             cells[rk] = cells.get(rk, 0) + 1
             _bk = by_kind.setdefault(kind, {})
             _bk[rk] = _bk.get(rk, 0) + 1
+            _ba = by_app.setdefault(m.get("app") or "?", {})
+            _ba[rk] = _ba.get(rk, 0) + 1
             cell_app[rk] = m.get("app")
             cell_kind[rk] = kind
             cell_seq[rk] = len(timeline)      # this line's ordinal, before it lands
@@ -1053,6 +1070,8 @@ def derived():
                 cells_clean[rk] = cells_clean.get(rk, 0) + 1
                 _bk = by_kind_clean.setdefault(kind, {})
                 _bk[rk] = _bk.get(rk, 0) + 1
+                _ba = by_app_clean.setdefault(m.get("app") or "?", {})
+                _ba[rk] = _ba.get(rk, 0) + 1
                 cell_app_clean[rk] = m.get("app")
                 cell_kind_clean[rk] = kind
                 cell_seq_clean[rk] = len(timeline)
@@ -1061,7 +1080,14 @@ def derived():
         to, tags = m.get("to", "all"), tuple(m.get("tags") or ())
         # index 6 is the FULL hash: the feed's tick layer needs an exact
         # hash -> ordinal map, and a 8-hex prefix collides once a log is big
-        timeline.append((m.get("t"), rk, kind, (h or "")[:8], to, tags, h, m.get("app")))
+        # index 7 is the WRITER, and it is NORMALISED to a string the plane can
+        # compare against: by_app keys on `app or "?"`, so a scrub filter that
+        # reads this column has to agree. A raw None here is the same "?" after
+        # a Python `or` and an `undefined` in JavaScript — two languages holding
+        # the same rule as two copies of a string literal. Normalised once, at
+        # the fold, it is one fact instead of a contract.
+        timeline.append((m.get("t"), rk, kind, (h or "")[:8], to, tags, h,
+                         m.get("app") or "?"))
         if kind == "bond":
             p = (m.get("text") or "").split()
             if len(p) == 3:
@@ -1080,12 +1106,14 @@ def derived():
                      "cell_app": cell_app, "cell_seq": cell_seq,
                      "cell_kind": cell_kind,
                      "by_kind": by_kind,
+                     "by_app": by_app,
                      # the pruned view of the same pass: what the plane draws
                      "cells_clean": cells_clean,
                      "cell_app_clean": cell_app_clean,
                      "cell_seq_clean": cell_seq_clean,
                      "cell_kind_clean": cell_kind_clean,
                      "by_kind_clean": by_kind_clean,
+                     "by_app_clean": by_app_clean,
                      "blocks_clean": blocks_clean,
                      "pruned": pruned, "pruned_by": pruned_by,
                      "pruned_hashes": pruned_hashes,
@@ -1162,6 +1190,8 @@ def _derived_absorb(body, raw, key0):
         d["cells"][rk] = d["cells"].get(rk, 0) + 1
         _bk = d.setdefault("by_kind", {}).setdefault(kind, {})
         _bk[rk] = _bk.get(rk, 0) + 1
+        _ba = d.setdefault("by_app", {}).setdefault(body.get("app") or "?", {})
+        _ba[rk] = _ba.get(rk, 0) + 1
         d["cell_app"][rk] = body.get("app")
         d.setdefault("cell_kind", {})[rk] = kind
         d["cell_seq"][rk] = len(d["timeline"])
@@ -1186,6 +1216,8 @@ def _derived_absorb(body, raw, key0):
         else:
             _bk = d.setdefault("by_kind_clean", {}).setdefault(kind, {})
             _bk[rk] = _bk.get(rk, 0) + 1
+            _ba = d.setdefault("by_app_clean", {}).setdefault(body.get("app") or "?", {})
+            _ba[rk] = _ba.get(rk, 0) + 1
             _cc = d.setdefault("cells_clean", {})
             _cc[rk] = _cc.get(rk, 0) + 1
             d.setdefault("cell_app_clean", {})[rk] = body.get("app")
@@ -1200,7 +1232,7 @@ def _derived_absorb(body, raw, key0):
         d["pruned_cells"] = len(d["cells"]) - len(d.get("cells_clean", {}))
     d["timeline"].append((body.get("t"), rk, kind, (h or "")[:8],
                           body.get("to", "all"), tuple(body.get("tags") or ()), h,
-                          body.get("app")))
+                          body.get("app") or "?"))
     if d.get("seq_of") is not None:
         d["seq_of"][h] = len(d["timeline"]) - 1   # a fold, so the ordinal is known
     if kind == "bond":
@@ -2247,12 +2279,12 @@ def plane_meta(raw=False):
     if raw:
         return {"level": 2, "last_app": d["cell_app"],
                 "last_kind": d["cell_kind"],
-                "by_kind": d["by_kind"],
+                "by_kind": d["by_kind"], "by_app": d["by_app"],
                 "last_seq": d["cell_seq"], "seq_max": len(d["timeline"]),
                 "raw": True, "pruned": 0}
     return {"level": 2, "last_app": d["cell_app_clean"],
             "last_kind": d["cell_kind_clean"],
-            "by_kind": d["by_kind_clean"],
+            "by_kind": d["by_kind_clean"], "by_app": d["by_app_clean"],
             "last_seq": d["cell_seq_clean"], "seq_max": len(d["timeline"]),
             "raw": False, "pruned": d.get("pruned", 0)}
 
@@ -2864,6 +2896,8 @@ def _demo_body():
     want_kind_c = dict(d1["cell_kind_clean"])
     want_bk, want_bk_c = ({k: dict(v) for k, v in d1["by_kind"].items()},
                           {k: dict(v) for k, v in d1["by_kind_clean"].items()})
+    want_ba, want_ba_c = ({k: dict(v) for k, v in d1["by_app"].items()},
+                          {k: dict(v) for k, v in d1["by_app_clean"].items()})
     # The per-kind maps must PARTITION the plane: every occupied cell appears
     # under at least one kind, and no cell appears that the counts do not have.
     # A per-kind map that loses a cell is a filter that hides a real address
@@ -2875,6 +2909,19 @@ def _demo_body():
     assert _uc == set(d1["cells_clean"]), "the pruned per-kind map covers exactly the pruned cells"
     _pk_raw, _pk_cl = plane_meta(raw=True)["by_kind"], plane_meta()["by_kind"]
     assert {rk for m_ in _pk_cl.values() for rk in m_} <= {rk for m_ in _pk_raw.values() for rk in m_}, "the pruned per-kind map never names a cell the unpruned one does not"
+    # The per-app map has to hold the same three promises, and it is a different
+    # partition: an address is a PAIR of (cell, writer) facts, and there is no
+    # reason for the two partitions to cover the same set of cells — index
+    # crowds 13,572 lines into 2,651 cells while chatdrop spreads 7,115 over
+    # 5,961. A map that only covered the biggest writer would be the §18 failure
+    # again, so the union is asserted against the plane, not against by_kind.
+    _ua = {rk for m_ in d1["by_app"].values() for rk in m_}
+    assert _ua == set(d1["cells"]), "every occupied cell appears under some writer, and none that is not occupied"
+    assert sum(sum(m_.values()) for m_ in d1["by_app"].values()) == sum(d1["cells"].values()), "and the per-writer counts add up to the plane they were folded from"
+    _uac = {rk for m_ in d1["by_app_clean"].values() for rk in m_}
+    assert _uac == set(d1["cells_clean"]), "the pruned per-writer map covers exactly the pruned cells"
+    _pa_raw, _pa_cl = plane_meta(raw=True)["by_app"], plane_meta()["by_app"]
+    assert {rk for m_ in _pa_cl.values() for rk in m_} <= {rk for m_ in _pa_raw.values() for rk in m_}, "the pruned per-writer map never names a cell the unpruned one does not"
     _DERIVED["key"] = None
     assert derived()["cells"] == want_cells, "incremental index equals a from-scratch rebuild"
     assert derived()["cell_app"] == want_app and derived()["cell_seq"] == want_seq, "the who/when maps rebuild to the same thing too"
@@ -2886,6 +2933,8 @@ def _demo_body():
     assert derived()["cell_kind_clean"] == want_kind_c, "and so does its pruned view — otherwise the kind layer outlives the prune that removed it"
     assert derived()["by_kind"] == want_bk, "the per-kind map rebuilds to the same thing too"
     assert derived()["by_kind_clean"] == want_bk_c, "and so does its pruned view — a filter must not outlive the prune"
+    assert derived()["by_app"] == want_ba, "the per-writer map rebuilds to the same thing too"
+    assert derived()["by_app_clean"] == want_ba_c, "and so does its pruned view — a filter must not outlive the prune"
     assert len(derived()["timeline"]) == want_tl, "timeline length agrees too"
     bhash = append("bench", "bond", "%s uses %s" % (hs[0], hs[1]))["hash"]
     assert any(e["hash"] == bhash for e in all_bonds()), "a fresh edge is in the graph without a rebuild"

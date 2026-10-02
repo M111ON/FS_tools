@@ -1658,19 +1658,19 @@ ui_check OK (174,914 bytes · 37/37 invariants)   pool.py demo 321/321
 run_all 12/12 suites PASS   ui_browser_check 18/18 PASS
 ```
 
-### 20.7 What is still not answered
+### 20.7 What was still not answered
 
 The kind filter answers "which cells hold this kind". Both axes §19.1 measured
-are now settled — one rejected, one paid for — and one is still owed:
+were real: one was rejected, and one —
 
-- **app as swimlanes** — the one axis the corpus has and the plane does not.
-  The corpus is three non-overlapping eras: hermes `0–11,655` · index
-  `11,656–25,229` · chatdrop `25,521–32,635` = 79% of the log, and the plane
-  sums every line into one number per cell, so it shows none of it. The kind
-  filter is the same *mechanism* `by_kind` is — a fold that partitions cells by
-  a second value — so `by_app` is the identical line of code with a different
-  key, and the measured cost is already known (26%). It is a filter on identity,
-  not a mode, and needs none of the six addressing functions §18 demanded.
+- **app as swimlanes** — the one axis the corpus has and the plane did not.
+  The corpus is a sequence of non-overlapping eras (the figures below are the
+  current ones, not the three this section was written against), and the plane
+  sums every line into one number per cell, so it showed none of it.
+
+— was **PAID FOR**. §22 is that work: the fold, the control, and what it cost.
+This section is left as the record of why the axis existed and why the answer
+was a filter rather than a second layout.
 
 ## 21. The browser check — a suite that clicks something
 
@@ -1746,6 +1746,10 @@ reports a dashboard that will not open, which is the failure it exists to catch.
 
 ### 21.4 What it proves
 
+The figures below are the ones this section earned. §22 takes the same suite to
+**32/32** and a sandbox of 101 lines; the numbers here are left as they were so
+the record reads in order.
+
 ```
 ui_browser_check  18/18 PASS   (chrome headless, sandbox corpus of 93 lines)
 mutations 8 attempted · 8 CAUGHT — every bug §20.5 lists, reintroduced one at a
@@ -1764,4 +1768,207 @@ was blind to it while `ui_check` was not. Adding the legend assertion closed
 it, and the legend was worth grading anyway: it is user-visible text that said
 `(0)` for every kind for as long as the bug lived.
 
+## 22. The writer axis — one filter that does not move the map
+
+Added 2026-10-03. §20.7 named the axis the corpus had and the plane did not.
+This is the fold, the control and the two things it cost.
+
+### 22.1 A filter, not a layout
+
+"Swimlanes" was the word §20.7 used, and it is worth being precise about what
+shipped, because a different reading was available and would have been wrong.
+
+Re-laying the plane by app would move every address a reader has learned, and
+the plane is a *map of addresses*: the same cell has to be the same cell in
+every mode, in the popup, in the tooltip and in the URL of a walk. §18 demanded
+six addressing functions for a new mode precisely so that a view could change
+without an address changing. A second numbering understood only by one branch is
+how the block squares ended up drawn on top of each other in row 0 — a bug this
+file already paid for once.
+
+So the app axis is a **filter on identity**, the same mechanism `by_kind` is:
+a fold that partitions cells by a second value, and a second `<select>` beside
+the first. Choosing an app does not rearrange anything. It answers "what did
+this corpus look like while only this one was writing" — which is the question
+the summed plane could not answer at all — and it answers it with the map a
+reader already knows.
+
+### 22.2 The fold, and what it actually costs
+
+`by_app` is `{app: {rkey: count}}`, the identical line of code as `by_kind` with
+a different key, folded in the pass that was already happening. Measured on the
+live corpus (32,705 lines · 13,210 clean cells):
+
 ```
+axis      pairs   vs cells   JSON     per-cell
+cells     13,210     1.00×   151,801 B
+by_kind   16,751     1.27×   191,917 B
+by_app    18,327     1.39×   210,280 B
+```
+
+**The 26% quoted before it was measured was low, and for a reason worth
+keeping.** The two axes are not the same shape. Kinds cluster — `index` puts
+5.12 lines into every cell it touches, so 2,651 addresses hold a third of the
+log — and apps spread out: chatdrop writes 7,115 lines across 5,961 cells.
+
+```
+app        lines   cells  lines/cell   %lines
+index      13,572   2,651       5.12    41.5%
+chatdrop    7,115   5,961       1.19    21.8%
+opencode    6,079   4,731       1.28    18.6%
+hermes      5,056   4,480       1.13    15.5%
+dashboard     843     464       1.82     2.6%
+```
+
+The coarser a value is, the more cells it touches, and the more (cell, value)
+pairs the map needs. That is a general fact about this fold and it is why "it is
+the same line of code" was worth believing — it was, and it was not free.
+
+### 22.3 One axis at a time, and why that is arithmetic
+
+Two `<select>`s could each hold a filter. They do not, and the reason is not
+taste:
+
+> "bond AND chatdrop" is an intersection **neither map can answer**.
+
+`by_kind[bond][rk]` counts every bond in the cell; `by_app[chatdrop][rk]` counts
+every chatdrop line in it. The lines that are both live in a third map nobody
+has kept. Two fields would have printed a number the plane cannot compute — the
+one answer a filter must never give, and the exact bug class §20.5 spent eight
+rows documenting.
+
+So `PV.filt` is **one field with a dimension**: `{dim:'kind'|'app', key}`, and
+picking an axis *replaces* the other. Both controls are a view of that one
+field, which is why they cannot drift apart — the invariant that holds them
+together is not "both are updated" but "there is only one thing to update".
+Choosing the other axis says so on screen rather than silently swapping.
+
+The four maths functions (`pvFilt`, `pvFiltN`, `pvInkAt`, `pvDrawMax`) did not
+change shape at all. The writer axis gets the same contract for free because it
+is the same code, and the probe now proves it: the node probe grades both axes,
+including that a writer-filtered count can never exceed the total.
+
+### 22.4 The wire has six columns
+
+The fold's timeline row has eight entries; `/plane/timeline` sends six:
+
+```python
+"lines": [[i, r[0], r[1], r[2], r[3], r[7]] for i, r in enumerate(vis)]
+#         ord    t     rkey  kind  hash  writer
+```
+
+So the writer is `row[5]` in the browser and `row[7]` in Python. Writing `row[7]`
+in `pvCellsUpTo` compares against `undefined`, which matches nothing — so the
+scrub silently drew nothing at all under a writer filter, and the status line
+agreed with it. Both numbers are now named in the comments on either side, and
+the invariant checks the browser's.
+
+A second, quieter drift sat behind it: a line with no `app` at all. `by_app`
+keys on `app or "?"`, so the plane needs *a* writer name for it, and a `null`
+key is a dropdown entry that reads "null". Rather than keep `"?"` as a string
+literal on both sides of a language boundary, the **fold normalises it once**
+when it writes the timeline row. One fact instead of a contract.
+
+### 22.5 The tour: three modes, clicked
+
+§21 drove one control. Until this commit nothing ever clicked **▦ ทั้งแผนที่**,
+**▢ กรอบเลื่อน** or **▩ ย่อ 12×12** — `ui_check` proved the script *names*
+three modes and the browser check only ever looked at the plane. Three
+addressing rules, none of them driven.
+
+With a filter on (so the tour also grades that a view is not a filter), each
+mode is entered from its own button and read back:
+
+- **the pitch its own name asks for** — `pstep` is asserted *per mode*, in the
+  browser, from the step the canvas is actually using: plane `2..8`, the other
+  two `8..84`. This is §20.6's change measured at the far end instead of in a
+  comment.
+- **its own sides** — 144, `PV.win`, and 12 respectively.
+- **the round trip** — take the busiest addresses the mode is drawing, ask
+  `pvCenter` where it puts them, hit-test that pixel back, and check the address
+  the hit-test returns is drawn *at those coordinates*. Not "the same rkey":
+  in the block view a cell and its block share a square but not an address, so
+  the assertion is positional and holds in all three modes.
+- **ink on the canvas** — sampled over the whole backing store on a stride. A
+  fixed corner is not evidence: in the block view one step is 46px and a small
+  corpus can legitimately live nowhere near the top-left.
+- **the view does not change what the filter says** — the status line's lit-cell
+  figure is identical in all three modes.
+
+### 22.6 Three things the tour found
+
+**`pvBasePaint` threw on every repaint.** The sighting rings and the "you are
+here" marker tested their bounds against `n` — a parameter of a signature the
+function no longer has. `PV.sights` is non-empty on any real corpus, so the
+first of them threw a `ReferenceError` on every single paint. A paint that
+throws leaves the canvas showing the *previous* frame, so the map still looked
+right, and everything after the throw silently never happened: the selection
+marker, and the `pvPop()` in `openPoint` that was going to open the cell popup.
+Every arithmetic check in this repository is green about that line, because
+none of them ever ran it.
+
+**The legend died on the first click.** Both legend boxes live inside
+`#plane-detail`, and `pvDetail` rewrites that container's `innerHTML` every time
+a cell is opened — so the first click of any session destroyed them, and their
+painters begin with `if(!box)return`, which is why nothing ever said a word
+about it. The nodes are now held once and adopted back by one function that
+every replacing path must call. Clicking **▢ กรอบเลื่อน** calls `openPoint`,
+which is why the tour is what found it.
+
+**The suite was the leak.** 105 sandboxes, each with a ~50MB Chrome profile,
+piled up in TEMP until the disk was full and `run_all` began failing with
+`ENOSPC` in suites that have nothing to do with disk. Two causes, both silent:
+`shutil.rmtree(..., ignore_errors=True)` swallowed every refusal, and the
+parent process held `server.out` open for the whole run, which on Windows makes
+that one file undeletable and therefore the whole directory with it. The handle
+is now closed as soon as the child owns it, the browser is waited on before the
+directory goes, and a sandbox that cannot be removed is **named** instead of
+ignored.
+
+### 22.7 The corpus had to be made able to lie
+
+An rkey is `app_rkey(app + kind + text)`, so **two different apps can never
+land in the same address through `append()`**. The sandbox therefore had every
+writer owning a private set of cells — which made "which cells hold this writer"
+and "who wrote this cell last" the same question, and borrowing one number for
+the other (bug 5, the mistake the kind filter shipped) would have passed.
+
+Eight lines are now written by hand with explicit rkeys: `hermes` writes into
+four addresses `chatdrop` holds, and `chatdrop` then writes into those same four
+again. chatdrop **holds** them and does not **own** them. Plus one line with no
+`app` key at all, because the `?` rule is a rule nothing in the corpus was
+exercising.
+
+The sandbox grew from 93 to 101 lines and its kind totals were held identical
+(CHAT 40 · bond 26 · DECISION 16 · pointer 6 · block 3 · msg 2) so that every
+figure the kind checks already assert is unchanged by adding the second axis.
+
+The suite also **refuses to start** if the `pool` it imported did not resolve
+inside the sandbox. It did once, during development: a test corpus appended to
+the reader's actual log, 93 lines, removed by hand.
+
+### 22.8 What it proves
+
+```
+ui_browser_check  32/32 PASS   (chrome headless, sandbox corpus of 101 lines)
+ui_check          40/40 invariants (180,629 bytes of dashboard JavaScript)
+pool.py demo      327/327
+
+mutations 12 attempted · 12 CAUGHT
+  the paint throws again · the legends are not adopted back ·
+  the scrub reads the fold's column · the writer box quotes the colour layer ·
+  both controls keep their own filter · the writer layer is the kind layer ·
+  the pitch goes back to guessing from the cell count ·
+  the block view draws an address somewhere else ·
+  an unknown filter key stays on the control ·
+  the writer fold forgets a line (raw and pruned) ·
+  the timeline stops normalising a missing writer
+
+run_all  12/12 suites PASS (45.4s)
+```
+
+One of the twelve is **equivalent rather than caught**: putting `pstep`'s pitch
+back to `w===144&&h===144` renders every pixel identically, because the plane is
+144 wide and the other two modes are not. No browser can see it. `ui_check` can,
+and does — which is the right division of labour and worth stating rather than
+hiding behind a green row.
