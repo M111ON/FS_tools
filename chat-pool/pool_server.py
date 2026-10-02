@@ -1646,7 +1646,7 @@ listen();
 // the touch code: PV_WINS must equal the options in #pv-win, because a frame
 // size the picker cannot show is a frame the reader cannot choose again
 const PV_WINS=[12,24,36,48,72],PV_PINCH_OUT=1.45;
-const PV={mode:'plane',n:144,sel:null,path:[],plane:{},cells:{},origin:null,
+const PV={mode:'plane',w:144,h:144,sel:null,path:[],plane:{},cells:{},origin:null,
           budget:64,over:[],sights:[],lines:null,stacked:null,timer:null,
           bonds:[],timeline:[],seqMax:0,seq:null,showBonds:true,playing:null,focus:0,
           style:'auto',ctxOn:false,ctxCells:{},crossEdges:[],
@@ -1686,14 +1686,20 @@ const pcv=$('#plane-cv');
 // places a stroke asks this one function, so the picture always agrees with
 // itself.
 function pstep(){
-  const n=PV.n,wrap=$('#plane-canvaswrap');
+  const w=PV.w,h=PV.h,wrap=$('#plane-canvaswrap');
   const avail=(wrap&&wrap.clientWidth)
     ?Math.min(wrap.clientWidth-26,Math.max(wrap.clientHeight-26,160)):520;
   // the canvas should fill the space it has at whatever cell count the view
   // needs: 144 cells at 3px and 12 cells at 36px are the same picture at
   // different magnifications, so the size is DERIVED, never hardcoded per mode
-  const lo=n===144?2:8,hi=n===144?8:84;
-  return Math.max(lo,Math.min(hi,Math.floor(avail/n)));
+  //
+  // The divisor is the LONGER side. One PV.n used to serve as "the cell count"
+  // for both axes at once, which held only because every mode happens to be
+  // square. Naming the two sides makes that an explicit fact instead of a
+  // coincidence: a step that fits w columns still has to fit h rows.
+  const span=Math.max(w,h);
+  const lo=w===144&&h===144?2:8,hi=w===144&&h===144?8:84;
+  return Math.max(lo,Math.min(hi,Math.floor(avail/span)));
 }
 
 // the plane at tick S: every line whose append ordinal is <= S, counted
@@ -1765,10 +1771,10 @@ function pvDerive(){
   const full=PV.seq===null||PV.seq>=PV.seqMax-1;
   const src=full?PV.plane:pvCellsUpTo(PV.seq);
   PV.over=Object.keys(src).filter(k=>src[k]>PV.budget).map(Number);
-  if(PV.mode==='plane'){PV.n=144;PV.cells=src;return}
+  if(PV.mode==='plane'){PV.w=144;PV.h=144;PV.cells=src;return}
   if(PV.mode==='window'){
     // the frame size is the reader's choice; the wrapping is not
-    PV.n=PV.win;
+    PV.w=PV.win;PV.h=PV.win;
     const c={};
     for(const k in src){
       const[dx,dy]=pvXY(+k);
@@ -1777,7 +1783,7 @@ function pvDerive(){
     PV.cells=c;return;
   }
   if(PV.mode==='blocks'){
-    PV.n=12;const agg={};
+    PV.w=12;PV.h=12;const agg={};
     for(const k in src){
       // keyed by the block's FIRST ADDRESS, like every other mode — pvXY, the
       // edge strokes, the radius mask and pvCountAt all speak cell addresses,
@@ -1794,7 +1800,7 @@ function pvDerive(){
   // the block view IS a window — the same wrapping frame, entered by zooming
   // into one block instead of by choosing an origin by hand. One code path, or
   // the picture and the hit-test drift apart at the seam.
-  PV.mode='window';PV.win=12;PV.n=PV.win;
+  PV.mode='window';PV.win=12;PV.w=PV.win;PV.h=PV.win;
   const c={};
   for(const k in src){
     const[dx,dy]=pvXY(+k);
@@ -1805,8 +1811,9 @@ function pvDerive(){
 function pvCenter(rk){
   const [x,y]=pvXY(rk);
   /* torus: edges may reference ghost-zone coords (-8..151), allow them */
-  const bound=PV.mode==='plane'&&PV.n===144?T144+8:PV.n;
-  if(x<-8||y<-8||x>=bound||y>=bound)return null;
+  const bx=PV.mode==='plane'&&PV.w===144?T144+8:PV.w,
+        by=PV.mode==='plane'&&PV.h===144?T144+8:PV.h;
+  if(x<-8||y<-8||x>=bx||y>=by)return null;
   const step=pstep();
   return[x*step+step/2,y*step+step/2];
 }
@@ -1830,7 +1837,7 @@ function torusNear(v){let d=((v%T144)+T144)%T144;if(d>T144/2)d-=T144;return d}
    A segment that cannot touch the canvas at all returns null — the one cheap
    reject, equivalent to the old drop but only for genuinely invisible edges. */
 function pvEdgeEnds(src,dst){
-  const step=pstep(),px=PV.n*step;
+  const step=pstep(),px=PV.w*step,py=PV.h*step;
   if(PV.mode==='plane'){
     const ax=src%144,ay=Math.floor(src/144);
     let bx=dst%144,by=Math.floor(dst/144);
@@ -1840,7 +1847,7 @@ function pvEdgeEnds(src,dst){
     if((Math.max(a[0],z[0])<0&&Math.min(a[0],z[0])+step<0)||
        (Math.min(a[0],z[0])>px&&Math.max(a[0],z[0])-step>px))return null;
     if((Math.max(a[1],z[1])<0&&Math.min(a[1],z[1])+step<0)||
-       (Math.min(a[1],z[1])>px&&Math.max(a[1],z[1])-step>px))return null;
+       (Math.min(a[1],z[1])>py&&Math.max(a[1],z[1])-step>py))return null;
     return[a,z];
   }
   if(PV.mode==='blocks'){
@@ -1859,16 +1866,16 @@ function pvEdgeEnds(src,dst){
     if(by<0)by+=12;else if(by>=12)by-=12;
     const a=pvCenterRaw(ax,ay),z=pvCenterRaw(bx,by);
     if(Math.max(a[0],z[0])<0||Math.min(a[0],z[0])>px||
-       Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>px)return null;
+       Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>py)return null;
     return[a,z];
   }
-  const n=PV.n,o=PV.origin||{wedge:0,ring:0},half=Math.floor(n/2);
+  const w=PV.w,h=PV.h,o=PV.origin||{wedge:0,ring:0},half=Math.floor(Math.min(w,h)/2);
   const aw=src%144,ar=Math.floor(src/144);
   const ax=half+torusNear(aw-o.wedge-half),ay=half+torusNear(ar-o.ring-half);
   const bx=ax+torusDx(aw,dst%144),by=ay+torusDx(ar,Math.floor(dst/144));
   const a=pvCenterRaw(ax,ay),z=pvCenterRaw(bx,by);
   if(Math.max(a[0],z[0])<0||Math.min(a[0],z[0])>px||
-     Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>px)return null;
+     Math.max(a[1],z[1])<0||Math.min(a[1],z[1])>py)return null;
   return[a,z];
 }
 function pvDegrees(edges){
@@ -1995,9 +2002,9 @@ function pvEdgeStrokesOf(edges,keep,style){
        far side is NOT adjacent (96 more cells sit in between), so a re-entry
        there would lie about the geometry — those stay clipped. */
     if(PV.mode==='plane'){
-      const px2=PV.n*step;
+      const px2=PV.w*step,py2=PV.h*step;
       const ox=Math.max(a[0],z[0])>px2?-T144*step:(Math.min(a[0],z[0])<0?T144*step:0);
-      const oy=Math.max(a[1],z[1])>px2?-T144*step:(Math.min(a[1],z[1])<0?T144*step:0);
+      const oy=Math.max(a[1],z[1])>py2?-T144*step:(Math.min(a[1],z[1])<0?T144*step:0);
       if(ox||oy)push(e,[a[0]+ox,a[1]+oy],[z[0]+ox,z[1]+oy],alpha,1);
     }
   });
@@ -2021,7 +2028,7 @@ function pvStroke(c,s,alphaOverride){
 }
 function pvMemoryPass(c,step,keep){
   for(const k in PV.ctxCells){
-    const [x,y]=pvXY(+k);if(x<0||y<0||x>=PV.n||y>=PV.n)continue;
+    const [x,y]=pvXY(+k);if(x<0||y<0||x>=PV.w||y>=PV.h)continue;
     const near=!keep||keep.has(+k),m=Math.max(2,Math.round(step*0.45));
     c.fillStyle='rgba(121,192,255,'+(near?0.9:0.10)+')';
     c.fillRect(x*step+(step-m)/2,y*step+(step-m)/2,m,m);
@@ -2170,9 +2177,9 @@ function pvXY(rk){
   if(PV.mode==='plane')return[rk%144,Math.floor(rk/144)];
   if(PV.mode==='blocks'){const o=PV.bOrig;
     return[pvB(Math.floor((rk%144)/12)-o.x),pvB(Math.floor(rk/144/12)-o.y)]}
-  const n=PV.n,o=PV.origin||{wedge:0,ring:0};
+  const w=PV.w,h=PV.h,o=PV.origin||{wedge:0,ring:0};
   const dx=pvWrap(rk%144-o.wedge),dy=pvWrap(Math.floor(rk/144)-o.ring);
-  if(dx>=n||dy>=n)return[-1,-1];          // this address is outside the frame
+  if(dx>=w||dy>=h)return[-1,-1];          // this address is outside the frame
   return[dx,dy];
 }
 function pvRkeyAt(x,y){
@@ -2344,7 +2351,7 @@ const PV_ZOOM=[1,2,3,4,5,6,8,10,12,16,20,25,32,40,48,64];
 function pvLensR(){
   // sized from the canvas, not fixed: 70px is most of the view on a phone and
   // a speck on a laptop, and the cap below is derived from this radius
-  const px=PV.n*pstep();
+  const px=Math.max(PV.w,PV.h)*pstep();
   return Math.max(34,Math.min(120,Math.round(px*0.17)));
 }
 function pvLensZ(){
@@ -2419,8 +2426,8 @@ function pvLensPt(w,r){return[pvWrap(w),pvWrap(r)]}
 // must answer, or the cursor would contradict the picture.
 function pvLensHit(gx,gy){
   if(!PV.lens.on)return null;
-  const [bx,by]=pvLensPos(),R=pvLensR(),px=PV.n*pstep();
-  for(const dx of [-px,0,px])for(const dy of [-px,0,px]){
+  const [bx,by]=pvLensPos(),R=pvLensR(),px=PV.w*pstep(),py=PV.h*pstep();
+  for(const dx of [-px,0,px])for(const dy of [-py,0,py]){
     const mx=gx-(bx+dx),my=gy-(by+dy);
     if(mx*mx+my*my<=R*R)return[mx,my];
   }
@@ -2463,14 +2470,14 @@ function pvLensInfo(){
 }
 function pvLensDraw(c){
   const L=PV.lens;if(!L.on)return;
-  const px=PV.n*pstep(),r=pvLensR(),[bx,by]=pvLensPos();
+  const px=PV.w*pstep(),py=PV.h*pstep(),r=pvLensR(),[bx,by]=pvLensPos();
   // The glass WRAPS with the plane: near an edge its rim reappears on the far
   // side, exactly like the cells it is magnifying. The seam is not a special
   // case here either — the content is placed by torus deltas, so the copy on
   // the other side is the same glass, not a second one.
-  for(const dx of [-px,0,px])for(const dy of [-px,0,px]){
+  for(const dx of [-px,0,px])for(const dy of [-py,0,py]){
     const ox=bx+dx,oy=by+dy;
-    if(ox+r<0||ox-r>px||oy+r<0||oy-r>px)continue;
+    if(ox+r<0||ox-r>px||oy+r<0||oy-r>py)continue;
     pvLensOne(c,ox,oy,r,dx===0&&dy===0);
   }
 }
@@ -2594,13 +2601,17 @@ function pvLensHandle(c,ox,oy,r){
   c.beginPath();c.moveTo(hx,hy);c.lineTo(hx+Math.cos(a)*13,hy+Math.sin(a)*13);c.stroke();
   c.lineCap='butt';
 }
-function pvGrid(c,n,step,px){
+function pvGrid(c,w,h,step,px,py){
   // a faint L1 grid: without it a 144x144 plane of 3px cells has no landmarks
   if(step*12<18)return;
   c.strokeStyle='rgba(139,148,158,.16)';c.lineWidth=1;
-  for(let i=1;i*12<n;i++){
+  for(let i=1;i*12<w;i++){
     const p=i*12*step+.5;
-    c.beginPath();c.moveTo(p,0);c.lineTo(p,px);c.moveTo(0,p);c.lineTo(px,p);c.stroke();
+    c.beginPath();c.moveTo(p,0);c.lineTo(p,py);c.stroke();
+  }
+  for(let i=1;i*12<h;i++){
+    const p=i*12*step+.5;
+    c.beginPath();c.moveTo(0,p);c.lineTo(px,p);c.stroke();
   }
 }
 /* ── the base layer: painted once, blitted per frame ────────────────────
@@ -2630,7 +2641,7 @@ function _idOf(o){
 }
 function pvBaseKey(px,bw){
   const o=PV.origin;
-  return[px,bw,PV.n,PV.mode,PV.colour,PV.sel,PV.focus,PV.seq,PV.win,
+  return[px,bw,PV.w,PV.h,PV.mode,PV.colour,PV.sel,PV.focus,PV.seq,PV.win,
     PV.showBonds,PV.ctxOn,PV.style,PV.hubK,PV.relColour,PV.prune,PV.cellSeqMax,
     o?o.wedge:null,o?o.ring:null,PV.bOrig.x,PV.bOrig.y,
     _idOf(PV.cells),_idOf(PV.bonds),_idOf(PV.crossEdges),_idOf(PV.sights),
@@ -2653,7 +2664,7 @@ function pvBase(px,bw){
   return cv;
 }
 function pvBasePaint(c,px){
-  const n=PV.n,step=pstep();
+  const w=PV.w,h=PV.h,step=pstep();
   c.fillStyle='#0a0e14';c.fillRect(0,0,px,px);
   const max=pvDrawMax();
   const keep=pvKeep(),filt=pvFilt();
@@ -2661,7 +2672,7 @@ function pvBasePaint(c,px){
     c.fillStyle='#8b949e';c.font='12px monospace';c.textAlign='center';
     c.fillText('ยังไม่มีบรรทัดในมุมมองนี้',px/2,px/2);c.textAlign='left';
   }
-  pvGrid(c,n,step,px);
+  pvGrid(c,w,h,step,px,px);
   // the three busiest cells get a glow: at plane scale they are the only
   // landmarks, and "where is the weight" is the first question anyone asks
   // the hubs are the busiest cells OF WHAT IS DRAWN: under a filter that is the
@@ -2671,24 +2682,24 @@ function pvBasePaint(c,px){
   const hv=k=>filt?filt[k]:PV.cells[k];
   const hubs=new Set(hk.sort((a,b)=>hv(b)-hv(a)).slice(0,3).filter(k=>hv(k)>1));
   for(const k in PV.cells){
-    const [x,y]=pvXY(+k);if(x<0||y<0||x>=n||y>=n)continue;
+    const [x,y]=pvXY(+k);if(x<0||y<0||x>=w||y>=h)continue;
     const hit=filt?(filt[k]||0):PV.cells[k];
     const near=(!keep||keep.has(+k))&&(!filt||hit>0);
     const rel=hit/max;
     // at plane scale one cell is ~3px, so a single line is nearly invisible;
     // every occupied cell gets a floor of 2px so the map is actually readable
-    const w=Math.max(step,2),o=(w-step)/2;
+    const cw=Math.max(step,2),o=(cw-step)/2;
     const gap=step>=6?1:0;                      // a hairline between cells
     c.globalAlpha=near?1:0.12;                  // masked = barely there
     c.fillStyle=pvInkAt(+k,rel);
-    c.fillRect(x*step-o+gap/2,y*step-o+gap/2,w-gap,w-gap);
+    c.fillRect(x*step-o+gap/2,y*step-o+gap/2,cw-gap,cw-gap);
     if(hubs.has(+k)){
       c.strokeStyle='rgba(255,212,121,.85)';c.lineWidth=1;
-      c.strokeRect(x*step-o-.5,y*step-o-.5,w+1,w+1);
+      c.strokeRect(x*step-o-.5,y*step-o-.5,cw+1,cw+1);
     }
     if(keep&&near&&+k!==PV.sel){                // in radius: mark it
       c.strokeStyle='rgba(126,231,135,.55)';c.lineWidth=1;
-      c.strokeRect(x*step-o-.5,y*step-o-.5,w+1,w+1);
+      c.strokeRect(x*step-o-.5,y*step-o-.5,cw+1,cw+1);
     }
     c.globalAlpha=1;
   }
@@ -2700,19 +2711,19 @@ function pvBasePaint(c,px){
       if(!ghosts.length)continue;
       const gh=filt?(filt[k]||0):PV.cells[k];
       const near=(!keep||keep.has(rk))&&(!filt||gh>0),rel=gh/max;
-      const w=Math.max(step,2),o=(w-step)/2,gap=step>=6?1:0;
+      const cw=Math.max(step,2),o=(cw-step)/2,gap=step>=6?1:0;
       c.globalAlpha=near?0.65:0.08;
       c.fillStyle=pvCellInk(rk,rel);
       for(const[dx,dy]of ghosts){
         const gx=cx+dx,gy=cy+dy;
-        c.fillRect(gx*step-o+gap/2,gy*step-o+gap/2,w-gap,w-gap);
+        c.fillRect(gx*step-o+gap/2,gy*step-o+gap/2,cw-gap,cw-gap);
         if(hubs.has(rk)){
           c.strokeStyle='rgba(255,212,121,.85)';c.lineWidth=1;
-          c.strokeRect(gx*step-o-.5,gy*step-o-.5,w+1,w+1);
+          c.strokeRect(gx*step-o-.5,gy*step-o-.5,cw+1,cw+1);
         }
         if(keep&&near&&rk!==PV.sel){
           c.strokeStyle='rgba(126,231,135,.55)';c.lineWidth=1;
-          c.strokeRect(gx*step-o-.5,gy*step-o-.5,w+1,w+1);
+          c.strokeRect(gx*step-o-.5,gy*step-o-.5,cw+1,cw+1);
         }
       }
       c.globalAlpha=1;
@@ -2761,7 +2772,7 @@ function pvBasePaint(c,px){
   }
 }
 function pvDraw(){
-  const n=PV.n,step=pstep(),px=n*step;
+  const step=pstep(),px=Math.max(PV.w,PV.h)*step;
   // Device-pixel-exact backing store. A fractional devicePixelRatio (measured
   // 1.232 here) with an integer css pixel size gave a NON-integer backing
   // store, which is the blurriest of all worlds: the size and the transform
@@ -2913,7 +2924,7 @@ function pvCellAt(ev){
     /* torus: clicking outside 0..143 wraps around */
     x=((x%T144)+T144)%T144;y=((y%T144)+T144)%T144;
   }else{
-    if(x<0||y<0||x>=PV.n||y>=PV.n)return null;
+    if(x<0||y<0||x>=PV.w||y>=PV.h)return null;
   }
   return[x,y,pvRkeyAt(x,y)];
 }

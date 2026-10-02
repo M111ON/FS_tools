@@ -302,7 +302,7 @@ def vocabulary_gaps(js):
 
 
 SEAM_PROBE = r"""
-const PV={mode:'blocks',n:12,seq:null,seqMax:9,budget:64,win:12,over:[],
+const PV={mode:'blocks',w:12,h:12,seq:null,seqMax:9,budget:64,win:12,over:[],
           bOrig:{x:0,y:0},origin:{wedge:0,ring:0},plane:{},cells:{}};
 const bad=[];
 // a plane with weight in every block: what the aggregation produces is checkable
@@ -410,7 +410,7 @@ def seam_roundtrip(js):
 
 TORUS_PROBE = r"""
 const T144=144;
-const PV={mode:'plane',n:144,origin:null,bOrig:{x:0,y:0},win:24};
+const PV={mode:'plane',w:144,h:144,origin:null,bOrig:{x:0,y:0},win:24};
 function pstep(){return 8}
 const fails=[];
 function near(a,b,eps){return Math.abs(a-b)<=eps}
@@ -423,9 +423,9 @@ if(!near(gap,-1,0.01))fails.push('plane seam pair gap='+gap+' (want -1: shortest
 const e4=pvEdgeEnds(10*144+50,10*144+54);
 if(!near((e4[1][0]-e4[0][0])/8,4,0.01))fails.push('plane normal pair gap='+((e4[1][0]-e4[0][0])/8));
 // window: pair 4 cells apart stays 4; a pair that straddles the origin seam
-// takes the short way (-2), never the long way (+142). PV.n must follow the
+// takes the short way (-2), never the long way (+142). PV.w/PV.h must follow the
 // mode: the page's pvMode() sets it, and this probe has no pvMode.
-PV.mode='window';PV.n=24;PV.origin={wedge:100,ring:100};
+PV.mode='window';PV.w=24;PV.h=24;PV.origin={wedge:100,ring:100};
 const ew=pvEdgeEnds(100*144+100,100*144+104);
 if(!near((ew[1][0]-ew[0][0])/8,4,0.01))fails.push('window normal pair gap='+((ew[1][0]-ew[0][0])/8));
 const ws=pvEdgeEnds(100*144+102,100*144+((98)%144));
@@ -435,15 +435,15 @@ if(!near((ws[1][0]-ws[0][0])/8,-4,0.01))fails.push('window seam pair gap='+((ws[
 const eo=pvEdgeEnds(100*144+112,100*144+118);
 if(!eo)fails.push('window: edge leaving the frame was dropped instead of clipped');
 // blocks: block (0,0) -> block (11,0) is ONE block across the seam, on-screen
-PV.mode='blocks';PV.n=12;PV.origin=null;
+PV.mode='blocks';PV.w=12;PV.h=12;PV.origin=null;
 const eb=pvEdgeEnds(0,11*12);
 const bg=(eb[1][0]-eb[0][0])/8;   // in the blocks branch positions are BLOCK units x pstep
 if(!near(bg,11,0.01))fails.push('blocks seam pair gap='+bg+' blocks (want 11: the visible rim image)');
 if(eb[0][0]<0||eb[1][0]<0)fails.push('blocks: seam image drawn off-canvas');
 // re-entry: on the full plane an edge that runs off one rim must be painted a
 // second time entering from the opposite rim — the torus promise. Back to
-// plane mode FIRST: the blocks branch above left PV.n at 12.
-PV.mode='plane';PV.n=144;
+// plane mode FIRST: the blocks branch above left PV.w at 12.
+PV.mode='plane';PV.w=144;PV.h=144;
 e=pvEdgeEnds(10*144+0,11*144+143);
 const ox=(Math.max(e[0][0],e[1][0])>144*8)?-144*8:(Math.min(e[0][0],e[1][0])<0?144*8:0);
 const oy=(Math.max(e[0][1],e[1][1])>144*8)?-144*8:(Math.min(e[0][1],e[1][1])<0?144*8:0);
@@ -777,6 +777,18 @@ INVARIANTS = [
      "pvCellsUpTo counts the log's own order, so without the kind check it "
      "would rebuild a plane the filter is not describing — drag time back with "
      "'bonds only' on and the filtered kinds come straight back"),
+    ("the plane's grid names both of its sides",
+     lambda js, html: (not _code_matches(js, r"\bPV\.n\b")
+                       and len(_code_matches(js, r"PV\.w\s*=")) == len(_code_matches(js, r"PV\.h\s*="))),
+     "one PV.n stood for 'the cell count' on both axes at once, which held only "
+     "because every mode happens to be square — so pstep inferred the mode from "
+     "it (n===144), and a future non-square mode would have inherited a "
+     "coincidence instead of a contract. PV.w/PV.h make it explicit. The guard "
+     "is the assignment count: the two are always set as a pair, so a new mode "
+     "that sets one and forgets the other fails here. Read through _code_matches "
+     "because pstep's own comment explains the old name — a plain regex is "
+     "satisfied by the sentence documenting the fix, which is §13.5 for the "
+     "fifth time in this file"),
     ("the kind list is built, not only computed",
      lambda js, html: kind_list(js) == "",
      lambda js, html: kind_list(js)),
