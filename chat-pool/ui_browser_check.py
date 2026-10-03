@@ -164,6 +164,13 @@ def build_log(box):
                 f.write(json.dumps(b, ensure_ascii=False) + "\n")
         pool._DERIVED["key"] = None          # the file moved; do not trust the cache
 
+    truth = _truth_from(pool)
+    del sys.modules["pool"]
+    return truth, i
+
+
+def _truth_from(pool):
+    """Every ground truth this file grades against, read out of the library."""
     d = pool.derived()
     by_kind = d["by_kind"]
     by_app = d["by_app"]
@@ -189,6 +196,7 @@ def build_log(box):
         "layer": layer,
         "cells_total": len(d["cells"]),
         "lines_total": sum(d["cells"].values()),
+        "lines_read": len(d["timeline"]),
         "mixed_cells": sum(1 for v in by_kind.values() if len(v) > 1),
         "mixed_apps": sum(1 for v in by_app.values() if len(v) > 1),
         # the composition strip reads /patterns, so its truth is the census —
@@ -208,8 +216,28 @@ def build_log(box):
             continue
         truth["kind_seq"].setdefault(row[2], []).append((i, rk))
         truth["app_seq"].setdefault(row[7], []).append((i, rk))
-    del sys.modules["pool"]
-    return truth, i
+    return truth
+
+
+def reread_truth(box):
+    """The truth again, AFTER the server has been running.
+
+    The corpus is written first and graded last, and in between the server
+    started — which registers itself, installs a session guard and starts a
+    bridge thread, so it APPENDS to the very log the truth was computed from.
+    Grading the page against a corpus that had since grown is how the legend
+    check started failing on a healthy plane: `pointer` was 6 when the truth
+    was read and 7 by the time the page drew it, and nothing was wrong with
+    either number. The truth has to describe the log the server actually read.
+    """
+    sys.path.insert(0, box)
+    for mod in [m for m in ("pool", "ctx_plane") if m in sys.modules]:
+        del sys.modules[mod]
+    import pool
+    try:
+        return _truth_from(pool)
+    finally:
+        sys.modules.pop("pool", None)
 
 
 # ── the driver that runs inside node ────────────────────────────────────────
@@ -267,6 +295,18 @@ const bye = () => { try { if (WS) WS.close(); } catch (x) {} };
 
   await send('Page.enable');
   await send('Runtime.enable');
+  // The tour must not MUTATE the corpus it grades. Opening a cell asks for
+  // /neighbors?...&record=1, which declares a SIGHTING — and a sighting goes
+  // through append(), into the very log this file's ground truth was read from.
+  // The plane was fetched before the tour and the who/when layer after it, so a
+  // single click left the legend claiming `pointer` on a cell the truth had not
+  // heard of: the suite grading a moving target, and the app blamed for it.
+  // Installed before navigation, so it is in place before the app's script runs.
+  const QUIET_READS =
+    "(function(){var f=window.fetch;window.fetch=function(u,o){" +
+    "try{if(typeof u==='string'&&u.indexOf('record=1')>=0)u=u.replace(/&?record=1/,'');}catch(e){}" +
+    "return f.call(this,u,o);};})()";
+  await send('Page.addScriptToEvaluateOnNewDocument', {source: QUIET_READS});
   await send('Page.navigate', {url: pageUrl});
   // Wait for THE APP, not for the document. `document.readyState` is 'complete'
   // on the blank page we started from, so polling it alone clicks the plane
@@ -562,6 +602,83 @@ const bye = () => { try { if (WS) WS.close(); } catch (x) {} };
       await new Promise(r => setTimeout(r, 450));
       R.stripUnclick = PV.filt === null;
     }
+    // ── the named views: ONE dropdown that sets all five axes ──────────
+    // A preset is a second store of view state unless it is proved to be the
+    // same store: it writes PV, the controls repaint from PV, and the reader
+    // can still hand-edit any of the five afterwards. Each of those three
+    // promises fails silently, and none of them fails loudly on screen — a
+    // menu that says "ชนิด" over a plane coloured by writer looks fine.
+    PH('presets');
+    const readView = () => {
+      const c = (id) => { const e = document.querySelector(id); return e ? e.value : null; };
+      const note = document.querySelector('#pv-preset-note');
+      // With no filter the status line does not say "สว่าง N ช่อง" (that is the
+      // FILTERED wording); unfiltered its short form reads "N/20,736 ช่อง".
+      // Asking for the filtered phrase here read nothing and looked like an
+      // empty map, which is a failing check for a healthy plane.
+      const info = document.querySelector('#plane-info').textContent;
+      let sig = '';
+      try {
+        const c2 = pcv.getContext('2d'), W = pcv.width, H = pcv.height;
+        const d = c2.getImageData(0, 0, W, H).data;
+        const stride = Math.max(1, Math.floor(Math.min(W, H) / 120));
+        let a = 0, b = 0;
+        for (let y = 0; y < H; y += stride)
+          for (let x = 0; x < W; x += stride) {
+            const i = (y * W + x) * 4;
+            a = (a * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) % 1000003;
+            if (d[i] > 42 || d[i + 1] > 42 || d[i + 2] > 42) b++;
+          }
+        sig = a + ':' + b;
+      } catch (e) { sig = 'err'; }
+      return {
+        preset: PV.preset, mode: PV.mode, colour: PV.colour, style: PV.style,
+        hubK: PV.hubK, win: PV.win, seq: PV.seq, seqMax: PV.seqMax,
+        w: PV.w, h: PV.h, step: pstep(), sig: sig,
+        ui: {colour: c('#pv-colour'), style: c('#pv-style'), hubK: c('#pv-hubk'),
+             win: c('#pv-win'), preset: c('#pv-preset')},
+        note: note ? note.textContent : '',
+        noteShown: note ? getComputedStyle(note).display !== 'none' : false,
+        frameCells: num((/([0-9,]+)\\/20,736\\s*ช่อง/.exec(info) || [])[1]),
+        lit: num((/สว่าง\\s*([0-9,]+)\\s*ช่อง/.exec(info) || [])[1]),
+        when: (document.querySelector('#pv-when') || {}).textContent || '',
+      };
+    };
+    const presSel = document.querySelector('#pv-preset');
+    R.presetOrder = presSel ? [...presSel.options].map(o => o.value).filter(Boolean) : [];
+    R.presetDecl = {};
+    R.presetNotes = {};
+    (typeof PV_PRESETS !== 'undefined' ? PV_PRESETS : [])
+      .forEach(p => { R.presetDecl[p.id] = p.v; R.presetNotes[p.id] = p.note; });
+    R.presets = {};
+    for (const id of R.presetOrder) {
+      PH('preset:' + id);
+      presSel.value = id; presSel.dispatchEvent(new Event('change'));
+      await new Promise(r => setTimeout(r, 650));
+      R.presets[id] = readView();
+    }
+    // a preset that READS a layer must ask for it the way a click does: a
+    // reader is allowed to arrive at "who wrote this" without first visiting a
+    // colour dropdown, and the layer is not in the counts payload
+    PH('preset-layer');
+    PV.metaOn = false; PV.cellApp = {}; PV.cellSeq = {}; PV.cellKind = {};
+    presSel.value = 'who'; presSel.dispatchEvent(new Event('change'));
+    await new Promise(r => setTimeout(r, 1200));
+    R.presetLayer = {metaOn: !!PV.metaOn, writers: Object.keys(PV.cellApp).length,
+                     preset: PV.preset};
+    // the claim must die the moment a hand touches one of the five
+    presSel.value = R.presetOrder[0]; presSel.dispatchEvent(new Event('change'));
+    await new Promise(r => setTimeout(r, 600));
+    R.presetBeforeTouch = PV.preset;
+    const styleEl = document.querySelector('#pv-style');
+    styleEl.value = styleEl.value === 'degree' ? 'flat' : 'degree';
+    styleEl.dispatchEvent(new Event('change'));
+    await new Promise(r => setTimeout(r, 600));
+    R.touched = Object.assign({preset: PV.preset,
+                               sel: document.querySelector('#pv-preset').value,
+                               note: (document.querySelector('#pv-preset-note') || {}).textContent || ''},
+                              readView());
+
     PH('legend'); const col = document.querySelector('#pv-colour');
     col.value = 'kind'; col.dispatchEvent(new Event('change'));
     R.legendLoaded = await waitFor(
@@ -1001,6 +1118,101 @@ def check(report, truth):
             "" if page.get("stripUnclick") else " · clicking it again did NOT clear"))
     add("clicking the same row again clears the filter", page.get("stripUnclick") is True,
         "PV.filt after a second click: %r" % (page.get("stripUnclick"),))
+
+    # ── the named views ────────────────────────────────────────────────
+    presets = page.get("presets") or {}
+    order = page.get("presetOrder") or []
+    decl = page.get("presetDecl") or {}
+    add("every view the menu offers was actually driven", len(order) >= 4 and set(order) == set(presets),
+        "the menu offers %d, the tour clicked %d%s" % (
+            len(order), len(presets),
+            "" if set(order) == set(presets) else " · unvisited: %s"
+            % sorted(set(order) - set(presets))))
+    # One store, not two. The picker and the five controls are all views of PV,
+    # so after a preset the controls must read back the fields it wrote. A
+    # preset that set the state and left the boxes showing the old values would
+    # pass every arithmetic check in the file.
+    mirror = []
+    notes = page.get("presetNotes") or {}
+    for pid in sorted(presets):
+        v = presets[pid]
+        if v.get("preset") != pid:
+            mirror.append("%s: PV.preset=%r, so the name is not carried by the state"
+                          % (pid, v.get("preset")))
+        if (v.get("ui") or {}).get("preset") != pid:
+            mirror.append("%s: the picker shows %r" % (pid, (v.get("ui") or {}).get("preset")))
+        for fld in ("colour", "style", "hubK", "win"):
+            if (v.get("ui") or {}).get(fld) != str(v.get(fld)):
+                mirror.append("%s: #pv-%s shows %r while PV.%s is %r"
+                              % (pid, fld, (v.get("ui") or {}).get(fld), fld, v.get(fld)))
+        # the sentence has to be THIS view's. A caption borrowed from the first
+        # entry in the array is a caption describing another picture, which is
+        # the whole failure the picker exists to avoid.
+        if (v.get("note") or "").strip() != (notes.get(pid) or "").strip():
+            mirror.append("%s: the sentence on screen is %r, not its own %r"
+                          % (pid, v.get("note"), notes.get(pid)))
+        elif not v.get("noteShown"):
+            mirror.append("%s: its sentence is not shown" % pid)
+    add("a named view sets the controls it claims to set", not mirror,
+        "; ".join(mirror)[:400] or "%d views, each with its five controls and its sentence"
+        % len(presets))
+    # And it must do what it says — a menu of eight labels that all land on the
+    # same picture is worse than no menu, because it looks like a choice.
+    claims = []
+    for pid in sorted(presets):
+        v, d = presets[pid], decl.get(pid) or {}
+        if not d:
+            claims.append("%s: offered by the menu, described by nothing" % pid)
+            continue
+        for fld in ("mode", "colour", "style", "hubK"):
+            if d.get(fld) is not None and v.get(fld) != d[fld]:
+                claims.append("%s: says %s=%r and the state is %r" % (pid, fld, d[fld], v.get(fld)))
+        if d.get("win") is not None and v.get("win") != d["win"]:
+            claims.append("%s: says a %r frame and drew %r" % (pid, d["win"], v.get("win")))
+        # the shape has to be the shape it names, in CELLS and not in buttons
+        side = {"plane": 144, "blocks": 12}.get(v.get("mode"), d.get("win"))
+        if side is not None and v.get("w") != side:
+            claims.append("%s: mode %s drew a %sx%s grid" % (pid, v.get("mode"), v.get("w"), v.get("h")))
+        # and time has to be where it says — one preset parks it, the rest do not
+        maxs = max((v.get("seqMax") or 1) - 1, 0)
+        if d.get("seqFrac") is not None:
+            want = int(maxs * d["seqFrac"])
+            if v.get("seq") is None or abs(v["seq"] - want) > 1:
+                claims.append("%s: parks time at %r, wanted ~%d of %d"
+                              % (pid, v.get("seq"), want, maxs))
+        elif v.get("seq") is not None:
+            claims.append("%s: says every line and parked time at %r" % (pid, v.get("seq")))
+        if not v.get("frameCells"):
+            claims.append("%s: the status line counts %r cells with lines in them"
+                          % (pid, v.get("frameCells")))
+    add("each named view lands on the picture it advertises", not claims,
+        "; ".join(claims)[:400] or "%s" % " · ".join(
+            "%s %s/%s %s%s cells" % (pid, presets[pid].get("mode"), presets[pid].get("colour"),
+                                     presets[pid].get("style"), presets[pid].get("w"))
+            for pid in sorted(presets)))
+    # The views cannot all paint the same pixels, or half the menu is the same
+    # picture wearing different labels. A sampled checksum of the canvas is the
+    # honest witness; the threshold is low on purpose because a small corpus can
+    # legitimately make two views identical (with 26 edges, hub-drawing draws
+    # every hub there is) and the check is about the MENU, not about drawing.
+    sigs = {v.get("sig") for v in presets.values()}
+    add("the named views do not all paint the same picture", len(sigs) >= 3,
+        "%d distinct canvases over %d views · %s" % (
+            len(sigs), len(presets),
+            " · ".join("%s=%s" % (pid, presets[pid].get("sig")) for pid in sorted(presets))))
+    t = page.get("touched") or {}
+    add("hand-editing a control drops the name the menu was claiming",
+        bool(page.get("presetBeforeTouch")) and not t.get("preset")
+        and not t.get("sel") and not t.get("note"),
+        "menu chose %r; after touching #pv-style: PV.preset=%r, picker=%r, note=%r"
+        % (page.get("presetBeforeTouch"), t.get("preset"), t.get("sel"), t.get("note")))
+    pl = page.get("presetLayer") or {}
+    add("a named view asks for the layer it reads",
+        bool(pl.get("metaOn")) and bool(pl.get("writers")),
+        "with the writer layer forced off, choosing \"who wrote this\" left "
+        "metaOn=%r with %r writers mapped%s"
+        % (pl.get("metaOn"), pl.get("writers"),
+           "" if pl.get("preset") else " · and lost its own name"))
     return r
 
 
@@ -1079,7 +1291,18 @@ def main():
             print("  FAIL driver: no verdict on stdout.\n  %s\n  %s"
                   % (r.stdout[-600:], r.stderr[-600:]))
             return 1
+        # The truth was read before the browser existed. If anything wrote to
+        # the corpus while the page was being driven, every comparison below is
+        # against a corpus the page never saw — so say so loudly instead of
+        # grading a moving target and blaming the app.
+        fresh = reread_truth(box)
         results = check(report, truth)
+        results.append((
+            "the corpus did not move while the page was driven",
+            fresh["lines_read"] == truth["lines_read"],
+            "the sandbox held %d lines when the truth was read and %d when the "
+            "verdict came back — every figure here describes the first"
+            % (truth["lines_read"], fresh["lines_read"])))
     except subprocess.TimeoutExpired as e:
         # A driver that never returns is a FAILURE with a name, not a
         # traceback: the sandbox log is already gone by the time the traceback

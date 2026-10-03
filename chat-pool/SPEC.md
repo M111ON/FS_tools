@@ -2054,3 +2054,120 @@ ui_check          40/40
 pool.py demo      327/327
 run_all           12/12 suites
 ```
+
+## 24. The named views — one control that sets five axes
+
+Added 2026-10-03. The plane had grown five controls that choose its shape, and
+choosing a view meant choosing five things in the right order. The combinations
+are 3 shapes × 5 colour layers × 6 edge styles × 4 hub thresholds × any scrub
+position, and the ones that answer an actual question are a handful of them.
+
+### 24.1 One store, or two
+
+A preset that kept its own copy of the view would be a second store, and a
+second store is how a control ends up disagreeing with the picture it controls
+with nothing on screen to say which is lying. So a preset writes the **same
+fields** the five controls write, and `pvSyncControls()` repaints every one of
+them out of `PV` on every view change. `pvMode()` and `pvSetSeq()` are the two
+places every state change passes through, so both call it — no third path can
+move the state without moving the controls with it.
+
+The claim is only worth making if it can end. `pvTouched()` clears `PV.preset`
+from all eight places a reader can change one of the five (three shape buttons,
+four controls, and the scrubber behind four more: slider, ▶, the ribbon, ล่าสุด).
+A caption reading "ชนิด" over a plane the reader has since coloured by hand is
+worse than no caption, so the picker returns to "🧭 เลือกมุมมอง…" and the
+sentence disappears rather than going stale.
+
+`PV.applying` is what lets a preset edit those same fields: the name is claimed
+*before* the first repaint, and the guard keeps the scrub inside the apply from
+erasing it. Setting it at the end also passed, until a handler inside the apply
+read the name — and then the state was mid-apply while the caption described the
+view the reader was in a moment ago. A guard that nothing can reach is a guard
+that proves nothing, and one mutation here is exactly that guard deleted.
+
+### 24.2 The nine
+
+| preset | shape | colour | edges | hub | time |
+|---|---|---|---|---|---|
+| 🗺 ทั้งแผนที่ | ▦ 144 | จำนวนบรรทัด | auto | 12 | all |
+| 👤 ใครเขียน | ▦ 144 | ผู้เขียนล่าสุด | auto | 12 | all |
+| 🏷 ชนิด | ▦ 144 | ชนิดล่าสุด | auto | 12 | all |
+| 🔥 ความร้อน | ▦ 144 | จำนวนบรรทัดย่อด้วย √ | auto | 12 | all |
+| ▦ ตารางรวม | ▩ 12×12 | จำนวนบรรทัด | auto | 12 | all |
+| 🪢 เส้นทุกเส้น | ▦ 144 | จำนวนบรรทัด | flat | 60 | all |
+| 🕸 แกนกลาง | ▦ 144 | จำนวนบรรทัด | hub | 120 | all |
+| 🔍 จุดหนาแน่นสุด | ▢ 24×24 | จำนวนบรรทัด | auto | 12 | all |
+| 🕒 ไล่เวลา | ▦ 144 | ล่าสุดเมื่อไร | flat | 12 | last 25% |
+
+Between them they touch all five colour layers, all three shapes, three edge
+styles, three hub thresholds and both ends of the scrubber. Each carries one
+sentence saying what it is for, shown beside the picker and gone the moment the
+reader changes anything by hand.
+
+The window preset has no address of its own — it opens the frame at the busiest
+cell, or at the reader's own selection if they have one, which is the same rule
+the ▢ button already used. A preset cannot invent a place to look.
+
+### 24.3 The bug this work found was in the harness
+
+The kind legend check started failing on a healthy plane: `pointer` was 6 in the
+truth and 7 on the page. Nothing was wrong with either number.
+
+Opening a cell asks for `/neighbors?...&record=1`, which declares a **sighting**
+— and a sighting goes through `append()` into the very log the ground truth was
+read from. The plane is fetched when the page loads; the who/when layer is
+fetched later, after the tour has clicked cells. So the suite was grading a
+moving target and blaming the app for the gap.
+
+The fix is in the driver, installed with `Page.addScriptToEvaluateOnNewDocument`
+before navigation: `&record=1` is stripped from `/neighbors` fetches. The tour
+must not mutate the corpus it grades — a read declared as data is a write, and
+this check grades a read-only dashboard. A new assertion now says so out loud:
+*"the corpus did not move while the page was driven"*, with both line counts. If
+anything ever writes again, that fails with a number instead of the six other
+checks failing for reasons that name nothing.
+
+Re-reading the truth at the end was tried first and made five checks worse: the
+plane-based ones were then compared against a corpus the page had never loaded.
+
+### 24.4 What the checks grade
+
+`ui_check` reads `PV_PRESETS` as the literal it is — a preset table is where a
+typo is quietest (`colour:'write'` assigns a field nobody reads, the menu shows
+the label, the picture does not move) — and holds every value against the
+`<option>` lists **in the markup**, plus a sentence per preset. It also requires
+`pvSyncControls` to write all five controls, `pvMode`/`pvSetSeq` to call it, and
+`pvTouched` to be reachable from all eight hand-edit paths.
+
+`ui_browser_check` clicks all nine and reads back what the page holds *and* what
+the controls show, then holds each view against the values it declared: the
+mode it names is the grid it drew, the frame it promised is the frame it opened,
+the scrub it asked for is the tick it landed on. A sampled checksum of the canvas
+separates the nine (9 distinct over 9), and the layer a preset reads is fetched
+from scratch first, so "who wrote this" must pay for the layer the way a click
+does.
+
+```
+ui_check  43/43 · ui_browser_check 43/43 · pool.py demo 327/327 · run_all 12/12
+
+mutations 11 attempted · 11 CAUGHT
+  a preset names a colour no control offers ·
+  the controls stop being repainted from the state ·
+  pvMode stops repainting · the scrubber stops repainting ·
+  one handler keeps the name after a hand edit ·
+  the guard is gone (applying erases its own name) ·
+  a scrub inside an apply ends the claim ·
+  the sentence shown belongs to a different view ·
+  the sentence is dropped · a preset promises a frame it never opens ·
+  a preset stops asking for the layer it reads
+```
+
+Two of the eleven were **missed on the first pass and are worth recording**. The
+guard turned out to be dead code — with the name set at the end, deleting it
+changed nothing, which is §13.5 in a new place: a check asserting a guard that
+no path can reach. The fix was to move the claim to the top of the apply, which
+made the guard load-bearing and the mutation real. And the "preset picks the
+wrong shape" mutation was not a defect at all — changing a design decision is an
+edit, not a bug — so it was replaced with the failure that is: a preset that
+promises a 24-cell frame and opens the whole plane.

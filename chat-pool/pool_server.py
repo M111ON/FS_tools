@@ -733,6 +733,12 @@ button.send:disabled{opacity:.55;cursor:progress}
       <b style="font-size:13px;color:var(--acc)">แผนที่ที่อยู่ 144×144 ช่อง</b>
       <span id="plane-info" style="font:10px var(--mono);color:var(--dim)"></span>
       <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+        <!-- the ONE control that sets the five axes below it at once. It is in
+             the always-visible header rather than behind ⚙ because it is the
+             control a reader can use without knowing what any of the five are;
+             every one of them stays, and stays editable, right underneath. -->
+        <select id="pv-preset" title="เลือกมุมมองที่ตั้งค่าไว้ให้ครบทั้ง 5 แกน (รูปทรง · สี · วิธีวาดเส้น · จุดรวม · เวลา) แล้วปรับต่อได้ทีละแกนด้วย" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font:10px var(--mono);padding:2px 4px"></select>
+        <span id="pv-preset-note" style="align-self:center;color:var(--dim);font:10px var(--mono);max-width:34ch"></span>
         <button class="pbtn on" id="pv-plane" title="มองทั้งแผนที่ — เห็นแค่ว่าช่องไหนมีบรรทัดอยู่กี่บรรทัด ไม่มีเนื้อหา">▦ ทั้งแผนที่</button>
         <button class="pbtn" id="pv-blocks" title="ย่อแผนที่เหลือตาราง 12×12 — หนึ่งช่องแทน 12×12 ช่องของแผนที่">▩ ย่อ 12×12</button>
         <button class="pbtn" id="pv-block" title="เปิดกรอบเลื่อนบนแผนที่ — ลากกรอบหรือกดลูกศร วนรอบไม่รู้จบ">▢ กรอบเลื่อน</button>
@@ -1687,6 +1693,9 @@ const PV={mode:'plane',w:144,h:144,sel:null,path:[],plane:{},cells:{},origin:nul
           // sighting says "someone read here"; a trail says "I got lost here"
           // and would drown the real ones)
           walk:null,census:null,showCensus:false,trail:[],cmp:0,
+          // the named view, and the flag that says "a preset is being applied
+          // right now" so the hand-editing guard can stay out of its own way
+          preset:null,applying:false,
           // 🔍 the magnifier: a lens you CARRY over the plane, not another
           // plane scale you switch to. It is an overlay for two reasons — the
           // base view keeps its landmarks (so you can see WHICH patch is
@@ -3240,6 +3249,93 @@ function pvInfo(){
   pvRelLegend();
   pvLegend();
 }
+/* ── view presets ──────────────────────────────────────────────────────
+   Five controls choose this view by hand: the SHAPE (▦ ▢ ▩), what the
+   colour MEANS, how the edges are drawn, how many cells count as a hub,
+   and where time is parked. That is five decisions before the plane says
+   anything, and the combinations that answer an actual question are a
+   handful of the sixteen.
+
+   A preset is NOT a second set of state. It writes the same PV fields the
+   five controls write, and then the controls are repainted FROM those
+   fields. Two stores is how a control ends up disagreeing with the picture
+   it controls, with nothing on screen to say which one is lying.
+
+   So the picker claims a name only while the state still matches it: touch
+   one of the five by hand and the name is dropped (pvTouched). A caption
+   reading "ชนิด" over a plane coloured by writer is worse than no caption.
+   Every value below is one an existing <option> offers, and ui_check reads
+   these four controls out of the markup to prove it — a typo here would set
+   a field to nothing and the preset would look chosen while changing
+   nothing at all. */
+const PV_PRESETS=[
+  {id:'map',    label:'🗺 ทั้งแผนที่',       note:'ช่องไหนหนาแน่น — ค่าที่เปิดแผนที่แล้วเห็น',
+   v:{mode:'plane',colour:'density',style:'auto',hubK:12,seq:null}},
+  {id:'who',    label:'👤 ใครเขียน',         note:'สี = ผู้เขียนล่าสุดของแต่ละช่อง',
+   v:{mode:'plane',colour:'writer',style:'auto',hubK:12,seq:null}},
+  {id:'kind',   label:'🏷 ชนิด',            note:'สี = ชนิดของบรรทัดที่เขียนล่าสุดในช่องนั้น',
+   v:{mode:'plane',colour:'kind',style:'auto',hubK:12,seq:null}},
+  {id:'heat',   label:'🔥 ความร้อน',         note:'สี = จำนวนบรรทัด ย่อด้วย √ ให้ช่องหนาแน่นมากไม่กลืนที่เหลือ',
+   v:{mode:'plane',colour:'heat',style:'auto',hubK:12,seq:null}},
+  {id:'board',  label:'▦ ตารางรวม',         note:'ย่อเหลือ 12×12 — เห็นว่าก้อนไหนใหญ่ โดยไม่เห็นรายละเอียด',
+   v:{mode:'blocks',colour:'density',style:'auto',hubK:12,seq:null}},
+  {id:'edges',  label:'🪢 เส้นทุกเส้น',       note:'วาดตรง ไม่คัดจุดรวม — เห็นว่าอะไรต่ออะไร',
+   v:{mode:'plane',colour:'density',style:'flat',hubK:60,seq:null}},
+  {id:'core',   label:'🕸 แกนกลาง',          note:'เฉพาะจุดรวม 120 อันดับแรก — โครงกรามล้วน',
+   v:{mode:'plane',colour:'density',style:'hub',hubK:120,seq:null}},
+  {id:'zoom',   label:'🔍 จุดหนาแน่นสุด',     note:'เปิดกรอบ 24×24 ที่ช่องที่มีบรรทัดมากที่สุด',
+   v:{mode:'window',win:24,colour:'density',style:'auto',hubK:12,seq:null}},
+  {id:'recent', label:'🕒 ไล่เวลา',          note:'ย้อนไป 25% ท้ายคลัง แล้วดูว่างานเกิดขึ้นเมื่อไร',
+   v:{mode:'plane',colour:'recent',style:'flat',hubK:12,seqFrac:0.75}},
+];
+// One writer for the five controls the presets own. Without it the picture and
+// the controls are two stores, and this is the same failure §20.2 is about one
+// level up: a frame that lies about itself. `pvMode` runs it on every view
+// change, so no path can move the state without moving the controls with it.
+function pvSyncControls(){
+  const put=(sel,v)=>{const el=$(sel);if(el&&v!=null)el.value=String(v)};
+  put('#pv-colour',PV.colour);put('#pv-style',PV.style);put('#pv-hubk',PV.hubK);
+  put('#pv-win',PV.win);put('#pv-preset',PV.preset||'');
+  const n=$('#pv-preset-note');
+  if(n){
+    const P=PV.preset?PV_PRESETS.find(p=>p.id===PV.preset):null;
+    n.textContent=P?P.note:'';            // empty by DEFAULT: a screen with no
+    n.style.display=P?'':'none';          // preset has no sentence to read
+  }
+}
+// Touching a control the preset wrote ends the claim. Called from the handlers
+// rather than from pvMode, because pvMode is also what a preset itself runs.
+function pvTouched(){if(PV.applying)return;PV.preset=null}
+async function pvApplyPreset(id){
+  const P=PV_PRESETS.find(p=>p.id===id);
+  if(!P){PV.preset=null;pvSyncControls();return}
+  const v=P.v;
+  // Claim the name FIRST, and hold it with PV.applying for the whole apply.
+  // Setting it at the end also passes, until something in here calls a
+  // handler that reads the name — and then the state is mid-apply while the
+  // caption still describes the view the reader was in a moment ago.
+  PV.preset=P.id;PV.applying=true;
+  try{
+    if(v.colour)PV.colour=v.colour;
+    if(v.style)PV.style=v.style;
+    if(v.hubK)PV.hubK=v.hubK;
+    if(v.win)PV.win=v.win;
+    // the who/when layer the colour layers read is NOT in the counts payload,
+    // so switching to one of them from a preset has to pay for it like a click
+    if(PV.colour==='writer'||PV.colour==='recent'||PV.colour==='kind')await loadMeta();
+    if(v.mode==='window'){
+      const here=(PV.sel!=null)?PV.sel:busiestCell();
+      if(here==null){toast('ยังไม่มีข้อมูลบนแผนที่ — เลือกมุมมองอื่น');PV.preset=null;return}
+      await pvZoomBlock(here,v.win||PV.win);      // the window fetches its own frame
+    }else{
+      PV.mode=v.mode;_legendKey=null;pvFilterOptions();pvMode();
+    }
+    // time LAST: pvSetSeq repaints the frame it lands in, so setting it first
+    // would draw the new view and then immediately draw over it
+    const max=Math.max(PV.seqMax-1,0);
+    pvSetSeq(v.seq===null?max:Math.floor(max*(v.seqFrac!=null?v.seqFrac:1)));
+  }finally{PV.applying=false;pvSyncControls()}
+}
 function pvMode(){
   $('#pv-plane').classList.toggle('on',PV.mode==='plane');
   $('#pv-blocks').classList.toggle('on',PV.mode==='blocks');
@@ -3247,9 +3343,10 @@ function pvMode(){
   pvWinInfo();
   pvLensInfo();
   pvFocusBtns();
-  // the frame-size picker must show the frame that is actually drawn: the pinch
-  // and the glass both set PV.win, and a picker that disagrees is a control lying
-  if(PV_WINS.indexOf(PV.win)>=0)$('#pv-win').value=String(PV.win);
+  // Every control the presets own is repainted from PV here, not by its own
+  // handler: the pinch, the glass and a preset all set PV.win, and a picker
+  // that disagrees with the frame being drawn is a control lying (§20.2).
+  pvSyncControls();
   _legendKey=null;                         // a new view is a new legend
   pvDerive();pvDraw();pvInfo();pvPop();pvRibbon();   // popup+strip ride along
   pvFilterOptions();pvComposition();pvLensInfo();
@@ -3257,12 +3354,13 @@ function pvMode(){
 // One place that moves time, so the slider, the arrow keys, the strip and the
 // replay button can never disagree about where "now" is.
 function pvSetSeq(S){
+  pvTouched();
   clearInterval(PV.playing);PV.playing=null;$('#pv-play').textContent='▶ เล่นย้อน';
   const max=Math.max(PV.seqMax-1,0);
   PV.seq=Math.max(0,Math.min(max,S));
   if(PV.seq>=max)PV.seq=null;              // pinned at the end = the live plane
   $('#pv-seq').value=PV.seq===null?max:PV.seq;
-  pvDerive();pvDraw();pvInfo();pvWhen();pvRibbon();
+  pvDerive();pvDraw();pvInfo();pvWhen();pvRibbon();pvSyncControls();
 }
 // the who/when layer is fetched the first time a colour mode needs it, not with
 // the counts: a reader that only wants the map should not pay for the layer
@@ -3721,9 +3819,10 @@ document.addEventListener('keydown',e=>{
   if($('#plane-modal').classList.contains('open')){pvClose();return}
   if($('#side').classList.contains('open'))sideOpen(false);
 });
-$('#pv-plane').onclick=()=>{PV.mode='plane';pvMode()};
-$('#pv-blocks').onclick=()=>{PV.mode='blocks';pvMode()};
+$('#pv-plane').onclick=()=>{pvTouched();PV.mode='plane';pvMode()};
+$('#pv-blocks').onclick=()=>{pvTouched();PV.mode='blocks';pvMode()};
 $('#pv-block').onclick=()=>{
+  pvTouched();
   // entering the window needs an origin, and the honest one is the point the
   // reader is already at — a window has to be opened SOMEWHERE
   if(PV.mode==='window'&&PV.origin){pvMode();return}
@@ -3734,6 +3833,7 @@ $('#pv-block').onclick=()=>{
 };
 $('#pv-win').value=String(PV.win);
 $('#pv-win').onchange=e=>{
+  pvTouched();
   PV.win=+e.target.value;
   if(PV.mode==='window')pvMode();
   else $('#pv-block').click();       // choosing a size IS asking for the window
@@ -4014,12 +4114,20 @@ $('#pv-ctx').onchange=async e=>{
   PV.ctxOn=e.target.checked;await loadCtx();pvMode();
   if(PV.ctxOn)toast('ความจำกลางที่แชร์ไว้: '+Object.keys(PV.ctxCells).length+' ช่อง · เชื่อมข้ามระบบ '+PV.crossEdges.length+' เส้น');
 };
-$('#pv-style').onchange=e=>{PV.style=e.target.value;pvMode()};
+$('#pv-style').onchange=e=>{pvTouched();PV.style=e.target.value;pvMode()};
 // how many cells count as a hub decides how much of the graph is drawn at all.
 // 12 was tuned when a plane held a handful of edges; a real corpus puts
 // thousands here, and the ceiling — not the style — was what hid them.
 $('#pv-hubk').value=String(PV.hubK);
-$('#pv-hubk').onchange=e=>{PV.hubK=+e.target.value;pvMode()};
+$('#pv-hubk').onchange=e=>{pvTouched();PV.hubK=+e.target.value;pvMode()};
+// the picker is BUILT from PV_PRESETS, so a preset cannot be added to the code
+// and left out of the menu (or the reverse): one array, one list, one truth
+const pvPresetSel=$('#pv-preset');
+if(pvPresetSel){
+  pvPresetSel.innerHTML='<option value="">🧭 เลือกมุมมอง…</option>'
+    +PV_PRESETS.map(p=>'<option value="'+p.id+'">'+esc(p.label)+'</option>').join('');
+  pvPresetSel.onchange=e=>pvApplyPreset(e.target.value);
+}
 $('#pv-rel').onchange=e=>{PV.relColour=e.target.checked;pvDraw();pvInfo()};
 $('#pv-lens').onclick=()=>{
   const L=PV.lens;
@@ -4120,6 +4228,7 @@ $('#pv-last').onclick=()=>pvSetSeq(PV.seqMax);          // "latest" = live plane
 $('#pv-kind').onchange=async e=>{await pvPickFilt('kind',e.target.value)};
 $('#pv-app').onchange=async e=>{await pvPickFilt('app',e.target.value)};
 $('#pv-colour').onchange=async e=>{
+  pvTouched();
   PV.colour=e.target.value;
   if(PV.colour==='writer'||PV.colour==='recent'||PV.colour==='kind')await loadMeta();
   // the layer just arrived and the filter reads it too, so the list has to be

@@ -869,6 +869,29 @@ INVARIANTS = [
      "branches, not one rule. Both must stay ARRAYS: the second version made the "
      "scrubbed branch `lit=src` — an object — and then asked `lit.length`, which "
      "is undefined, so the one frame the fix existed for reported itself EMPTY"),
+    # ── the named views: a preset is a NAME, and a name can go stale
+    ("every value a named view sets is one a control offers",
+     lambda js, html: preset_values(js, html) == "",
+     lambda js, html: preset_values(js, html)),
+    ("a named view writes the fields, and the controls read them back",
+     lambda js, html: (re.search(r"function\s+pvSyncControls\s*\(\s*\)\s*\{.*?"
+                                 r"put\(\s*'\#pv-colour'.*?put\(\s*'\#pv-style'.*?"
+                                 r"put\(\s*'\#pv-hubk'.*?put\(\s*'\#pv-win'.*?"
+                                 r"put\(\s*'\#pv-preset'",
+                                 _js_function(js, "pvSyncControls"), re.S)
+                       and re.search(r"pvSyncControls\s*\(\s*\)\s*;", _js_function(js, "pvMode"))
+                       and re.search(r"pvSyncControls\s*\(\s*\)\s*;", _js_function(js, "pvSetSeq"))
+                       and re.search(r"PV\.preset\s*=\s*P\.id", _js_function(js, "pvApplyPreset"))),
+     "a preset that writes PV and leaves the five <select>s showing the old "
+     "values is two stores wearing one name: the reader changes a box and "
+     "nothing happens, or changes it and the caption keeps claiming a view "
+     "that no longer holds. pvMode and pvSetSeq are the two places every "
+     "state change passes through, so both must repaint the controls — and "
+     "pvApplyPreset must set PV.preset only AFTER pvSetSeq, which drops the "
+     "claim itself"),
+    ("a hand on any of the five ends the named view",
+     lambda js, html: preset_touched(js) == "",
+     lambda js, html: preset_touched(js)),
     ("a blocks drag keeps the pointerdown anchor",
      lambda js, html: ("PV.bOrig={x:pvB(d.bx+dw),y:pvB(d.by+dr)};" in js
                        and "bx:" not in block(js, "if(d.blocks){", "}else{")
@@ -1117,6 +1140,121 @@ def _js_arrow(js, name):
                         js.find(nl + "function ", i + 1),
                         js.find(nl + "/* ", i + 1)) if x > 0]
     return js[i:min(ends) if ends else len(js)].rstrip().rstrip(";")
+
+
+def preset_touched(js):
+    """Every control a preset writes must drop the preset's NAME when used.
+
+    The claim is only worth making if it can end. Otherwise the menu keeps
+    saying "ชนิด" over a plane the reader has since coloured by hand — a
+    caption that lies, which is §20.2 again one level up, and the same defect
+    as a control disagreeing with the picture it controls.
+
+    The handlers are inline arrows, not named functions, so this is matched
+    through _code_matches: the block comment above the presets explains the
+    rule and would otherwise satisfy every pattern here by itself.
+    """
+    guard = re.search(r"if\s*\(\s*PV\.applying\s*\)\s*return\s*;\s*PV\.preset\s*=\s*null",
+                      _js_function(js, "pvTouched"))
+    if not guard:
+        return ("pvTouched must clear PV.preset and must stand down while a "
+                "preset is being applied — otherwise applying one would "
+                "immediately erase its own name")
+    want = {
+        "#pv-plane":  r"\$\('#pv-plane'\)\.onclick\s*=\s*\(\s*\)\s*=>\s*\{\s*pvTouched\s*\(\s*\)\s*;",
+        "#pv-blocks": r"\$\('#pv-blocks'\)\.onclick\s*=\s*\(\s*\)\s*=>\s*\{\s*pvTouched\s*\(\s*\)\s*;",
+        "#pv-block":  r"\$\('#pv-block'\)\.onclick\s*=\s*\(\s*\)\s*=>\s*\{\s*pvTouched\s*\(\s*\)\s*;",
+        "#pv-win":    r"\$\('#pv-win'\)\.onchange\s*=\s*e\s*=>\s*\{\s*pvTouched\s*\(\s*\)\s*;",
+        "#pv-style":  r"\$\('#pv-style'\)\.onchange\s*=\s*e\s*=>\s*\{pvTouched\s*\(\s*\)\s*;",
+        "#pv-hubk":   r"\$\('#pv-hubk'\)\.onchange\s*=\s*e\s*=>\s*\{pvTouched\s*\(\s*\)\s*;",
+        "#pv-colour": r"\$\('#pv-colour'\)\.onchange\s*=\s*async\s+e\s*=>\s*\{\s*pvTouched\s*\(\s*\)\s*;",
+    }
+    lost = [sel for sel, pat in want.items() if not _code_matches(js, pat)]
+    # the scrubber is one function behind four controls (slider, replay, the
+    # strip, "latest"), so it needs one check rather than four
+    if not re.search(r"pvTouched\s*\(\s*\)\s*;", _js_function(js, "pvSetSeq")):
+        lost.append("pvSetSeq (the scrubber: slider · ▶ เล่นย้อน · แถบเวลา · ล่าสุด)")
+    return ("these can be changed by hand without the view losing its name: "
+            + ", ".join(lost)) if lost else ""
+
+
+def _select_options(html, sel_id):
+    """The value of every <option> inside one <select>, from the MARKUP.
+
+    Read here rather than from PV, deliberately: the point is that a preset's
+    values have to be values a reader can also reach by hand. A check that read
+    the list out of the same constant the presets are built from would agree
+    with itself forever.
+    """
+    m = re.search(r'id="%s"[^>]*>(.*?)</select>' % sel_id, html, re.S)
+    return set(re.findall(r'<option value="([^"]*)"', m.group(1))) if m else None
+
+
+def preset_values(js, html):
+    """Every value PV_PRESETS names must be one an existing control offers.
+
+    A preset is a table of strings, and a typo in a table is the quietest kind
+    of bug there is: `colour:'write'` assigns a field nobody reads, the menu
+    shows "ใครเขียน", the picture is unchanged, and every check that computes
+    something still passes. So this parses the literal array and holds each
+    value against the <option> lists in the markup — the four axes the presets
+    own, plus the shape.
+
+    Parsed, not pattern-matched, because a comment describing the typo would
+    otherwise satisfy a regex (§13.5). Nothing here can be satisfied by prose:
+    it reads `id:'map'` and `colour:'writer'` or it finds nothing.
+    """
+    i = js.find("const PV_PRESETS=[")
+    if i < 0:
+        return ("PV_PRESETS must still be in the script: without it the view "
+                "menu is a list of labels with nothing behind them")
+    j = js.find(chr(10) + "];", i)
+    if j < 0:
+        return "PV_PRESETS is not a literal array any more, and this check " \
+               "reads it as one — rewrite it or teach the check the new shape"
+    arr = js[i:j]
+    ids = re.findall(r"\{id:'([^']+)'", arr)
+    if not ids:
+        return "PV_PRESETS holds no {id:…} entries, so nothing can be chosen"
+    opts = {k: _select_options(html, k) for k in ("pv-colour", "pv-style",
+                                                  "pv-hubk", "pv-win")}
+    field = {"colour": "pv-colour", "style": "pv-style", "hubK": "pv-hubk",
+             "win": "pv-win"}
+    bad = []
+    if len(set(ids)) != len(ids):
+        bad.append("two presets share an id: %s" % ids)
+    for pid, body in re.findall(r"\{id:'([^']+)'.*?v:\{([^}]*)\}", arr, re.S):
+        got = {}
+        for k, s, n in re.findall(r"(\w+):(?:'([^']*)'|(-?[\d.]+|null))", body):
+            got[k] = s if s != "" or n == "" else n
+            if n:
+                # an int stays an int: `hubK:12` written 12.0 fails the option
+                # list it is supposed to be in, which is the same class of
+                # mistake as the typo this check exists for
+                got[k] = None if n == "null" else (float(n) if "." in n else int(n))
+        for k in got:
+            if k not in ("mode", "colour", "style", "hubK", "win", "seq",
+                         "seqFrac"):
+                bad.append("%s sets %r, which no control and no field reads"
+                           % (pid, k))
+        if "mode" in got and got["mode"] not in ("plane", "blocks", "window"):
+            bad.append("%s names the shape %r, which is not one of the three "
+                       "buttons" % (pid, got["mode"]))
+        for k, sel in field.items():
+            if k in got and opts[sel] is None:
+                bad.append("#%s is gone, so %s has nothing to be true of"
+                           % (sel, pid))
+            elif k in got and str(got[k]) not in opts[sel]:
+                bad.append("%s sets %s=%r and #%s offers %s"
+                           % (pid, k, got[k], sel, sorted(opts[sel] or ())))
+    # every preset must say something, or the menu is nine identical pictures
+    notes = re.findall(r"note:'([^']*)'", arr)
+    if len(notes) != len(ids):
+        bad.append("%d presets carry %d sentences; each one must say what it "
+                   "is showing" % (len(ids), len(notes)))
+    elif any(not n.strip() for n in notes):
+        bad.append("a preset with an empty sentence")
+    return "; ".join(bad[:6])
 
 
 def kind_list(js):
