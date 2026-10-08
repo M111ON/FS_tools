@@ -2,5 +2,7 @@ build/
 *.exe
 *.o
 *.obj
-data/lz_route.log
+data/**/lz_route.log
 data/*.log
+# derived corpora (rebuild with scripts/build_index.py + POST /v1/state/regrow)
+data/memcore/

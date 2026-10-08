@@ -468,6 +468,88 @@ static int lz_mem_search(const float *qv, int qd,
     return nh;
 }
 
+/* ── anchor regrow hook (ported from gguf_lazy_serve.c L632-707) ──
+ * Trains anchors over the current index, writes PATH_ANCH (atomic + checksum),
+ * posts every entry into its top-2 buckets, writes the placement perm to
+ * PATH_ORDER, and rewrites PATH_INDEX with anchor/anchor2 fields added.
+ * This is what makes a fresh base index (sid/file/npast/dim/vec) routable. */
+static int lz_anchor_refresh(int *Kout, int *nout) {
+    if (Kout) *Kout = 0;
+    LZEntry *a = NULL;
+    int n = 0;
+    lz_index_load(&a, &n);
+    if (nout) *nout = n;
+    int rc = 1;
+    if (n >= LZ_ANCH_MIN && a[0].dim > 0 && a[0].dim <= ANCHR_MAXD) {
+        int dim = a[0].dim, K = n >= 64 ? 8 : n >= 32 ? 4 : 2;
+        if (K > LZ_ANCH_MAXK) K = LZ_ANCH_MAXK;
+        int m = 0;
+        for (int i = 0; i < n; i++) if (a[i].dim == dim) m++;
+        if (m >= K) {
+            float *X = (float *)malloc((size_t)m * dim * sizeof(float));
+            float *C = (float *)malloc((size_t)K * dim * sizeof(float));
+            int *rows = (int *)malloc((size_t)n * sizeof(int));
+            int *rows2 = (int *)malloc((size_t)n * sizeof(int));
+            if (X && C && rows && rows2) {
+                int w = 0;
+                for (int i = 0; i < n; i++)
+                    if (a[i].dim == dim) { memcpy(X + (size_t)w * dim, a[i].vec, (size_t)dim * sizeof(float)); w++; }
+                if (anch_train(X, m, dim, K, C, NULL) == 0 &&
+                    anch_save_atomic(PATH_ANCH, C, K, dim, n) == 0) {
+                    int okv = 0;
+                    float *V = (float *)malloc((size_t)K * dim * sizeof(float));
+                    if (V) {
+                        int vd = 0, vn = 0;
+                        okv = (anch_load(PATH_ANCH, V, K, dim, &vd, &vn) == K &&
+                               vd == dim && vn == n &&
+                               memcmp(V, C, (size_t)K * dim * sizeof(float)) == 0);
+                        free(V);
+                    }
+                    if (okv) {
+                        int t2[LZ_ANCH_MAXK];
+                        for (int i = 0; i < n; i++) {
+                            if (a[i].dim != dim) { rows[i] = -1; rows2[i] = -1; continue; }
+                            int nb = anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2);
+                            rows[i] = nb > 0 ? t2[0] : -1;
+                            rows2[i] = nb > 1 ? t2[1] : -1;
+                        }
+                        uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+                        if (perm && anch_perm(rows, n, K, perm) == 0) {
+                            FILE *of = fopen(PATH_ORDER, "wb");
+                            if (of) { fwrite(perm, sizeof(uint32_t), (size_t)n, of); fclose(of); }
+                            char tmp[512];
+                            snprintf(tmp, sizeof(tmp), "%s.tmp", PATH_INDEX);
+                            FILE *ix = fopen(tmp, "w");
+                            if (ix) {
+                                for (int i = 0; i < n; i++) {
+                                    fprintf(ix, "{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"anchor\":%d,\"anchor2\":%d,\"dim\":%d,\"vec\":[",
+                                            a[i].sid, a[i].file, a[i].npast, rows[i], rows2[i], a[i].dim);
+                                    for (int vi = 0; vi < a[i].dim; vi++)
+                                        fprintf(ix, "%s%.6g", vi ? "," : "", (double)a[i].vec[vi]);
+                                    fprintf(ix, "]}\n");
+                                }
+                                fclose(ix);
+                                remove(PATH_INDEX);
+                                rename(tmp, PATH_INDEX);
+                                if (Kout) *Kout = K;
+                                rc = 0;
+                            }
+                            free(perm);
+                        }
+                    } else rc = -1;
+                }
+            }
+            free(X); free(C); free(rows); free(rows2);
+        }
+    } else if (n < LZ_ANCH_MIN) {
+        remove(PATH_ANCH);
+        remove(PATH_ORDER);
+    }
+    lz_index_free(a, n);
+    if (rc == 0) { lz_index_cache_invalidate(); lz_route_cache_invalidate(); }
+    return rc;
+}
+
 /* ── GET /health ── */
 static int handle_health(sock_t cli) {
     LZEntry *ents = NULL; int nent = 0;
@@ -631,6 +713,16 @@ int main(int argc, char **argv) {
         sscanf(rq, "%15s %255s", method, path);
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
             handle_health(cli);
+        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/regrow") == 0) {
+            int rK = 0, rN = 0;
+            int rrc = lz_anchor_refresh(&rK, &rN);
+            const char *rmode = rrc == 0 ? "anchor" : (rrc == 1 ? "brute" : "error");
+            char rresp[256];
+            int rrlen = snprintf(rresp, sizeof(rresp),
+                "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d}",
+                rrc < 0 ? "error" : "ok", rmode, rN, rK);
+            lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
+            sock_close(cli);
         } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search") == 0) {
             handle_search(cli, rq);
         } else {

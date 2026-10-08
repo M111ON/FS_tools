@@ -82,6 +82,41 @@ curl -s -X POST -H "Content-Type: application/json" \
 silent clamp. See `FORK.md` for the one behaviour change vs upstream and the
 carried upstream test issue.
 
+## Integrations
+
+### memcore → ANN (built and measured 2026-10-08)
+
+memcore (`I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3`) already stores
+`multilingual-e5-small` vectors at dim 384 — the same model this server's
+sidecar serves — so its 57,076 entries index **without re-embedding**:
+
+```sh
+# 1. base index from the store (no embedding; reads stored vec blobs)
+python scripts/build_index.py --out data/memcore/kv_index.jsonl
+
+# 2. train anchors + place + write the anchor fields (server-side)
+ANN_INDEX_PATH=data/memcore/kv_index.jsonl \
+ANN_ANCH_PATH=data/memcore/kv_anchors.bin \
+ANN_ORDER_PATH=data/memcore/kv_index.order \
+  ./build/ann_search.exe --serve 8099
+curl -s -X POST http://127.0.0.1:8099/v1/state/regrow    # ~60 s on 57k
+```
+
+Measured on 57,076 entries:
+
+| | wall | note |
+|---|---|---|
+| memcore `v2.search` | **568 ms** (7.9 s cold) | rebuilds the 57k×384 matrix every call |
+| this server | **~60 ms** | index cached; exact cosine over the whole set |
+
+Recall: top-5 **identical to an independent numpy cosine oracle** on every
+query tested (4/4). The anchor route does not prune (scores all 57k) — this is
+exact recall, the win is caching + no matrix rebuild, not approximation.
+
+`npast` in a memcore-built index is the content character length (the index
+format has no other field for it). To map a hit back to memcore, the `sid` is
+the memcore `entries.id`.
+
 ## Known limits (inherited, measured upstream)
 
 - Anchor route does **not** prune: a query scores the whole index (`items_scored
