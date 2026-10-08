@@ -231,6 +231,9 @@ present, else the shipped sample. `chat-pool`'s `GET /semantic` defaults to
 
 ## Embed-input sanitizer (tokenizer vocab gap) — always on
 
+See [`EMBEDDERS.md`](EMBEDDERS.md) for the full embedder map (ONNX vs GGUF, speed,
+drift, the e5 prefix rule). Summary of the sanitizer below.
+
 The `multilingual-e5-small` GGUF tokenizer has holes: some codepoints make the
 sidecar's `/embedding` return **500** (`invalid unordered_map<K,T> key`), which the
 server surfaced as `503 embed_unavailable`. The big one is **U+0E33 (Thai SARA AM,
