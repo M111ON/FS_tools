@@ -6,6 +6,8 @@ data/**/lz_route.log
 data/*.log
 # derived corpora (rebuild with scripts/build_index.py + POST /v1/state/regrow)
 data/memcore/
+# derived graft bias tables (rebuild with scripts/graft_bias.py)
+data/graft/
 # runtime (supervisor)
 .keepalive.pid
 .keepalive.log

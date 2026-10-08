@@ -266,7 +266,16 @@ static inline uint32_t lz_fog_id(int bucket) {
 #define LZ_ROUTE_HEADROOM_DEF 4
 #define LZ_SEARCH_BUDGET_DEF 512
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
-typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; } LZEntry;
+typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; int goff; int gn; } LZEntry;
+
+/* graft bias hooks (defined after lz_mem_search; used inside it) */
+static void graft_init(LZEntry *ents, int nent);
+static float graft_bias(const LZEntry *e, const int *qkeys, int qn);
+static void graft_query_keys(const char *q);
+static int g_graft_on = 0;                 /* master switch (env ANN_GRAFT) */
+static int g_qkeys[16], g_qn = 0;          /* query-side file keys, per request */
+static int g_graft_ready = 0;              /* bias tables loaded (or off) */
+static void graft_ensure_init(void);       /* loads the tables once */
 
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
@@ -417,6 +426,7 @@ static int lz_mem_search(const float *qv, int qd,
     LZEntry *ents = NULL;
     int nent = 0;
     int use_cache = lz_index_cached(&ents, &nent);
+    if (!g_graft_ready) graft_init(ents, nent);   /* load bias tables once */
     char rm[16];
     snprintf(rm, sizeof(rm), "%s", "brute");
     int rb[ANN_MAXK];
@@ -476,6 +486,10 @@ static int lz_mem_search(const float *qv, int qd,
             double dot = 0;
             for (int wi = 0; wi < qd; wi++) dot += (double)qv[wi] * ents[ei].vec[wi];
             double sc = (ents[ei].norm > 0) ? dot / (qn * ents[ei].norm) : -1;
+            /* Confident Guideline: a soft cluster bias (never a filter). It only
+             * ADDS to the score, so recall cannot drop; ranking is nudged toward
+             * structurally-related entries. Off unless ANN_GRAFT=1. */
+            if (g_graft_on) sc += graft_bias(&ents[ei], g_qkeys, g_qn);
             scored++;
             for (int ti = 0; ti < topk; ti++) {
                 if (sc > top_sc[ti]) {
@@ -525,6 +539,273 @@ static int lz_mem_search(const float *qv, int qd,
     int nh = 0;
     if (top_sc) for (int ti = 0; ti < topk && top_sc[ti] > -2; ti++) nh++;
     return nh;
+}
+
+/* ── Confident Guideline (graft cluster bias) ─────────────────────────
+ * A SOFT bias built from graft's file-relationship graph: entries that mention
+ * a file in the query's neighborhood get score + lambda*affinity, so the
+ * ordering is nudged toward the structurally-related cluster — NEVER a filter,
+ * so recall cannot drop. Disabled by default; tune at runtime via env:
+ *   ANN_GRAFT=0|1        master switch (default 0)
+ *   ANN_GRAFT_DIR        dir with nb.tsv / keys.tsv (default data/graft)
+ *   ANN_GRAFT_LAMBDA     bias strength (default 0.05; 0 = off)
+ *   ANN_GRAFT_MAXN       max file keys per entry (default 4)
+ * Weights live in data/graft/bias.json, produced by scripts/graft_bias.py —
+ * change the model there and re-run, no rebuild. */
+static float g_graft_lambda = 0.05f;
+static int g_graft_maxn = 4;
+/* neighbor table: CSR by file id — rows g_nb_off[f]..g_nb_off[f+1] -> (id,score) */
+static int *g_nb_off = NULL;          /* size g_nb_nf+1 */
+static int *g_nb_id = NULL;
+static float *g_nb_sc = NULL;
+static int g_nb_nf = 0, g_nb_n = 0;
+/* entry -> file keys: parallel arrays indexed by entry position */
+static int *g_ent_goff = NULL, *g_ent_gn = NULL, *g_ent_gkeys = NULL, g_ent_n = 0;
+/* path -> file id, from files.tsv */
+static char **g_fnames = NULL;
+static int g_fn_cap = 0;
+/* sid -> entry position hash (built once) */
+static int *g_sid_hash = NULL;
+static int g_sid_cap = 0;
+static LZEntry *g_ents_ref = NULL;
+
+static int graft_file_id(const char *path) {
+    for (int i = 0; i < g_fn_cap; i++)
+        if (g_fnames[i] && strcmp(g_fnames[i], path) == 0) return i;
+    return -1;
+}
+
+static void graft_load_files(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        int id = atoi(line);
+        char *name = tab + 1;
+        size_t l = strlen(name);
+        while (l && (name[l-1] == '\n' || name[l-1] == '\r')) name[--l] = '\0';
+        if (id >= g_fn_cap) {
+            int nc = g_fn_cap ? g_fn_cap : 1024;
+            while (nc <= id) nc *= 2;
+            g_fnames = (char **)realloc(g_fnames, (size_t)nc * sizeof(char *));
+            for (int i = g_fn_cap; i < nc; i++) g_fnames[i] = NULL;
+            g_fn_cap = nc;
+        }
+        free(g_fnames[id]);
+        g_fnames[id] = strdup(name);
+    }
+    fclose(f);
+}
+
+/* extract repo-path-ish tokens from a query string -> file ids. Matches the
+ * same shape scripts/graft_bias.py keys on (core/x.h, tools/y.c, docs/z.md). */
+static void graft_query_keys(const char *q) {
+    g_qn = 0;
+    if (!g_graft_on || !q) return;
+    static const char *exts[] = {".h", ".c", ".py", ".md", ".jsonl", NULL};
+    for (const char *p = q; *p && g_qn < 16; p++) {
+        if (!(p == q || p[-1] == ' ' || p[-1] == '(' || p[-1] == '`' || p[-1] == '"')) continue;
+        const char *slash = strchr(p, '/');
+        if (!slash || slash - p > 24) continue;
+        const char *e = p;
+        while (*e && *e != ' ' && *e != ')' && *e != ',' && *e != '"' && *e != '`' && *e != '\t' && *e != '\n') e++;
+        int ok = 0;
+        for (int i = 0; exts[i]; i++) {
+            size_t l = strlen(exts[i]);
+            if ((size_t)(e - p) > l && strncmp(e - l, exts[i], l) == 0) { ok = 1; break; }
+        }
+        if (!ok) continue;
+        char tok[256];
+        int tl = (int)(e - p); if (tl > 255) tl = 255;
+        memcpy(tok, p, (size_t)tl); tok[tl] = '\0';
+        int fid = graft_file_id(tok);
+        if (fid >= 0) {
+            int dup = 0;
+            for (int i = 0; i < g_qn; i++) if (g_qkeys[i] == fid) dup = 1;
+            if (!dup) g_qkeys[g_qn++] = fid;
+        }
+        p = e - 1;
+    }
+}
+
+static void graft_free(void) {
+    free(g_nb_off); g_nb_off = NULL;
+    free(g_nb_id); g_nb_id = NULL;
+    free(g_nb_sc); g_nb_sc = NULL;
+    free(g_ent_goff); g_ent_goff = NULL;
+    free(g_ent_gn); g_ent_gn = NULL;
+    free(g_ent_gkeys); g_ent_gkeys = NULL;
+    free(g_sid_hash); g_sid_hash = NULL;
+    for (int i = 0; i < g_fn_cap; i++) free(g_fnames[i]);
+    free(g_fnames); g_fnames = NULL;
+    g_nb_nf = g_nb_n = g_ent_n = g_sid_cap = g_fn_cap = 0;
+    g_ents_ref = NULL;
+    g_graft_ready = 0;
+}
+
+typedef struct { int fid, dst; float sc; } NbTriple;
+static int _nb_cmp(const void *a, const void *b) {
+    return ((const NbTriple *)a)->fid - ((const NbTriple *)b)->fid;
+}
+
+/* load nb.tsv: rows "<fid>\t<dst>:<score>\t..." -> CSR by fid */
+static void graft_load_nb(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[65536];
+    int cap = 0, n = 0, maxf = 0;
+    NbTriple *tr = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        int fid = atoi(line);
+        if (fid > maxf) maxf = fid;
+        const char *p = strchr(line, '\t');
+        while (p) {
+            p++;
+            int dst = atoi(p);
+            const char *c = strchr(p, ':');
+            float sc = c ? (float)atof(c + 1) : 0.0f;
+            if (n == cap) { cap = cap ? cap * 2 : 4096;
+                tr = (NbTriple *)realloc(tr, (size_t)cap * sizeof(NbTriple)); }
+            tr[n].fid = fid; tr[n].dst = dst; tr[n].sc = sc; n++;
+            p = strchr(p, '\t');
+        }
+    }
+    fclose(f);
+    qsort(tr, (size_t)n, sizeof(NbTriple), _nb_cmp);
+    g_nb_nf = maxf + 1;
+    g_nb_off = (int *)calloc((size_t)g_nb_nf + 1, sizeof(int));
+    g_nb_id = (int *)malloc((size_t)(n ? n : 1) * sizeof(int));
+    g_nb_sc = (float *)malloc((size_t)(n ? n : 1) * sizeof(float));
+    g_nb_n = n;
+    for (int i = 0; i < n; i++) { g_nb_id[i] = tr[i].dst; g_nb_sc[i] = tr[i].sc; }
+    /* CSR offsets: off[f] = first index with fid>=f (dense, handles gaps) */
+    int j = 0;
+    for (int f = 0; f < g_nb_nf; f++) {
+        while (j < n && tr[j].fid < f) j++;
+        g_nb_off[f] = j;
+    }
+    g_nb_off[g_nb_nf] = n;
+    free(tr);
+}
+
+/* sid -> entry position hash (open addressing). Built once from the entries. */
+static unsigned _fnv(const char *s) {
+    unsigned h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
+}
+
+static void graft_build_sid_hash(LZEntry *ents, int nent) {
+    int cap = 1; while (cap < nent * 2) cap <<= 1;
+    g_sid_cap = cap;
+    g_ents_ref = ents;
+    g_sid_hash = (int *)malloc((size_t)cap * sizeof(int));
+    for (int i = 0; i < cap; i++) g_sid_hash[i] = -1;
+    for (int e = 0; e < nent; e++) {
+        unsigned m = (unsigned)cap - 1, i = _fnv(ents[e].sid) & m;
+        for (unsigned k = 0; k < (unsigned)cap; k++) {
+            unsigned s = (i + k) & m;
+            if (g_sid_hash[s] < 0) { g_sid_hash[s] = e; break; }
+        }
+    }
+}
+
+static int graft_sid_pos(const char *sid) {
+    if (!g_sid_hash || !g_ents_ref) return -1;
+    unsigned m = (unsigned)g_sid_cap - 1, i = _fnv(sid) & m;
+    for (unsigned k = 0; k < (unsigned)g_sid_cap; k++) {
+        unsigned s = (i + k) & m;
+        if (g_sid_hash[s] < 0) return -1;
+        if (strcmp(g_ents_ref[g_sid_hash[s]].sid, sid) == 0) return g_sid_hash[s];
+    }
+    return -1;
+}
+
+/* load keys.tsv: rows "<sid>\t<fid>\t<fid>..." -> per-entry key runs */
+static void graft_load_keys(const char *path, LZEntry *ents, int nent) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    graft_build_sid_hash(ents, nent);
+    int cap = 0, n = 0;
+    int *gkeys = NULL;
+    char line[65536];
+    while (fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        char *sid = line;
+        int kstart = n;
+        char *p = tab + 1;
+        while (*p) {
+            int id = atoi(p);
+            if (n == cap) { cap = cap ? cap * 2 : 4096;
+                gkeys = (int *)realloc(gkeys, (size_t)cap * sizeof(int)); }
+            gkeys[n++] = id;
+            p = strchr(p, '\t');
+            if (!p) break;
+            p++;
+        }
+        int kn = n - kstart;
+        if (kn > g_graft_maxn) kn = g_graft_maxn;
+        int pos = graft_sid_pos(sid);
+        if (pos >= 0) { ents[pos].goff = kstart; ents[pos].gn = kn; }
+    }
+    fclose(f);
+    g_ent_gkeys = gkeys; g_ent_n = n;
+}
+
+static void graft_init(LZEntry *ents, int nent) {
+    graft_free();
+    const char *on = getenv("ANN_GRAFT");
+    if (!on || !atoi(on)) { g_graft_ready = 1; return; }   /* off by design */
+    g_graft_on = 1;
+    const char *le = getenv("ANN_GRAFT_LAMBDA");
+    if (le) g_graft_lambda = (float)atof(le);
+    const char *me = getenv("ANN_GRAFT_MAXN");
+    if (me && atoi(me) > 0) g_graft_maxn = atoi(me);
+    const char *dir = getenv("ANN_GRAFT_DIR");
+    char nbp[512], kp[512], fp[512];
+    snprintf(nbp, sizeof(nbp), "%s/nb.tsv", dir && dir[0] ? dir : "data/graft");
+    snprintf(kp, sizeof(kp), "%s/keys.tsv", dir && dir[0] ? dir : "data/graft");
+    snprintf(fp, sizeof(fp), "%s/files.tsv", dir && dir[0] ? dir : "data/graft");
+    graft_load_files(fp);
+    graft_load_nb(nbp);
+    graft_load_keys(kp, ents, nent);
+    g_graft_ready = 1;
+    fprintf(stderr, "[ann_search] graft bias ON lambda=%.3f files=%d entries_with_keys=%d\n",
+            g_graft_lambda, g_fn_cap, g_ent_n);
+}
+
+/* called at request time, before query keys are needed (index may not have
+ * been loaded at boot, and env must be read before the first query). */
+static void graft_ensure_init(void) {
+    if (g_graft_ready) return;
+    LZEntry *ents = NULL; int nent = 0;
+    lz_index_cached(&ents, &nent);
+    graft_init(ents, nent);
+}
+
+/* soft bias for one entry: sum over the entry's file keys of the neighborhood
+ * score of any key shared with the query's keys. Returns 0 when off/absent. */
+static float graft_bias(const LZEntry *e, const int *qkeys, int qn) {
+    if (!g_graft_on || !g_graft_ready || e->gn <= 0 || qn <= 0) return 0.0f;
+    float best = 0.0f;
+    for (int i = 0; i < e->gn; i++) {
+        int k = g_ent_gkeys[e->goff + i];
+        for (int j = 0; j < qn; j++) {
+            if (k == qkeys[j]) return g_graft_lambda;   /* exact file match */
+            /* neighbor of the query key? */
+            int a = g_nb_off[k], b = g_nb_off[k + 1];
+            for (int t = a; t < b; t++) if (g_nb_id[t] == qkeys[j]) {
+                float v = g_graft_lambda * g_nb_sc[t];
+                if (v > best) best = v;
+            }
+        }
+    }
+    return best;
 }
 
 /* ── anchor regrow hook (ported from gguf_lazy_serve.c L632-707) ──
@@ -645,9 +926,8 @@ static int handle_health(sock_t cli) {
 }
 
 /* parse a JSON float array field ("vec":[f,f,...]); returns count or 0.
- * Used so a caller can send its OWN query vector instead of having the sidecar
- * embed the text — then the query vector and the stored vectors come from the
- * same model, and the ranking is exactly the caller's. */
+ * Lets a caller send its OWN query vector instead of having the sidecar embed
+ * the text, so ranking uses the caller's model. */
 static int lz_json_float_array(const char *json, const char *key, float *out, int cap) {
     char pat[128];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -733,6 +1013,8 @@ static int handle_search(sock_t cli, const char *rq) {
     qd = lz_json_float_array(bd3, "vec", qv, 1024);
     if (qd <= 0 && sq[0]) qd = lz_embed(sq, qv, 1024);
     if (qd > 0) {
+        graft_ensure_init();    /* tables must exist before extracting keys */
+        graft_query_keys(sq);   /* extract the query's file keys for the bias */
         char top_sid[ANN_MAXK][64]; char top_file[ANN_MAXK][256];
         int top_np[ANN_MAXK]; double top_sc[ANN_MAXK];
         char route_mode[16];

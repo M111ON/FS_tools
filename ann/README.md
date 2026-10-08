@@ -117,6 +117,44 @@ exact recall, the win is caching + no matrix rebuild, not approximation.
 format has no other field for it). To map a hit back to memcore, the `sid` is
 the memcore `entries.id`.
 
+## Confident Guideline (graft cluster bias) — OPTIONAL, OFF by default
+
+A soft ranking bias built from **graft's file-relationship graph**. Entries
+that mention a file in the query's neighborhood get `score + λ·affinity`, so
+ordering leans toward the structurally-related cluster. It is **never a
+filter** — the bias only ADDS, so the scored candidate set is unchanged and
+recall cannot drop.
+
+```sh
+# build the bias tables from graft's wiring graph (re-run after the graph moves)
+python scripts/graft_bias.py
+python scripts/graft_bias.py --mode 2hop --damp 0.5      # try other forms
+python scripts/graft_bias.py --rel calls=1.0,imports=0.7,extends=0.9,contains=0.4
+
+# turn it on (default OFF)
+ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
+```
+
+| env | default | meaning |
+|---|---|---|
+| `ANN_GRAFT` | `0` | master switch |
+| `ANN_GRAFT_LAMBDA` | `0.05` | bias strength (0 = off) |
+| `ANN_GRAFT_MAXN` | `4` | max file keys per entry |
+| `ANN_GRAFT_DIR` | `data/graft` | tables dir |
+
+Model (relation/confidence weights, neighbor mode `direct|2hop|max|sum`, damp,
+k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.
+
+**Measured** (57k index, 40 queries that name a file, direct mode): cluster
+share in top-10 rose 0.395 → 0.83 at λ=0.05, but the top-10 order also
+changed ~44% — λ=0.02 is the conservative point (+22% cluster, 22% reorder).
+
+**Tombstone is the amplifier.** This bias is the *structural* axis (which code
+a query is about — static, baked). The fog latch / tombstone is the *hot/cold*
+axis (which routes were just walked — changes per query). They compose: a route
+the tombstone keeps warm can carry a stronger cluster weight later. Keep them
+separate.
+
 ## Run as a service (Windows)
 
 The server is kept alive by a supervisor + a Task Scheduler entry, the same
