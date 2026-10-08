@@ -1,0 +1,6 @@
+build/
+*.exe
+*.o
+*.obj
+data/lz_route.log
+data/*.log
