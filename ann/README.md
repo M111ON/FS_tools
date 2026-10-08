@@ -229,5 +229,21 @@ present, else the shipped sample. `chat-pool`'s `GET /semantic` defaults to
 - `LZ_ANCH_MAXK = 8` caps routing buckets while N grows.
 - Wins on index **memory** and build time, not query latency (loses ~84× to HNSW).
 
+## Embed-input sanitizer (tokenizer vocab gap) — always on
+
+The `multilingual-e5-small` GGUF tokenizer has holes: some codepoints make the
+sidecar's `/embedding` return **500** (`invalid unordered_map<K,T> key`), which the
+server surfaced as `503 embed_unavailable`. The big one is **U+0E33 (Thai SARA AM,
+the "ำ" in "ทำ")**; Thai-block gaps (`U+0E3B/0E3C/0E4E/0E5B`, `U+0E5C..U+0E7F`),
+several math symbols, and even **`\n`/`\t`/`\r`** do the same.
+
+`lz_sanitize()` in `ann_search.c` normalizes the text before it reaches the
+sidecar: U+0E33 → U+0E4D U+0E32 (NFKC), an ASCII map for the symbols, drop for the
+remaining Thai holes, control/whitespace → space. It is the C twin of
+`scripts/build_index.py:sanitize`. Meaning-preserving; a no-op for English.
+
+Measured: raw `ระบบนี้ทำงานยังไง` → sidecar **500**; sanitized → **200**. English
+top-1 unchanged (`51b0fc3f…`), so no ranking regression.
+
 Next levers live upstream and are ported on demand: tombstone warm path, maze
 refine layer. Do not raise `ANCHR_MAXK` expecting pruning — measured negative.

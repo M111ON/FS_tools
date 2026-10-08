@@ -203,6 +203,88 @@ static int lz_http_post(const char *host, int port, const char *path,
     sock_close(fd);
     return total;
 }
+/* ── embed-input sanitizer (tokenizer vocab gap) ──────────────────────
+ * The multilingual-e5-small GGUF tokenizer has holes: some codepoints make
+ * llama-server /embedding return 500 ("invalid unordered_map<K,T> key"). The
+ * main one is U+0E33 (Thai SARA AM, the "ำ" in "ทำ"); the Thai block gaps
+ * (U+0E3B/0E3C/0E4E/0E5B, U+0E5C..U+0E7F) and several math symbols do the same.
+ * The index build side already normalizes with the SAME rule
+ * (scripts/build_index.py:sanitize), so a query must be normalized identically
+ * or the query text and the indexed text live in different spaces. This is the
+ * C twin of that function: NFKC-lite for the codepoints NFKC actually fixes
+ * (U+0E33 -> U+0E4D U+0E32, a 1->2 byte expansion) plus an ASCII map for the
+ * symbols NFKC leaves alone, and a drop for the remaining Thai-block holes.
+ * Meaning-preserving; no-op for English/plain ASCII. */
+static int lz_is_thai_hole(unsigned cp) {
+    /* Thai block codepoints the e5 GGUF tokenizer 500s on (measured), minus
+     * U+0E33 which is decomposed by the NFKC-lite pass above it. */
+    if (cp == 0x0E3B || cp == 0x0E3C || cp == 0x0E4E || cp == 0x0E5B) return 1;
+    if (cp >= 0x0E5C && cp <= 0x0E7F) return 1;
+    return 0;
+}
+static const char *lz_ascii_map(unsigned cp) {
+    switch (cp) {
+        case 0x2209: return " not in ";
+        case 0x220B: return " contains ";
+        case 0x2216: return " minus ";
+        case 0x221D: return " proportional to ";
+        case 0x2224: return " does not divide ";
+        case 0x2245: return " ~= ";
+        case 0x22C0: return " AND ";
+        case 0x22C1: return " OR ";
+        case 0x23ED: return " next ";
+        case 0x23F8: return " pause ";
+        case 0x27FA: return " <=> ";
+        case 0x2B20: return " pentagon ";
+        default: return NULL;
+    }
+}
+/* decode one UTF-8 codepoint at s; returns bytes consumed (>=1) and sets *cp.
+ * Invalid bytes decode to their byte value (so nothing is lost silently). */
+static int lz_utf8_next(const char *s, unsigned *cp) {
+    const unsigned char *u = (const unsigned char *)s;
+    if (u[0] < 0x80) { *cp = u[0]; return 1; }
+    if ((u[0] & 0xE0) == 0xC0 && (u[1] & 0xC0) == 0x80) {
+        *cp = ((unsigned)(u[0] & 0x1F) << 6) | (u[1] & 0x3F); return 2;
+    }
+    if ((u[0] & 0xF0) == 0xE0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80) {
+        *cp = ((unsigned)(u[0] & 0x0F) << 12) | ((unsigned)(u[1] & 0x3F) << 6) | (u[2] & 0x3F); return 3;
+    }
+    if ((u[0] & 0xF8) == 0xF0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80 && (u[3] & 0xC0) == 0x80) {
+        *cp = ((unsigned)(u[0] & 0x07) << 18) | ((unsigned)(u[1] & 0x3F) << 12) | ((unsigned)(u[2] & 0x3F) << 6) | (u[3] & 0x3F); return 4;
+    }
+    *cp = u[0]; return 1;
+}
+static void lz_utf8_put(char *dst, int *di, int cap, unsigned cp) {
+    if (cp < 0x80) { if (*di < cap - 1) dst[(*di)++] = (char)cp; }
+    else if (cp < 0x800) {
+        if (*di < cap - 2) { dst[(*di)++] = (char)(0xC0 | (cp >> 6)); dst[(*di)++] = (char)(0x80 | (cp & 0x3F)); }
+    } else if (cp < 0x10000) {
+        if (*di < cap - 3) { dst[(*di)++] = (char)(0xE0 | (cp >> 12)); dst[(*di)++] = (char)(0x80 | ((cp >> 6) & 0x3F)); dst[(*di)++] = (char)(0x80 | (cp & 0x3F)); }
+    } else {
+        if (*di < cap - 4) { dst[(*di)++] = (char)(0xF0 | (cp >> 18)); dst[(*di)++] = (char)(0x80 | ((cp >> 12) & 0x3F)); dst[(*di)++] = (char)(0x80 | ((cp >> 6) & 0x3F)); dst[(*di)++] = (char)(0x80 | (cp & 0x3F)); }
+    }
+}
+static int lz_sanitize(char *dst, int cap, const char *src) {
+    int di = 0;
+    for (const char *p = src; *p && di < cap - 8; ) {
+        unsigned cp; int adv = lz_utf8_next(p, &cp); p += adv;
+        if (cp == 0x0E33) {                 /* NFKC-lite: SARA AM -> NIKHAHIT + SARA AA */
+            lz_utf8_put(dst, &di, cap, 0x0E4D);
+            lz_utf8_put(dst, &di, cap, 0x0E32);
+            continue;
+        }
+        const char *rep = lz_ascii_map(cp);
+        if (rep) { for (const char *r = rep; *r && di < cap - 1; r++) dst[di++] = *r; continue; }
+        if (lz_is_thai_hole(cp)) continue;  /* drop: unrepresentable in this tokenizer */
+        /* control/whitespace the tokenizer also 500s on (measured): \n \t \r and
+         * other C0 controls -> a single space (keeps word separation, no hole). */
+        if (cp < 0x20 || cp == 0x7F) { if (di < cap - 1) dst[di++] = ' '; continue; }
+        lz_utf8_put(dst, &di, cap, cp);
+    }
+    dst[di] = '\0';
+    return di;
+}
 /* fetch embedding for text; returns dim or -1. Sidecar: llama-server
  * /embedding with {"content": "..."} (multilingual-e5-small, 384-dim). */
 static int lz_embed(const char *text, float *vec, int maxdim) {
@@ -210,15 +292,31 @@ static int lz_embed(const char *text, float *vec, int maxdim) {
     const char *ep = getenv("LZ_EMBED_PORT");
     const char *host = (eh && eh[0]) ? eh : "127.0.0.1";
     int port = (ep && atoi(ep)) ? atoi(ep) : 18095;
+    /* normalize the text to the tokenizer's representable space, exactly as the
+     * index build does — otherwise Thai queries 500 the sidecar. */
+    static char sane[4096];
+    lz_sanitize(sane, (int)sizeof(sane), text);
     char body[8192];
     char esc[8000];
-    lz_json_escape(esc, sizeof(esc), text);
+    lz_json_escape(esc, sizeof(esc), sane);
     snprintf(body, sizeof(body), "{\"content\":\"%s\"}", esc);
     static char resp[65536];
     int nr = lz_http_post(host, port, "/embedding", body, resp, sizeof(resp));
-    if (nr <= 0) return -1;
+    if (nr <= 0) {
+        fprintf(stderr, "[ann_search] embed transport fail (nr=%d) sidecar=%s:%d\n", nr, host, port);
+        return -1;
+    }
     const char *p = strstr(resp, "\"embedding\"");
-    if (!p) return -1;
+    if (!p) {
+        /* the sidecar answered but not with an embedding — usually a 500 from
+         * the tokenizer. Log the status line + a slice so the cause is visible
+         * instead of a bare 503 "embed_unavailable". */
+        char line[256]; int li = 0;
+        for (const char *q = resp; *q && *q != '\r' && *q != '\n' && li < 255; q++) line[li++] = *q;
+        line[li] = '\0';
+        fprintf(stderr, "[ann_search] embed rejected by sidecar: %.200s\n", line);
+        return -1;
+    }
     p = strchr(p, '[');
     if (!p) return -1;
     p++;
