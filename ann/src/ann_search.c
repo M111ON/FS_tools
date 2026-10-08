@@ -120,6 +120,65 @@ static void lz_json_escape(char *dst, size_t cap, const char *src) {
     }
     dst[di] = '\0';
 }
+/* decode a JSON string body (bytes between the quotes) into dst: handles
+ * \uXXXX (incl. surrogate pairs) and \n \t \r \b \f \" \\ \/ . src points at
+ * the first char AFTER the opening quote; stops at the closing quote.
+ * Standard JSON clients send non-ASCII as \uXXXX, so this is what makes a
+ * Python/curl/urllib body embed the same text the caller meant. */
+static int lz_json_unescape(char *dst, int cap, const char *src) {
+    int di = 0;
+    while (*src && *src != '"' && di < cap - 1) {
+        if (*src == '\\' && src[1]) {
+            src++;
+            char c = *src;
+            if (c == 'n') { dst[di++] = '\n'; src++; }
+            else if (c == 't') { dst[di++] = '\t'; src++; }
+            else if (c == 'r') { dst[di++] = '\r'; src++; }
+            else if (c == 'b') { dst[di++] = '\b'; src++; }
+            else if (c == 'f') { dst[di++] = '\f'; src++; }
+            else if (c == '"' || c == '\\' || c == '/') { dst[di++] = c; src++; }
+            else if (c == 'u') {
+                unsigned cp = 0; int ok = 1;
+                for (int h = 0; h < 4; h++) {
+                    char x = src[1 + h]; cp <<= 4;
+                    if (x >= '0' && x <= '9') cp |= (unsigned)(x - '0');
+                    else if (x >= 'a' && x <= 'f') cp |= (unsigned)(x - 'a' + 10);
+                    else if (x >= 'A' && x <= 'F') cp |= (unsigned)(x - 'A' + 10);
+                    else { ok = 0; break; }
+                }
+                if (!ok) { dst[di++] = c; src++; continue; }
+                src += 5;   /* past \uXXXX */
+                if (cp >= 0xD800 && cp <= 0xDBFF && src[0] == '\\' && src[1] == 'u') {
+                    unsigned lo = 0; int ok2 = 1;
+                    for (int h = 0; h < 4; h++) {
+                        char x = src[2 + h]; lo <<= 4;
+                        if (x >= '0' && x <= '9') lo |= (unsigned)(x - '0');
+                        else if (x >= 'a' && x <= 'f') lo |= (unsigned)(x - 'a' + 10);
+                        else if (x >= 'A' && x <= 'F') lo |= (unsigned)(x - 'A' + 10);
+                        else { ok2 = 0; break; }
+                    }
+                    if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                        src += 6;
+                    }
+                }
+                if (cp < 0x80) { if (di < cap - 1) dst[di++] = (char)cp; }
+                else if (cp < 0x800) {
+                    if (di < cap - 2) { dst[di++] = (char)(0xC0 | (cp >> 6)); dst[di++] = (char)(0x80 | (cp & 0x3F)); }
+                } else if (cp < 0x10000) {
+                    if (di < cap - 3) { dst[di++] = (char)(0xE0 | (cp >> 12)); dst[di++] = (char)(0x80 | ((cp >> 6) & 0x3F)); dst[di++] = (char)(0x80 | (cp & 0x3F)); }
+                } else {
+                    if (di < cap - 4) { dst[di++] = (char)(0xF0 | (cp >> 18)); dst[di++] = (char)(0x80 | ((cp >> 12) & 0x3F)); dst[di++] = (char)(0x80 | ((cp >> 6) & 0x3F)); dst[di++] = (char)(0x80 | (cp & 0x3F)); }
+                }
+            }
+            else { dst[di++] = c; src++; }   /* unknown escape: keep the char */
+        } else {
+            dst[di++] = *src++;
+        }
+    }
+    dst[di] = '\0';
+    return di;
+}
 /* ── minimal HTTP POST (for embedding sidecar) ── */
 static int lz_http_post(const char *host, int port, const char *path,
                         const char *body, char *resp, int cap) {
@@ -522,8 +581,11 @@ static int lz_anchor_refresh(int *Kout, int *nout) {
                             FILE *ix = fopen(tmp, "w");
                             if (ix) {
                                 for (int i = 0; i < n; i++) {
+                                    char esid[256], efile[1024];
+                                    lz_json_escape(esid, sizeof(esid), a[i].sid);
+                                    lz_json_escape(efile, sizeof(efile), a[i].file);
                                     fprintf(ix, "{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"anchor\":%d,\"anchor2\":%d,\"dim\":%d,\"vec\":[",
-                                            a[i].sid, a[i].file, a[i].npast, rows[i], rows2[i], a[i].dim);
+                                            esid, efile, a[i].npast, rows[i], rows2[i], a[i].dim);
                                     for (int vi = 0; vi < a[i].dim; vi++)
                                         fprintf(ix, "%s%.6g", vi ? "," : "", (double)a[i].vec[vi]);
                                     fprintf(ix, "]}\n");
@@ -561,19 +623,48 @@ static int handle_health(sock_t cli) {
         uint64_t w = g_fog.w[wi];
         while (w) { sh += (int)(w & 1ull); w >>= 1; }
     }
+    /* every search depends on the embed sidecar, so a green /health that does
+     * not probe it hides a 100%-broken search path from the supervisor. Ping it
+     * (short timeout) and report honestly; the index still reports its state. */
+    int embed_ok = (lz_embed("ping", (float[4]){0}, 1) >= 0) ? 1 : 0;
     /* the index path is a Windows path — escape it or the JSON is invalid
      * (\t, \a, \k are not legal escapes). */
     char esc[512];
     lz_json_escape(esc, sizeof(esc), PATH_INDEX);
     char b[768];
     int bl = snprintf(b, sizeof(b),
-        "{\"status\":\"ok\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
-        "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"maxk\":%d,"
+        "{\"status\":\"%s\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
+        "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"maxk\":%d,\"embed\":\"%s\","
         "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
-        esc, nent, routed, ANN_MAXK, g_fog_replayed, sh, (unsigned)WL_FREE);
+        (embed_ok && nent > 0) ? "ok" : "degraded",
+        esc, nent, routed, ANN_MAXK, embed_ok ? "ok" : "down",
+        g_fog_replayed, sh, (unsigned)WL_FREE);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
+}
+
+/* parse a JSON float array field ("vec":[f,f,...]); returns count or 0.
+ * Used so a caller can send its OWN query vector instead of having the sidecar
+ * embed the text — then the query vector and the stored vectors come from the
+ * same model, and the ranking is exactly the caller's. */
+static int lz_json_float_array(const char *json, const char *key, float *out, int cap) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '[') p++;
+    int n = 0;
+    while (*p && *p != ']' && n < cap) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']' || !*p) break;
+        out[n++] = (float)atof(p);
+        while (*p && *p != ',' && *p != ']') p++;
+    }
+    return n;
 }
 
 /* ── POST /v1/state/search ── */
@@ -592,16 +683,22 @@ static int handle_search(sock_t cli, const char *rq) {
             while (*qp == ' ') qp++;
             if (*qp == '"') {
                 qp++;
-                int qi2 = 0;
-                while (*qp && *qp != '"' && qi2 < 2047) {
-                    if (*qp == '\\' && qp[1]) qp++;
-                    sq[qi2++] = *qp++;
-                }
-                sq[qi2] = '\0';
+                lz_json_unescape(sq, (int)sizeof(sq), qp);
             }
         }
     }
-    if (!sq[0]) { sock_close(cli); return 0; }
+    if (!sq[0]) {
+        /* no "query" text — accept a caller-supplied "vec" instead (the caller
+         * embedded it itself, so ranking uses ITS model, not the sidecar's). */
+        const char *vp = strstr(bd3, "\"vec\"");
+        if (!vp) {
+            const char *eb = "{\"status\":\"error\",\"error\":\"missing_query\","
+                             "\"detail\":\"send \\\"query\\\" text or a \\\"vec\\\" array\"}";
+            lz_http_send(cli, "400 Bad Request", "application/json", eb, (int)strlen(eb));
+            sock_close(cli);
+            return 0;
+        }
+    }
     stopk = lz_json_int(bd3, "topk", 3);
     {
         const char *sfp = strstr(bd3, "\"sid\"");
@@ -630,7 +727,11 @@ static int handle_search(sock_t cli, const char *rq) {
     static char sresp[16384];
     int srlen = 0;
     float qv[1024];
-    int qd = lz_embed(sq, qv, 1024);
+    int qd = 0;
+    /* prefer a caller-supplied vector: same model as the caller's index means
+     * the ranking is exactly the caller's (no cross-embedder drift). */
+    qd = lz_json_float_array(bd3, "vec", qv, 1024);
+    if (qd <= 0 && sq[0]) qd = lz_embed(sq, qv, 1024);
     if (qd > 0) {
         char top_sid[ANN_MAXK][64]; char top_file[ANN_MAXK][256];
         int top_np[ANN_MAXK]; double top_sc[ANN_MAXK];
@@ -646,9 +747,12 @@ static int handle_search(sock_t cli, const char *rq) {
             &budget, &truncated, &us_per_item, &fog);
         srlen = snprintf(sresp, sizeof(sresp), "{\"status\":\"ok\",\"hits\":[");
         for (int ti = 0; ti < stopk && top_sc[ti] > -2; ti++) {
+            char esid[256], efile[1024];
+            lz_json_escape(esid, sizeof(esid), top_sid[ti]);
+            lz_json_escape(efile, sizeof(efile), top_file[ti]);
             srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
                 "%s{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"score\":%.4f}",
-                ti ? "," : "", top_sid[ti], top_file[ti], top_np[ti], top_sc[ti]);
+                ti ? "," : "", esid, efile, top_np[ti], top_sc[ti]);
         }
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen, "]");
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
@@ -663,10 +767,67 @@ static int handle_search(sock_t cli, const char *rq) {
             "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u}}}",
             fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE);
     } else {
-        srlen = snprintf(sresp, sizeof(sresp), "{\"error\":\"embed unavailable\"}");
+        srlen = snprintf(sresp, sizeof(sresp),
+            "{\"status\":\"error\",\"error\":\"embed_unavailable\","
+            "\"detail\":\"the embed sidecar could not embed this query\"}");
+        lz_http_send(cli, "503 Service Unavailable", "application/json", sresp, srlen);
+        sock_close(cli);
+        return 0;
     }
     lz_http_send(cli, "200 OK", "application/json", sresp, srlen);
     sock_close(cli);
+    return 0;
+}
+
+/* ── per-connection handling ──────────────────────────────────────────
+ * The server was single-threaded with no socket timeout, so one idle or
+ * half-open connection froze the whole service (including /health). Now each
+ * connection runs on its own thread with a recv/send timeout, and the search
+ * core (shared index/anchor/fog caches) is guarded by a critical section so
+ * the caches stay consistent — the same serialization as before, but a slow
+ * client can no longer hold the accept loop. */
+static CRITICAL_SECTION g_lock;
+
+static void dispatch(sock_t cli, char *rq) {
+    char method[16] = "", path[256] = "";
+    sscanf(rq, "%15s %255s", method, path);
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
+        handle_health(cli);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/regrow") == 0) {
+        int rK = 0, rN = 0;
+        int rrc = lz_anchor_refresh(&rK, &rN);
+        const char *rmode = rrc == 0 ? "anchor" : (rrc == 1 ? "brute" : "error");
+        char rresp[256];
+        int rrlen = snprintf(rresp, sizeof(rresp),
+            "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d}",
+            rrc < 0 ? "error" : "ok", rmode, rN, rK);
+        lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
+        sock_close(cli);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search") == 0) {
+        handle_search(cli, rq);
+    } else {
+        const char *b = "{\"error\":\"not_found\",\"try\":\"/health or POST /v1/state/search\"}";
+        lz_http_send(cli, "404 Not Found", "application/json", b, (int)strlen(b));
+        sock_close(cli);
+    }
+}
+
+static DWORD WINAPI client_thread(LPVOID arg) {
+    sock_t cli = (sock_t)(intptr_t)arg;
+    DWORD tv = 5000;   /* ms — a stalled client frees its own thread, not the server */
+    setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    char *rq = (char *)malloc(1 << 20);
+    if (!rq) { sock_close(cli); return 0; }
+    int n = lz_http_recv(cli, rq, 1 << 20);
+    if (n > 0) {
+        EnterCriticalSection(&g_lock);
+        dispatch(cli, rq);
+        LeaveCriticalSection(&g_lock);
+    } else {
+        sock_close(cli);
+    }
+    free(rq);
     return 0;
 }
 
@@ -682,6 +843,7 @@ int main(int argc, char **argv) {
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "wsa fail\n"); return 1; }
+    InitializeCriticalSection(&g_lock);
     lz_fog_init();
     { LZEntry *e; int n; int c = lz_index_cached(&e, &n);
       fprintf(stderr, "[ann_search] index=%s entries=%d cache=%d maxk=%d\n",
@@ -693,43 +855,27 @@ int main(int argc, char **argv) {
     if (srv == SOCK_INVALID) { fprintf(stderr, "socket fail\n"); return 1; }
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    /* On Windows SO_REUSEADDR alone lets a SECOND instance bind the same port
+     * (split-brain); SO_EXCLUSIVEADDRUSE makes the second bind fail loudly. */
+#ifdef SO_EXCLUSIVEADDRUSE
+    setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof(one));
+#endif
     struct sockaddr_in sa;
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = INADDR_ANY;
     if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        fprintf(stderr, "bind %d failed\n", port); return 1;
+        fprintf(stderr, "bind %d failed (already in use?)\n", port); return 1;
     }
-    listen(srv, 16);
+    listen(srv, 64);
     fprintf(stderr, "[ann_search] listening on %d\n", port);
 
-    static char rq[1 << 20];
     for (;;) {
         sock_t cli = accept(srv, NULL, NULL);
         if (cli == SOCK_INVALID) continue;
-        int n = lz_http_recv(cli, rq, sizeof(rq));
-        if (n <= 0) { sock_close(cli); continue; }
-        char method[16] = "", path[256] = "";
-        sscanf(rq, "%15s %255s", method, path);
-        if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            handle_health(cli);
-        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/regrow") == 0) {
-            int rK = 0, rN = 0;
-            int rrc = lz_anchor_refresh(&rK, &rN);
-            const char *rmode = rrc == 0 ? "anchor" : (rrc == 1 ? "brute" : "error");
-            char rresp[256];
-            int rrlen = snprintf(rresp, sizeof(rresp),
-                "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d}",
-                rrc < 0 ? "error" : "ok", rmode, rN, rK);
-            lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
-            sock_close(cli);
-        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search") == 0) {
-            handle_search(cli, rq);
-        } else {
-            const char *b = "{\"error\":\"not_found\",\"try\":\"/health or POST /v1/state/search\"}";
-            lz_http_send(cli, "404 Not Found", "application/json", b, (int)strlen(b));
-            sock_close(cli);
-        }
+        HANDLE h = CreateThread(NULL, 0, client_thread, (LPVOID)(intptr_t)cli, 0, NULL);
+        if (h) CloseHandle(h);
+        else client_thread((LPVOID)(intptr_t)cli);   /* fallback: inline */
     }
     WSACleanup();
     return 0;
