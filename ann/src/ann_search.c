@@ -275,6 +275,7 @@ typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; i
 static void graft_init(LZEntry *ents, int nent);
 static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm);
 static void graft_query_keys(const char *q);
+static int graft_candidates(uint32_t *out, int cap);   /* graph → candidate entries */
 static int g_graft_on = 0;                 /* master switch (env ANN_GRAFT) */
 static int g_qkeys[16], g_qn = 0;          /* query-side file keys, per request */
 static int g_graft_ready = 0;              /* bias tables loaded (or off) */
@@ -542,8 +543,33 @@ static int lz_mem_search(const float *qv, int qd,
                                 g_fog_log_open ? &g_fog_log : NULL);
             if (g_fog_log_open && g_fog_log.fp) fflush(g_fog_log.fp);
         } else {
-            ord_own = (uint32_t *)malloc((nent ? (size_t)nent : 1) * sizeof(uint32_t));
-            if (ord_own) { for (int i = 0; i < nent; i++) ord_own[i] = (uint32_t)i; ord = ord_own; }
+            /* no trained anchor route (or dim mismatch): the file-relationship
+             * graph draws a rough map. If the query names files the graph knows,
+             * score only the entries the graph proposes (guided subset) instead
+             * of the whole index. Falls back to a full scan when the graph
+             * cannot propose — so a novel query keeps exact behaviour. This is
+             * the "train-free" route: structure proposes, the tombstone pins. */
+            int gcap = nent;
+            { const char *gc = getenv("ANN_GRAFT_CAND");
+              if (gc && atoi(gc) > 0) gcap = atoi(gc); }
+            uint32_t *gcand = NULL;
+            int gn = 0;
+            if (g_graft_on && g_qn > 0) {
+                gcand = (uint32_t *)malloc((size_t)(gcap ? gcap : 1) * sizeof(uint32_t));
+                if (gcand) gn = graft_candidates(gcand, gcap);
+            }
+            if (gn > 0) {
+                if (ord_own) free(ord_own);
+                ord_own = gcand; ord = gcand;
+                routed = 1;
+                rnb = 0;
+                budget = gn;
+                snprintf(rm, sizeof(rm), "%s", "graph");
+            } else {
+                if (gcand) free(gcand);
+                ord_own = (uint32_t *)malloc((nent ? (size_t)nent : 1) * sizeof(uint32_t));
+                if (ord_own) { for (int i = 0; i < nent; i++) ord_own[i] = (uint32_t)i; ord = ord_own; }
+            }
         }
         LARGE_INTEGER qf, qt0, qt1;
         QueryPerformanceFrequency(&qf);
@@ -555,7 +581,7 @@ static int lz_mem_search(const float *qv, int qd,
             if (ei < 0 || ei >= nent) continue;
             int sel = 1;
             if (sid_filter[0] && strcmp(ents[ei].sid, sid_filter) != 0) sel = 0;
-            if (sel && routed) {
+            if (sel && routed && rnb > 0) {
                 sel = (ents[ei].anchor < 0);
                 for (int rbi = 0; rbi < rnb && !sel; rbi++)
                     if (ents[ei].anchor == rb[rbi] || ents[ei].anchor2 == rb[rbi]) sel = 1;
@@ -657,6 +683,19 @@ static int *g_sid_hash = NULL;
 static int g_sid_cap = 0;
 static LZEntry *g_ents_ref = NULL;
 
+/* ── graph → candidate proposal ───────────────────────────────────────
+ * When there is no trained anchor route (or a query would fall back to a
+ * full "brute" scan), the file-relationship graph proposes the candidate
+ * entries to score. Per file key we gather the entries that carry it (CSR
+ * below) plus the entries carrying a NEIGHBOUR file, and return the top
+ * by structural score. This is "the graph draws a rough map" so the walk is
+ * a guided subset, not an O(N) scan — the tombstone then pins the routes
+ * actually walked. */
+static int *g_file_ent_off = NULL;    /* size g_file_nf+1: entries per file id */
+static int *g_file_ent_ids = NULL;    /* entry positions, grouped by file id */
+static int g_file_ent_n = 0;
+static int g_file_nf = 0;             /* number of file slots (files.tsv space) */
+
 static int graft_file_id(const char *path) {
     for (int i = 0; i < g_fn_cap; i++)
         if (g_fnames[i] && strcmp(g_fnames[i], path) == 0) return i;
@@ -727,6 +766,9 @@ static void graft_free(void) {
     free(g_ent_gn); g_ent_gn = NULL;
     free(g_ent_gkeys); g_ent_gkeys = NULL;
     free(g_sid_hash); g_sid_hash = NULL;
+    free(g_file_ent_off); g_file_ent_off = NULL;
+    free(g_file_ent_ids); g_file_ent_ids = NULL;
+    g_file_ent_n = 0; g_file_nf = 0;
     free(g_warm_flag); g_warm_flag = NULL; g_warm_flag_n = 0;
     for (int i = 0; i < g_fn_cap; i++) free(g_fnames[i]);
     free(g_fnames); g_fnames = NULL;
@@ -867,9 +909,36 @@ static void graft_init(LZEntry *ents, int nent) {
     graft_load_files(fp);
     graft_load_nb(nbp);
     graft_load_keys(kp, ents, nent);
+    /* build the sid→entry CSR used by the graph candidate proposal (needs the
+     * per-entry keys loaded above). Indexed by file id over the files.tsv
+     * space (g_fn_cap), which is a superset of the nb.tsv space. */
+    if (g_ent_n > 0 && g_fn_cap > 0) {
+        g_file_nf = g_fn_cap;
+        g_file_ent_off = (int *)calloc((size_t)g_file_nf + 1, sizeof(int));
+        g_file_ent_ids = (int *)malloc((size_t)g_ent_n * sizeof(int));
+        if (g_file_ent_off && g_file_ent_ids) {
+            for (int i = 0; i < nent; i++)
+                for (int k = 0; k < ents[i].gn; k++) {
+                    int fid = g_ent_gkeys[ents[i].goff + k];
+                    if (fid >= 0 && fid < g_file_nf) g_file_ent_off[fid + 1]++;
+                }
+            for (int f = 0; f < g_file_nf; f++) g_file_ent_off[f + 1] += g_file_ent_off[f];
+            { int *cur = (int *)malloc((size_t)g_file_nf * sizeof(int));
+              if (cur) {
+                  for (int f = 0; f < g_file_nf; f++) cur[f] = g_file_ent_off[f];
+                  for (int i = 0; i < nent; i++)
+                      for (int k = 0; k < ents[i].gn; k++) {
+                          int fid = g_ent_gkeys[ents[i].goff + k];
+                          if (fid >= 0 && fid < g_file_nf) g_file_ent_ids[cur[fid]++] = i;
+                      }
+                  free(cur);
+              } }
+            g_file_ent_n = nent;
+        }
+    }
     g_graft_ready = 1;
-    fprintf(stderr, "[ann_search] graft bias ON lambda=%.3f files=%d entries_with_keys=%d\n",
-            g_graft_lambda, g_fn_cap, g_ent_n);
+    fprintf(stderr, "[ann_search] graft bias ON lambda=%.3f files=%d entries_with_keys=%d route=%s\n",
+            g_graft_lambda, g_fn_cap, g_ent_n, g_file_ent_n ? "ready" : "off");
 }
 
 /* called at request time, before query keys are needed (index may not have
@@ -902,6 +971,57 @@ static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm) {
     }
     if (warm && g_amp_boost) best *= g_amp_k;   /* tombstone × graft amplifier */
     return best;
+}
+
+/* graph → candidate entries. The map the graph draws when there is no trained
+ * anchor route: take the entries carrying the query's file keys (score 1.0)
+ * plus the entries carrying a NEIGHBOUR file (score = edge affinity), then
+ * return the top-`cap` by score. This is a guided subset of the index built
+ * from structure alone — no training, no geometry. Returns the candidate
+ * count (0 when the graph cannot propose). The caller falls back to the full
+ * scan only when this is 0. */
+static int graft_candidates(uint32_t *out, int cap) {
+    if (!g_graft_on || !g_graft_ready || !g_file_ent_off || !g_file_ent_ids ||
+        !g_ents_ref || g_qn <= 0 || cap <= 0) return 0;
+    static int escore[ANCHR_MAXK];
+    static int eseen[ANCHR_MAXK];
+    for (int i = 0; i < ANCHR_MAXK; i++) { escore[i] = 0; eseen[i] = -1; }
+    int nseen = 0;
+    for (int j = 0; j < g_qn; j++) {
+        int fid = g_qkeys[j];
+        if (fid < 0 || fid >= g_file_nf) continue;
+        /* exact file: entries carrying it score full */
+        for (int t = g_file_ent_off[fid]; t < g_file_ent_off[fid + 1]; t++) {
+            int ei = g_file_ent_ids[t];
+            int idx = -1;
+            for (int s = 0; s < nseen; s++) if (eseen[s] == ei) { idx = s; break; }
+            if (idx < 0) { if (nseen >= ANCHR_MAXK) continue; idx = nseen; eseen[nseen++] = ei; }
+            if (escore[idx] < 1) escore[idx] = 1;
+        }
+        /* neighbours: entries carrying a related file score by affinity */
+        for (int t = g_nb_off[fid]; t < g_nb_off[fid + 1]; t++) {
+            int nb = g_nb_id[t];
+            if (nb < 0 || nb >= g_file_nf) continue;
+            int w = (int)(g_nb_sc[t] * 10.0f);
+            if (w < 1) continue;
+            for (int u = g_file_ent_off[nb]; u < g_file_ent_off[nb + 1]; u++) {
+                int ei = g_file_ent_ids[u];
+                int idx = -1;
+                for (int s = 0; s < nseen; s++) if (eseen[s] == ei) { idx = s; break; }
+                if (idx < 0) { if (nseen >= ANCHR_MAXK) continue; idx = nseen; eseen[nseen++] = ei; }
+                if (escore[idx] < w) escore[idx] = w;
+            }
+        }
+    }
+    int n = 0;
+    for (int c = 0; c < cap && n < cap; c++) {
+        int best = -1, bi = -1;
+        for (int s = 0; s < nseen; s++) if (escore[s] > best) { best = escore[s]; bi = s; }
+        if (bi < 0 || best <= 0) break;
+        out[n++] = (uint32_t)eseen[bi];
+        escore[bi] = -1;
+    }
+    return n;
 }
 
 /* ── anchor regrow hook (ported from gguf_lazy_serve.c L632-707) ──

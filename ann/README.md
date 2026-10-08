@@ -143,6 +143,7 @@ ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
 | `ANN_GRAFT_DIR` | `data/graft` | tables dir |
 | `ANN_AMP_BOOST` | `0` | tombstone × graft amplifier: multiply the bias of warm-bucket entries (needs `ANN_GRAFT=1` + `ANN_TOMBSTONE_WARM=1`) |
 | `ANN_AMP_K` | `2.0` | warm-bucket weight multiplier |
+| `ANN_GRAFT_CAND` | index size | cap on graph-proposed candidates in the train-free route |
 
 Model (relation/confidence weights, neighbor mode `direct|2hop|max|sum`, damp,
 k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.
@@ -173,6 +174,21 @@ after them. An overlapping query scores fewer items with the **same top-k**; a
 novel query is unchanged. Inert at `topk>=3` on the 57k index (the route already
 covers everything — the B1 wall). Full numbers, limits, and reproduce steps in
 [`WARM-PATH.md`](WARM-PATH.md).
+
+## Graph route (train-free) — OPTIONAL, OFF by default
+
+When there is **no trained anchor route** (a fresh index, or a train that cannot
+run), the server would otherwise fall back to `mode:"brute"` — a full O(N) scan.
+With `ANN_GRAFT=1` the file-relationship graph instead **proposes the candidates**:
+entries carrying the query's files plus entries carrying a neighbour file
+(`route.mode = "graph"`). A query the graph cannot map falls back to the full
+scan, so novel recall is untouched. Knob `ANN_GRAFT_CAND` caps the subset.
+
+Measured on the real 57k index with the anchor route disabled: the graph scores
+**11–266 of 57,076** entries (a 200×–5000× smaller set) but recall@10 against
+exact brute is only **0.34** (0.60 on files well-represented in the index, 0.00 on
+sparse ones). It is a *rough* map / front tier, not an exact route. Full numbers:
+[`GRAPH-ROUTE.md`](GRAPH-ROUTE.md).
 
 ## Run as a service (Windows)
 
