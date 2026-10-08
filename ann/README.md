@@ -117,6 +117,32 @@ exact recall, the win is caching + no matrix rebuild, not approximation.
 format has no other field for it). To map a hit back to memcore, the `sid` is
 the memcore `entries.id`.
 
+## Run as a service (Windows)
+
+The server is kept alive by a supervisor + a Task Scheduler entry, the same
+pattern chat-pool uses (`I:/tools/chat-pool/pool_keepalive.py`):
+
+```sh
+python ann_keepalive.py --once     # one pass: if /health is down, start it
+pythonw ann_keepalive.py           # foreground loop (rarely needed)
+```
+
+`ann_keepalive.py` also starts the **embed sidecar** if `:18095` is down (it
+runs `llama-server` from its own dir, which its exe needs for sibling DLLs).
+It only ever STARTS — never kills a healthy server — and backs off on a
+crash-loop.
+
+Task: `ann-keepalive` (logon + every 5 min, runs `--once`), registered from
+`ann-keepalive.xml`:
+
+```sh
+schtasks /create /tn ann-keepalive /xml "I:\tools\ann\ann-keepalive.xml" /f
+```
+
+It binds **:8096** and serves the derived memcore index (`data/memcore/`) when
+present, else the shipped sample. `chat-pool`'s `GET /semantic` defaults to
+`http://127.0.0.1:8096`, so the two line up with no extra config.
+
 ## Known limits (inherited, measured upstream)
 
 - Anchor route does **not** prune: a query scores the whole index (`items_scored
