@@ -22,82 +22,38 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool
 import taskboard
 import ws_bridge
+import inbox_bridge
 
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
 
-# ── task board page (the inbox dashboard, rebuilt over /tasks) ───────
-# Read-only: a task changes by POST /task /task/update, never from the page.
-# The inbox source stays authoritative for what was posted there; this page is
-# the shared, owner-aware view every platform can read from the pool directly.
-TASKS_PAGE = """<!DOCTYPE html>
-<html lang=\"th\"><head><meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<title>chat-pool · task board</title>
-<style>
-  :root { --bg:#0d1117; --surface:#161b22; --border:#30363d; --text:#e6edf3;
-          --muted:#8b949e; --accent:#58a6ff; --green:#3fb950; --yellow:#d29922;
-          --red:#f85149; --grey:#6e7681; }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'SF Mono','Cascadia Code',monospace; background:var(--bg);
-         color:var(--text); padding:20px; }
-  .header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:16px; }
-  .header h1 { font-size:16px; }
-  .header a { color:var(--accent); font-size:12px; text-decoration:none; }
-  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; margin-bottom:20px; }
-  .stat { background:var(--surface); border:1px solid var(--border); border-radius:8px;
-          padding:10px 12px; text-align:center; }
-  .stat .num { font-size:22px; font-weight:700; }
-  .stat .label { font-size:10px; color:var(--muted); text-transform:uppercase; margin-top:2px; }
-  .col-pending .num{color:var(--accent)} .col-in_progress .num{color:var(--yellow)}
-  .col-done .num{color:var(--green)} .col-blocked .num{color:var(--red)}
-  .sec { margin-bottom:22px; }
-  .sec h2 { font-size:12px; color:var(--muted); text-transform:uppercase;
-            letter-spacing:0.5px; margin-bottom:10px; }
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:8px;
-          padding:12px 14px; margin-bottom:6px; }
-  .card .t { font-size:13px; font-weight:600; margin-bottom:4px; }
-  .card .d { color:var(--muted); font-size:11px; line-height:1.5; white-space:pre-wrap; }
-  .card .meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;
-                font-size:10px; color:var(--muted); align-items:center; }
-  .pill { padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;
-          text-transform:uppercase; background:#1f2937; }
-  .pill-pending{color:var(--accent)} .pill-in_progress{color:var(--yellow);background:#2d1f00}
-  .pill-done{color:var(--green);background:#0d2818} .pill-blocked{color:var(--red);background:#2d1214}
-  .pill-cancelled{color:var(--grey)}
-  .owner { color:var(--text); }
-  .sub { border-left:2px solid var(--border); margin-left:14px; padding-left:10px; }
-  .muted { color:var(--muted); }
-</style></head><body>
-<div class=\"header\"><h1>chat-pool · task board</h1>
-<a href=\"/\">← pool dashboard</a></div>
-<div class=\"stats\" id=\"stats\"></div>
-<div id=\"board\">loading…</div>
-<script>
-const S={pending:'pending',in_progress:'working',done:'done',blocked:'blocked',cancelled:'cancelled'};
-function esc(s){return (s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}
-fetch('/tasks').then(r=>r.json()).then(j=>{
-  const tasks=j.tasks||[];
-  const by={}; tasks.forEach(t=>{(by[t.parent||'']=by[t.parent||'']||[]).push(t)});
-  const st=j.summary||{counts:{},in_progress:[]};
-  document.getElementById('stats').innerHTML=
-    ['pending','in_progress','done','blocked','cancelled'].map(s=>
-      `<div class=\"stat col-${s}\"><div class=\"num\">${st.counts[s]||0}</div><div class=\"label\">${S[s]}</div></div>`
-    ).join('')+`<div class=\"stat\"><div class=\"num\">${tasks.length}</div><div class=\"label\">total</div></div>`;
-  function card(t,sub){
-    const who=t.owner?`<span class=\"owner\">@${esc(t.owner)}</span>`:'<span class=\"muted\">unclaimed</span>';
-    const kids=(by[t.id]||[]).map(k=>card(k,true)).join('');
-    return `<div class=\"card\"><div class=\"t\">${esc(t.title)}</div>`+
-      (t.desc?`<div class=\"d\">${esc(t.desc)}</div>`:'')+
-      `<div class=\"meta\"><span class=\"pill pill-${t.status}\">${S[t.status]||t.status}</span>${who}`+
-      `<span>${esc(t.id)}</span>${t.tags.map(x=>`<span>#${esc(x)}</span>`).join('')}`+
-      (t.revs>1?`<span>rev ${t.revs}</span>`:'')+`</div></div>`+(kids?`<div class=\"sub\">${kids}</div>`:'');
-  }
-  const roots=(by['']||[]);
-  document.getElementById('board').innerHTML=
-    roots.length?roots.map(t=>card(t,false)).join(''):'<div class=\"muted\">board is empty — POST /task to add one</div>';
-}).catch(e=>{document.getElementById('board').textContent='load failed: '+e});
-</script></body></html>"""
+# ── task board page ───────────────────────────────────────────────────
+# Its own file, not a string in here: it grew from a read-only list into the
+# thing people actually work in — new/edit/status/tag, a status vocabulary you
+# can type into, and a drawer for the small stuff — and a 400-line HTML string
+# inside a 5000-line server is not a place to edit that safely.
+# Read on every request, so editing the file reloads the page.
+# The inbox source stays authoritative for the cards it owns; this page writes
+# through POST /task and /task/update, which is the same path every other
+# platform uses — there is no side door into the log.
+TASKS_UI_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "tasks_ui.html")
+_MISSING_UI = (b"<!DOCTYPE html><meta charset=utf-8><body style="
+               b"font-family:monospace;background:#0d1117;color:#e6edf3;padding:24px>"
+               b"<h1>tasks_ui.html is missing</h1><p>The board page lives in "
+               b"chat-pool/tasks_ui.html. It was not found next to pool_server.py,"
+               b" so there is nothing to serve.</p>")
+
+
+def _tasks_page():
+    """The board page, read from disk on every request so editing the HTML
+    takes effect on reload. A missing file says so plainly instead of raising a
+    500 on the one URL a person is looking at."""
+    try:
+        with open(TASKS_UI_FILE, "rb") as f:
+            return f.read()
+    except OSError:
+        return _MISSING_UI
 
 # A query parameter that could not be read as a number: the 400 answer is
 # already written when these come back, so the caller only has to return.
@@ -116,109 +72,14 @@ def _get_token():
         tok = secrets.token_hex(16)
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(tok)
-    return open(TOKEN_FILE, encoding="utf-8").read().strip()
-
-
-# ── inbox → pool task bridge ─────────────────────────────────────────
-# The inbox-manager board (.inbox_state.json board, status todo|in_progress|...)
-# is a local file one app owns. The pool is where every platform already meets,
-# so the bridge reads that file over the inbox dashboard's own /api/state and
-# writes each card into the chain as a task — owner-aware, deduped by source id.
-# The inbox board stays the source of record; the pool mirrors status so any
-# OTHER platform can see and claim work without touching that file.
-_INBOX_STATUS = {"todo": "pending", "in_progress": "in_progress", "done": "done",
-                 "blocked": "blocked", "cancelled": "cancelled"}
-
-
-def _inbox_board():
-    """Read the live inbox board. INBOX_STATE_FILE (a .inbox_state.json) is
-    tried first — no network, works even when the inbox dashboard is down —
-    then the dashboard's own /api/state at INBOX_STATE_URL (default
-    http://127.0.0.1:5000/api/state). Returns (board, err)."""
-    path = os.environ.get("INBOX_STATE_FILE", "")
-    if path:
-        try:
-            with open(path, encoding="utf-8") as f:
-                d = json.load(f)
-            return (d.get("board") or []), None
-        except Exception as e:
-            return [], str(e)
-    url = os.environ.get("INBOX_STATE_URL", "http://127.0.0.1:5000/api/state")
-    try:
-        with urllib.request.urlopen(url, timeout=3) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        return (d.get("board") or []), None
-    except Exception as e:
-        return [], str(e)
-
-
-def _src_of(t):
-    return (t.get("tags") or [""])[0].startswith("src:")
-
-
-def _inbox_sync_tasks(apply=False):
-    """Diff the inbox board against pool tasks and return the plan; with
-    apply=True, execute it. Import rules:
-      - card status must map (unknown statuses are skipped, reported)
-      - title[:80] becomes the task title, deduped by the src:<id> tag
-      - in_progress cards get owner=inbox-manager (ใครกำลังทำอยู่)
-      - done/cancelled cards import as their terminal status (history)
-    Returns {cards, imported, updated, skipped, actions} — actions carry the
-    task id + what would happen, so a dry-run is the same shape as the result."""
-    board, err = _inbox_board()
-    if err:
-        return {"ok": False, "error": err, "imported": 0, "updated": 0, "actions": []}
-    # existing mirrored tasks by their src: tag
-    existing = {}
-    for t in taskboard.task_list():
-        for tag in t.get("tags", []):
-            if tag.startswith("src:"):
-                existing[tag] = t
-    actions, imported, updated, skipped = [], 0, 0, 0
-    app = "inbox-bridge"
-    for c in board:
-        cid = str(c.get("id", ""))
-        src = "src:inbox-%s" % cid
-        st = _INBOX_STATUS.get(c.get("status", ""))
-        title = (c.get("title") or "").strip()[:80]
-        if not cid or not title:
-            skipped += 1
-            actions.append({"card": cid, "op": "skip", "why": "missing id/title"})
-            continue
-        if st is None:
-            skipped += 1
-            actions.append({"card": cid, "op": "skip", "why": "unknown status %r" % c.get("status")})
-            continue
-        desc = (c.get("body") or "").strip()
-        cur = existing.get(src)
-        if cur is None:
-            actions.append({"card": cid, "op": "import", "status": st,
-                            "title": title,
-                            "owner": "inbox-manager" if st == "in_progress" else ""})
-            if apply:
-                row = taskboard.task_create(app, title, desc=desc,
-                                            tags=src, status=st,
-                                            owner="inbox-manager" if st == "in_progress" else "")
-                actions[-1]["id"] = row["id"]
-            imported += 1
-        elif cur["status"] != st:
-            actions.append({"card": cid, "op": "update", "id": cur["id"],
-                            "from": cur["status"], "to": st})
-            if apply:
-                taskboard.task_update(app, cur["id"], status=st,
-                                      note="sync from inbox card #%s" % cid)
-            updated += 1
-    if apply and (imported or updated):
-        try:
-            if not pool.is_registered(app):
-                pool.register_app(app)
-            else:
-                pool.touch_app(app)
-        except Exception:
-            pass
-    return {"ok": True, "cards": len(board), "imported": imported,
-            "updated": updated, "skipped": skipped,
-            "applied": bool(apply), "actions": actions}
+    return open(TOKEN_FILE, encoding="utf-8").read().strip()# ── inbox ↔ pool task bridge ──────────────────────────────────────────
+# The inbox-manager board (.inbox_state.json, status todo|in_progress|...) is a
+# local file one app owns. The pool is where every platform already meets, so
+# the bridge reads that file and writes each card into the chain as a task —
+# owner-aware, deduped by source id — and writes back the cards somebody moved
+# here. The RULES live in inbox_bridge.py, once: the CLI and these endpoints
+# call the same code, so "what the server would do" and "what I just ran"
+# cannot quietly become two different things.
 
 
 def _lan_ips():
@@ -1387,6 +1248,7 @@ const SAY_ERRORS=[
   [/\?n=/, ()=>'จำนวนบรรทัดที่ขอไม่ถูกต้อง — ต้องเป็นจำนวนเต็ม'],
   [/\?hide=/, ()=>'คะแนนเกณฑ์ไม่ถูกต้อง — ต้องเป็นจำนวนเต็ม'],
   [/\?rkey=/, ()=>'ไม่ได้ระบุที่อยู่บนแผนที่'],
+  [/\?view=\s*open\|folded\|all/, ()=>'มุมมองที่ขอไม่ถูกต้อง — ได้ open (งานที่ต้องทำ), folded (ของที่เก็บไว้) หรือ all'],
   [/\?level=/, ()=>'ตัวเลือกระดับความละเอียดไม่ถูกต้อง'],
   [/\?path=/, ()=>'เส้นทางช่องย่อยไม่ถูกต้อง — ต้องเป็นตัวเลขคั่นด้วยจุลภาค'],
   [/\?hops=/, ()=>'จำนวนทอดไม่ถูกต้อง (ต้อง 1–4)'],
@@ -3007,11 +2869,20 @@ function pvLegend(){
     // the count beside each swatch is how many CELLS carry that kind last, so
     // the legend says what the picture is showing rather than how many lines
     // exist — those two numbers are different and only one of them is drawn
+    //
+    // and the swatch says the SAME WORD the composition strip says — in the
+    // label AND in the tooltip. One table, KIND_TH, read through kindLabel, so
+    // the two views cannot teach the reader two names for one colour; the
+    // tooltip used to print `title="CHAT · 13,746 ช่อง"` and that was the last
+    // place the corpus's own spelling still reached the screen.
+    // `data-kind` keeps the wire name for the machine, exactly as the strip's
+    // data-cmp-key does: a key nobody reads is not a leak.
     const ks=pvTopKinds();
     h='<div style="color:var(--fg)">สี = ชนิดของบรรทัดล่าสุดในช่องนั้น</div>';
     h+=ks?Object.keys(ks).sort((a,b)=>ks[b]-ks[a]).map(k=>
       '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:9px"'
-      +' title="'+esc(k)+' · '+ks[k]+' ช่อง">'
+      +' data-kind="'+esc(k)+'"'
+      +' title="'+esc(kindLabel(k))+' · '+ks[k]+' ช่อง">'
       +'<span style="width:11px;height:11px;border-radius:3px;background:'+pvKindInk(k,1)+';display:inline-block"></span>'
       +esc(kindLabel(k))+' <span style="color:var(--dim)">'+ks[k]+'</span></span>').join('')
       :'<span style="color:var(--warn)">ยังโหลดข้อมูลชนิดไม่เสร็จ — เลือกสีนี้ใหม่อีกครั้ง</span>';
@@ -4614,22 +4485,44 @@ class PoolHandler(BaseHTTPRequestHandler):
             owner = qs.get("owner", [None])[0]
             parent = qs.get("parent", [None])[0]
             query = qs.get("q", [None])[0]
+            tag = qs.get("tag", [None])[0]
+            view = qs.get("view", [None])[0]
+            if view not in (None, "open", "folded", "all"):
+                self._json(400, {"error": "?view= open|folded|all"})
+                return
             with _lock:
                 tasks = taskboard.task_list(status=status, owner=owner,
-                                            parent=parent, query=query)
+                                            parent=parent, query=query,
+                                            tag=tag, view=view)
+                # hold rides with the task: "readable by everyone, writable by
+                # @holder until they have been idle 15 minutes" is a property of
+                # the board, not something a caller has to reconstruct.
+                for t in tasks:
+                    t["hold"] = taskboard.hold_of(t)
             self._json(200, {"tasks": tasks, "summary": taskboard.task_summary()
-                             if not (status or owner or parent or query) else None})
+                             if not (status or owner or parent or query
+                                     or tag or view) else None})
 
         elif parsed.path == "/tasks/summary":
             with _lock:
                 self._json(200, taskboard.task_summary())
 
-        elif parsed.path == "/tasks/ui":
-            # read-only board page over /tasks — same data every platform reads
-            body = TASKS_PAGE.encode("utf-8")
+        elif parsed.path == "/holds":
+            with _lock:
+                self._json(200, {"holds": taskboard.hold_list(),
+                                 "idle_sec": taskboard.HOLD_IDLE_SEC})
+
+        elif parsed.path in ("/tasks/ui", "/task/ui", "/tasks/ui/"):
+            # WRITABLE board page over /tasks — add / edit / claim / fold, all
+            # through POST /task and /task/update (the same path every platform
+            # uses; there is no side door). Serves the same page on /task/ui
+            # (no "s") too: that is a common typo and an old bookmark, and a
+            # 404 on the one URL a person is looking at helps nobody.
+            body = _tasks_page()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
@@ -5041,21 +4934,44 @@ class PoolHandler(BaseHTTPRequestHandler):
                         t = taskboard.task_update(
                             app, tid, status=body.get("status", ""),
                             owner=body.get("owner", ""),
-                            note=body.get("note", ""))
+                            note=body.get("note", ""),
+                            title=body.get("title", ""),
+                            desc=body.get("desc"),
+                            add_tags=body.get("add_tags", ()),
+                            remove_tags=body.get("remove_tags", ()))
+            except taskboard.Held as e:
+                # 409, not 400: the request was well formed, it is just not
+                # yours to make. The message says who holds it and how long is
+                # left, which is the only thing the caller can act on.
+                self._json(409, {"error": str(e), "held": True,
+                                 "howto": {"read": "GET /holds"}})
+                return
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
             self._json(200, {"ok": True, "id": t["id"], "status": t["status"],
-                             "owner": t["owner"], "rev": t["rev"], "hash": t["hash"]})
+                             "owner": t["owner"], "rev": t["rev"], "hash": t["hash"],
+                             "title": t["title"], "desc": t["desc"],
+                             "tags": t["tags"],
+                             "hold": taskboard.hold_of(t)})
         elif parsed.path == "/tasks/sync":
-            # bridge: pull the inbox board into the pool as task blocks.
-            # POST {} → dry-run (what WOULD be imported, nothing written);
-            # POST {"apply": true} → writes; the inbox board stays the
-            # source of record for those cards, the pool mirrors status.
+            # bridge, inbox → pool: pull the inbox board into the pool as task
+            # blocks. POST {} → dry-run (nothing written); POST {"apply": true}
+            # → writes. The rules live in inbox_bridge, not here, so the CLI
+            # and this endpoint cannot drift apart.
             body = self._read_json() or {}
             apply = body.get("apply", False)
             with _lock:
-                result = _inbox_sync_tasks(apply=apply)
+                result = inbox_bridge.apply() if apply else inbox_bridge.plan()
+            self._json(200, result)
+        elif parsed.path == "/tasks/pull":
+            # bridge, pool → inbox: the return direction. Writes back onto
+            # .inbox_state.json the cards somebody moved here — under a lock
+            # file, with os.replace, and only when the card is genuinely behind
+            # its task. Dry-run by default, exactly like /tasks/sync.
+            body = self._read_json() or {}
+            with _lock:
+                result = inbox_bridge.pull(apply=body.get("apply", False))
             self._json(200, result)
         elif parsed.path == "/session-end":
             body = self._read_json()
@@ -5135,6 +5051,14 @@ def main():
         pool.pool_session_guard("pool-server")
     except Exception:
         pass
+    # The board page writes as whoever typed in its name box, and that box
+    # defaults to board-ui. Registering it here is what keeps the first click
+    # from being a 403 the page has no way to explain.
+    try:
+        if not pool.is_registered("board-ui"):
+            pool.register_app("board-ui")
+    except Exception:
+        pass
     server = PoolServer(("0.0.0.0", PORT), PoolHandler)
     threading.Thread(target=ws_bridge.loop, daemon=True,
                      name="ws-bridge").start()
@@ -5169,11 +5093,13 @@ def main():
     print(f"  GET  /patterns           (whole plane's link shape: islands/springs/wells + hubs)")
     print(f"  GET  /curator?prune=1    (what the feed hides AND what the plane prunes)")
     print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
-    print(f"  GET  /tasks?q=&status=&owner= (task board: pending/in_progress/done/blocked/cancelled + owner)")
-    print(f"  GET  /tasks/ui      (read-only board page)     /tasks/summary")
-    print(f"  POST /task {{app, title, desc?, parent?, owner?, due?, tags?, refs?}}")
-    print(f"  POST /task/update {{app, id, status?|owner?|note?|action:'claim'}}")
+    print(f"  GET  /tasks?status=&owner=&parent=&tag=&q=&view=  (open|folded|all — the board's own split)")
+    print(f"  GET  /tasks/ui      (writable board page)      /tasks/summary   /holds")
+    print(f"  POST /task {{app, title, desc?, parent?, owner?, due?, tags?, refs?, status?}}")
+    print(f"  POST /task/update {{app, id, title?|desc?|status?|owner?|note?|add_tags?|remove_tags?|action:'claim'}}")
     print(f"  POST /tasks/sync {{apply?}}        (bridge: inbox board → pool tasks; dry-run by default)")
+    print(f"  POST /tasks/pull {{apply?}}        (bridge: pool tasks → inbox cards; dry-run by default)")
+    print(f"  GET  /holds                      (who holds which in_progress task, and for how long)")
     print(f"  POST /session-end  {{app, force?}}   (auto-write a block on session close)")
     print(f"  POST /flush   (emit + push now)")
     try:
