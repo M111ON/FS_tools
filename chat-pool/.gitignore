@@ -35,3 +35,5 @@ opencode.json
 # server runtime logs
 .server*.log
 .server.err
+.keepalive.log
+.keepalive.pid
