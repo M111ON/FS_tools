@@ -80,10 +80,58 @@ Env-gated by `ANN_GRAFT=1`; **off by default**, strict no-op when off.
    file-centric traffic (fast, rough), with the tombstone making repeats cheap —
    not as a replacement for the anchor route or exact search.
 
+## Backward / reciprocal ("magnetic") score — what can be computed backwards
+
+The score is our own formula, so it is **invertible** (measured, exact):
+
+```
+squash:  s = w/(w+k)   ->  w   = k·s/(1-s)        (max abs error 8.5e-14)
+magnet:  v = x·ret^rho ->  ret = (v/x)^(1/rho)    (max abs error 2.2e-16)
+```
+
+So a stored score can be run back to its raw weight and its return strength —
+nothing is lost. The interesting "backwards" is on the **graph direction**:
+
+**The graft graph is a dependency DAG.** 0 of 2,091 non-self file pairs have a
+reverse edge, so a *direct* reciprocal (`min`/`geomean` of A→B and B→A) is 0
+everywhere and is useless here. The magnet has to be measured **indirectly**:
+
+- `ret(A,B) = |out(A) ∩ out(B)| / |out(A)|` — how much B's orbit points back into
+  A's orbit. **275 / 2,091 pairs (13%)** have a non-zero return, touching
+  **259 / 836** files. This is implemented as `magnet()` in `scripts/graft_bias.py`
+  (`--magnet indirect --rho 0.5`).
+
+**Backward candidate expansion** (`ANN_GRAFT_BACKWARD=1`): a file that points at
+the query's file (an **in-edge**) contributes its entries. This is the transpose
+of the forward walk and it is where a leaf/header's context lives:
+
+| file | forward degree | in-degree | candidates F → B |
+|---|---|---|---|
+| `core/geo_wang_latch.h` | 1 | 8 | 20 → **101** |
+| `core/anchor_route.h` | 0 | 20 | 180 → **370** |
+| `core/geo_id_route_log.h` | 0 | 5 | 11 → **21** |
+| `core/gguf_box.h` | — | — | 96 → **238** |
+
+### Measured (real 57k index, anchor route disabled, brute = reference)
+
+| query | sc_F | sc_B | R@10_F | R@10_B |
+|---|---|---|---|---|
+| `core/geo_wang_latch.h tombstone warm route` | 20 | 101 | 0.00 | 0.00 |
+| `tools/gguf_lazy_serve.c anchor route buckets` | 266 | 266 | 0.60 | 0.60 |
+| `core/anchor_route.h centroids nearest bucket` | 180 | 370 | 0.60 | 0.60 |
+| `core/geo_id_route_log.h p3 log crc` | 11 | 21 | 0.00 | **0.10** |
+| `core/gguf_box.h routing engine zero-copy` | 96 | 238 | 0.10 | 0.10 |
+| `tools/maze_walk_cli.c greedy descent` | 206 | 206 | 0.10 | 0.10 |
+
+**Mean R@10: forward 0.233 → backward 0.250.** Backward widens the candidate set
+(and lifts the sparsest file off 0.00), but the recall gain is small — because the
+true top-10 for a semantic query is mostly entries that do **not** name the file
+and are not structurally adjacent to it. Structure (forward or backward) is a
+rough map, not the semantic answer. Both directions remain env-gated; forward is
+the default.
+
 ## Next levers (not done)
 
-- **Widen the neighbourhood** (2-hop, or co-file expansion) to lift recall for
-  sparse files — trade scan cost for recall.
 - **Front-tier fallback**: return graph hits, and fall back to the full scan
   when the graph subset is tiny or the top score is below a confidence floor.
 - **Graph + anchor**: once a route IS trained, use the graph to *bias the bucket

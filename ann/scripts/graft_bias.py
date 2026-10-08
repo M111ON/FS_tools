@@ -24,7 +24,7 @@ USAGE
   python scripts/graft_bias.py --mode 2hop --damp 0.5 --k 5
   python scripts/graft_bias.py --rel calls=1.0,imports=0.7,extends=0.9,contains=0.4
 """
-import argparse, collections, json, os, re, sqlite3, sys
+import argparse, collections, json, math, os, re, sqlite3, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -63,6 +63,58 @@ def build_rel(edges, rel_w, conf_w, k):
     for (a, b), w in raw.items():
         out[a][b] = round(w / (w + k), 6)
     return out, raw
+
+
+def sym_mode(rel, rho):
+    """Reciprocal ("magnetic") pair weight — DIRECT form.
+
+    NOTE (measured on the real graft graph, 2026-10-08): that graph is a
+    dependency DAG — 0 of 2,091 non-self file pairs have a reverse edge. So the
+    DIRECT reciprocal here is 0 for almost every pair and is kept only for
+    completeness. Use `magnet` for the form that actually fires on a DAG.
+    """
+    out = collections.defaultdict(dict)
+    for a in set(rel):
+        for b, x in rel[a].items():
+            y = rel.get(b, {}).get(a, 0.0)
+            if rho == 0.0:
+                v = max(x, y)
+            elif rho == 1.0:
+                v = min(x, y)
+            else:
+                v = (x ** rho) * (y ** (1.0 - rho))
+            out[a][b] = round(v, 6)
+    return out
+
+
+def magnet(rel, rho=0.5):
+    """Reciprocal ("magnetic") pair weight — INDIRECT form.
+
+    A dependency graph has no A->B / B->A pair (it is a DAG), so the magnet is
+    measured through the RETURN PATH: how much B's own orbit points back into
+    A's orbit. With
+        aout = neighbours of A (A->B itself included)
+        back = neighbours of B
+        ret  = |aout ∩ back| / |aout|      in [0,1]   (the return strength)
+    the magnet score is
+        w(A,B) = base(A->B) ** (1 - rho) * (base(A->B) * ret) ** rho
+    so rho=0 gives the plain one-way weight (today's behaviour) and rho=1 makes
+    the score vanish unless B's orbit points back into A's (mutual). This is the
+    "field lines loop around the pair" idea: attraction is not the edge, it is
+    the edge PLUS the return.
+    """
+    out = collections.defaultdict(dict)
+    for a in set(rel):
+        aout = set(rel[a])
+        for b, x in rel[a].items():
+            back = set(rel.get(b, {}))
+            inter = aout & back
+            if a in back:
+                inter = inter | {a}
+            ret = (len(inter) / len(aout)) if aout else 0.0
+            v = (x ** (1.0 - rho)) * ((x * ret) ** rho)
+            out[a][b] = round(v, 6)
+    return out
 
 
 def neighborhood(rel, raw, mode, damp, k):
@@ -117,6 +169,10 @@ def main():
     ap.add_argument("--mode", default="direct", choices=["direct", "2hop", "max", "sum"])
     ap.add_argument("--damp", type=float, default=0.5)
     ap.add_argument("--k", type=float, default=5.0)
+    ap.add_argument("--rho", type=float, default=0.5,
+                    help="reciprocal ('magnetic') mix: 1=mutual min, 0.5=geometric mean, 0=one-way max")
+    ap.add_argument("--magnet", default="indirect", choices=["indirect", "direct", "off"],
+                    help="reciprocal form: indirect (return-path, DAG-safe), direct (A<->B), off (one-way)")
     a = ap.parse_args()
 
     rel_w, conf_w = parse_rel(a.rel), parse_rel(a.conf)
@@ -124,6 +180,14 @@ def main():
     edges = json.load(open(a.wiring, encoding="utf-8"))["edges"]
     rel, raw = build_rel(edges, rel_w, conf_w, a.k)
     print(f"  edges {len(edges)} -> {sum(len(v) for v in rel.values())} directed file pairs, {len(rel)} files")
+    if a.magnet == "indirect" and a.rho > 0.0:
+        rel = magnet(rel, a.rho)
+        print(f"  magnet (indirect return-path) rho={a.rho}")
+    elif a.magnet == "direct" and a.rho > 0.0:
+        rel = sym_mode(rel, a.rho)
+        print(f"  reciprocal (direct) rho={a.rho}")
+    else:
+        print("  one-way (no reciprocal)")
     nb = neighborhood(rel, raw, a.mode, a.damp, a.k)
     print(f"  mode={a.mode} damp={a.damp} k={a.k}")
 
@@ -162,7 +226,7 @@ def main():
                 f.write(sid + "\t" + "\t".join(ids) + "\n")
 
     cfg = {"wiring": a.wiring, "rel_weights": rel_w, "conf_weights": conf_w,
-           "mode": a.mode, "damp": a.damp, "k": a.k,
+           "mode": a.mode, "damp": a.damp, "k": a.k, "rho": a.rho,
            "files": len(rel), "entries_with_keys": len(keys)}
     json.dump(cfg, open(os.path.join(a.out, "bias.json"), "w", encoding="utf-8"), indent=2)
     print(f"wrote {a.out}/{{rel.json, entries.jsonl, bias.json, files.tsv, nb.tsv, keys.tsv}}")

@@ -144,6 +144,11 @@ ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
 | `ANN_AMP_BOOST` | `0` | tombstone × graft amplifier: multiply the bias of warm-bucket entries (needs `ANN_GRAFT=1` + `ANN_TOMBSTONE_WARM=1`) |
 | `ANN_AMP_K` | `2.0` | warm-bucket weight multiplier |
 | `ANN_GRAFT_CAND` | index size | cap on graph-proposed candidates in the train-free route |
+| `ANN_GRAFT_BACKWARD` | `0` | expand graph candidates via in-edges (files that point at the query's file) |
+
+The reciprocal ("magnetic") mix is **not** a server env var — it is baked into
+`nb.tsv` by `scripts/graft_bias.py --magnet indirect --rho 0.5`. See
+[`GRAPH-ROUTE.md`](GRAPH-ROUTE.md).
 
 Model (relation/confidence weights, neighbor mode `direct|2hop|max|sum`, damp,
 k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.

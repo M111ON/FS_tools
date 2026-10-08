@@ -295,6 +295,7 @@ static unsigned char *g_warm_flag = NULL;  /* [nent] 1 if entry is in a warm buc
 static int g_warm_flag_n = 0;
 static int g_warm_ord = 0;                 /* set by lz_mem_search: a warm path ran */
 static int g_amp_applied = 0;              /* entries whose bias was boosted (telemetry) */
+static int g_backward = 0;                 /* ANN_GRAFT_BACKWARD: expand candidates via in-edges */
 
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
@@ -695,6 +696,12 @@ static int *g_file_ent_off = NULL;    /* size g_file_nf+1: entries per file id *
 static int *g_file_ent_ids = NULL;    /* entry positions, grouped by file id */
 static int g_file_ent_n = 0;
 static int g_file_nf = 0;             /* number of file slots (files.tsv space) */
+/* reverse adjacency: for file f, the files that point AT f (in-edges). The
+ * graph is a DAG, so a leaf/header has forward degree 0 but may have many
+ * in-edges — the backward direction is where its context lives. */
+static int *g_rev_off = NULL;         /* size g_file_nf+1 */
+static int *g_rev_id = NULL;          /* source file ids, grouped by dst file id */
+static int g_rev_n = 0;
 
 static int graft_file_id(const char *path) {
     for (int i = 0; i < g_fn_cap; i++)
@@ -769,6 +776,8 @@ static void graft_free(void) {
     free(g_file_ent_off); g_file_ent_off = NULL;
     free(g_file_ent_ids); g_file_ent_ids = NULL;
     g_file_ent_n = 0; g_file_nf = 0;
+    free(g_rev_off); g_rev_off = NULL;
+    free(g_rev_id); g_rev_id = NULL; g_rev_n = 0;
     free(g_warm_flag); g_warm_flag = NULL; g_warm_flag_n = 0;
     for (int i = 0; i < g_fn_cap; i++) free(g_fnames[i]);
     free(g_fnames); g_fnames = NULL;
@@ -894,6 +903,7 @@ static void graft_init(LZEntry *ents, int nent) {
      * still knows the user's intent; it stays inert without a graft bias. */
     { const char *ab = getenv("ANN_AMP_BOOST"); g_amp_boost = (ab && atoi(ab)) ? 1 : 0; }
     { const char *ak = getenv("ANN_AMP_K"); if (ak && atof(ak) > 0) g_amp_k = (float)atof(ak); }
+    { const char *bw = getenv("ANN_GRAFT_BACKWARD"); g_backward = (bw && atoi(bw)) ? 1 : 0; }
     const char *on = getenv("ANN_GRAFT");
     if (!on || !atoi(on)) { g_graft_ready = 1; return; }   /* off by design */
     g_graft_on = 1;
@@ -936,9 +946,35 @@ static void graft_init(LZEntry *ents, int nent) {
             g_file_ent_n = nent;
         }
     }
+    /* reverse adjacency from the nb.tsv edges (transpose): for each dst, the
+     * srcs that point at it. Used by the backward candidate expansion. */
+    if (g_nb_nf > 0 && g_nb_n > 0) {
+        g_rev_off = (int *)calloc((size_t)g_file_nf + 1, sizeof(int));
+        g_rev_id = (int *)malloc((size_t)g_nb_n * sizeof(int));
+        if (g_rev_off && g_rev_id) {
+            /* nb.tsv is CSR by src: row src = [g_nb_off[src], g_nb_off[src+1]) */
+            for (int src = 0; src < g_nb_nf && src < g_file_nf; src++)
+                for (int t = g_nb_off[src]; t < g_nb_off[src + 1]; t++) {
+                    int dst = g_nb_id[t];
+                    if (dst >= 0 && dst < g_file_nf) g_rev_off[dst + 1]++;
+                }
+            for (int f = 0; f < g_file_nf; f++) g_rev_off[f + 1] += g_rev_off[f];
+            { int *cur = (int *)malloc((size_t)g_file_nf * sizeof(int));
+              if (cur) {
+                  for (int f = 0; f < g_file_nf; f++) cur[f] = g_rev_off[f];
+                  for (int src = 0; src < g_nb_nf && src < g_file_nf; src++)
+                      for (int t = g_nb_off[src]; t < g_nb_off[src + 1]; t++) {
+                          int dst = g_nb_id[t];
+                          if (dst >= 0 && dst < g_file_nf) g_rev_id[cur[dst]++] = src;
+                      }
+                  free(cur);
+              } }
+            g_rev_n = g_nb_n;
+        }
+    }
     g_graft_ready = 1;
-    fprintf(stderr, "[ann_search] graft bias ON lambda=%.3f files=%d entries_with_keys=%d route=%s\n",
-            g_graft_lambda, g_fn_cap, g_ent_n, g_file_ent_n ? "ready" : "off");
+    fprintf(stderr, "[ann_search] graft bias ON lambda=%.3f files=%d entries_with_keys=%d route=%s rev=%d\n",
+            g_graft_lambda, g_fn_cap, g_ent_n, g_file_ent_n ? "ready" : "off", g_rev_n);
 }
 
 /* called at request time, before query keys are needed (index may not have
@@ -1010,6 +1046,23 @@ static int graft_candidates(uint32_t *out, int cap) {
                 for (int s = 0; s < nseen; s++) if (eseen[s] == ei) { idx = s; break; }
                 if (idx < 0) { if (nseen >= ANCHR_MAXK) continue; idx = nseen; eseen[nseen++] = ei; }
                 if (escore[idx] < w) escore[idx] = w;
+            }
+        }
+        /* backward: entries carrying a file that POINTS AT this file (in-edges).
+         * The graph is a DAG, so a leaf/header has no forward degree but its
+         * context is exactly who points at it. Weight 1 (same as an exact file
+         * hit) because "a file that uses this file" is a strong structural tie. */
+        if (g_backward && g_rev_off) {
+            for (int t = g_rev_off[fid]; t < g_rev_off[fid + 1]; t++) {
+                int src = g_rev_id[t];
+                if (src < 0 || src >= g_file_nf) continue;
+                for (int u = g_file_ent_off[src]; u < g_file_ent_off[src + 1]; u++) {
+                    int ei = g_file_ent_ids[u];
+                    int idx = -1;
+                    for (int s = 0; s < nseen; s++) if (eseen[s] == ei) { idx = s; break; }
+                    if (idx < 0) { if (nseen >= ANCHR_MAXK) continue; idx = nseen; eseen[nseen++] = ei; }
+                    if (escore[idx] < 1) escore[idx] = 1;
+                }
             }
         }
     }
