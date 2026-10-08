@@ -5,23 +5,23 @@ WHY THIS EXISTS
   the process died (a real bug did this — a >4 KiB log record crashed every
   append), the hub stayed down until a human noticed. This is the keeper.
 
-WHAT IT DOES (loop, one instance only)
-  1. Is /health answering? -> leave the server alone.
-  2. Not answering? -> start pool_server.py detached, then wait for /health.
-  3. Repeat every CHECK seconds.
+WHAT IT DOES
+  one pass (once()): if /health answers, do nothing; else start the server
+  detached and wait for /health. The scheduled task runs --once every 5 min and
+  at logon; bare with no flag it loops in the foreground.
 
 GUARDS (learned from the failure that motivated this)
-  * ONE instance only. A PID file + a global mutex-free lock; if another keeper
-    holds it, this one exits instead of stacking servers.
-  * Backoff on crash-loop. If we start the server and it dies again quickly
-    (a real bug, not a one-off), we slow down instead of restarting in a tight
-    loop, and we log the failure loudly. A supervisor that spins on a broken
-    server is worse than none.
+  * ONE instance only. A PID file names the holder; a second keeper exits
+    instead of stacking a second server.
+  * Backoff on crash-loop. A server that dies quickly (a real bug, not a
+    one-off) is retried on a growing delay, not a tight loop. A supervisor that
+    spins on a broken server is worse than none.
   * Never kill a healthy server. We only ever START; we never taskkill.
 
 RUN
   pythonw.exe pool_keepalive.py        (the scheduled task; no console)
   python.exe  pool_keepalive.py --once (one pass, for a check)
+  python.exe  pool_keepalive.py demo   (isolated self-check, temp dir + port)
 """
 import json
 import os
@@ -33,7 +33,6 @@ import urllib.request
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PY = r"I:\python3.14.4\python.exe"
-PYW = r"I:\python3.14.4\pythonw.exe"
 SERVER = os.path.join(DIR, "pool_server.py")
 PIDFILE = os.path.join(DIR, ".keepalive.pid")
 LOG = os.path.join(DIR, ".keepalive.log")
@@ -68,10 +67,8 @@ def _healthy(timeout=3):
 def _only_instance():
     """Claim the keeper slot. A live PID in the file means someone else has it.
 
-    Not perfect on Windows (PID reuse), but the consequence of a false
-    positive is one skipped keeper, and the consequence of no guard is a
-    second keeper stacking a second server — worse. We also re-check that the
-    recorded PID looks like our own script before believing it.
+    Not perfect on Windows (PID reuse), but a false positive only skips one
+    keeper, while no guard lets a second keeper stack a second server — worse.
     """
     if os.path.exists(PIDFILE):
         try:
@@ -89,31 +86,30 @@ def _only_instance():
 
 
 def _pid_is_keepalive(pid):
-    """Does PID look like a live python running pool_keepalive? Best-effort."""
+    """Does PID look like a live python? Best-effort; cannot-tell means yes."""
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
-        return True   # cannot tell -> assume it is, and skip (safer than stacking)
+        return True
     return "python" in out.lower()
 
 
 def _start_server():
-    """Start pool_server.py detached, no console, logs beside the code."""
+    """Start the server detached, no console, logs beside the code."""
     out = open(os.path.join(DIR, ".server.log"), "ab")
     err = open(os.path.join(DIR, ".server.err"), "ab")
     flags = 0
     if hasattr(subprocess, "DETACHED_PROCESS"):
         flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    p = subprocess.Popen([PY, SERVER], cwd=DIR,
-                         stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                         creationflags=flags, close_fds=True)
-    return p
+    return subprocess.Popen([PY, SERVER], cwd=DIR,
+                            stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                            creationflags=flags, close_fds=True)
 
 
 def _wait_healthy(seconds=25):
-    """Poll /health until it answers or the budget runs out. Returns bool."""
+    """Poll /health until it answers or the budget runs out."""
     deadline = time.time() + seconds
     while time.time() < deadline:
         if _healthy():
@@ -123,7 +119,7 @@ def _wait_healthy(seconds=25):
 
 
 def once():
-    """One supervision pass. Returns True if the server is healthy afterward."""
+    """One supervision pass. True iff the server is healthy afterward."""
     if _healthy():
         return True
     _log("server DOWN -> starting")
@@ -151,19 +147,93 @@ def main():
     backoff = BACKOFF_MIN
     while True:
         t0 = time.time()
-        ok = once()
-        if ok:
+        if once():
             backoff = BACKOFF_MIN
             time.sleep(CHECK)
             continue
-        # failed start or fast death: back off so a broken server is not
-        # restarted in a tight loop (that was the whole hazard)
-        lived = time.time() - t0
-        if lived < FAST_DEATH:
+        if time.time() - t0 < FAST_DEATH:   # died fast: real bug, slow down
             backoff = min(BACKOFF_MAX, backoff * 2)
         _log("retry in %ds" % backoff)
         time.sleep(backoff)
 
 
+# ── self-check (temp dir + temp port; never touches the live hub) ───────
+def demo():
+    """Runs once()/guards against a STUB server on a free port, in a temp dir.
+
+    A stub, not the real pool_server, on purpose: this proves the keeper's
+    contract (poll -> start on down -> wait for health -> never stack) fast and
+    deterministically. Booting a 320 KB server in a self-check would be neither.
+    """
+    import socket
+    import tempfile
+    import shutil
+
+    global DIR, SERVER, PIDFILE, LOG, PORT, HEALTH
+
+    box = tempfile.mkdtemp(prefix="keepalive-demo-")
+    stub = os.path.join(box, "stub_server.py")
+    with open(stub, "w", encoding="utf-8") as f:
+        f.write(
+            "import json, os\n"
+            "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+            "open(os.path.join(os.path.dirname(os.path.abspath(__file__)),"
+            " 'starts.log'), 'a').write('x\\n')\n"
+            "class H(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        b = json.dumps({'ok': True}).encode()\n"
+            "        self.send_response(200)\n"
+            "        self.send_header('Content-Type', 'application/json')\n"
+            "        self.send_header('Content-Length', str(len(b)))\n"
+            "        self.end_headers(); self.wfile.write(b)\n"
+            "    def log_message(self, *a): pass\n"
+            "HTTPServer(('127.0.0.1', int(os.environ['POOL_PORT'])),"
+            " H).serve_forever()\n")
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    DIR, SERVER = box, stub
+    PIDFILE = os.path.join(box, ".keepalive.pid")
+    LOG = os.path.join(box, ".keepalive.log")
+    PORT = port
+    HEALTH = "http://127.0.0.1:%d/health" % port
+    os.environ["POOL_PORT"] = str(port)
+    starts = os.path.join(box, "starts.log")
+
+    ok = []
+    ok.append(_healthy(timeout=2) is False)                 # nothing is up yet
+    ok.append(once() is True)                               # starts it
+    ok.append(_healthy() is True)                           # /health answers
+    ok.append(once() is True)                               # second pass: no-op
+    n = len(open(starts).read().split()) if os.path.exists(starts) else 0
+    ok.append(n == 1)                                       # started exactly once
+    ok.append(_wait_healthy(seconds=5) is True)             # poll returns fast
+    open(PIDFILE, "w").write(str(os.getpid()))
+    ok.append(_only_instance() is True)                     # own pid -> holder
+    open(PIDFILE, "w").write("999999")
+    ok.append(_only_instance() is True)                     # dead pid -> take it
+
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "(Get-NetTCPConnection -LocalPort %d -State Listen"
+         " -EA SilentlyContinue).OwningProcess" % port],
+        capture_output=True, text=True).stdout.split()
+    for pid in set(out):
+        if pid.isdigit():
+            subprocess.run(["taskkill", "/F", "/PID", pid],
+                           capture_output=True, text=True)
+    shutil.rmtree(box, ignore_errors=True)
+
+    fails = [i for i, x in enumerate(ok) if not x]
+    print("pool_keepalive demo: %d/%d ok%s" % (sum(ok), len(ok),
+          "  FAILED at " + ",".join(map(str, fails)) if fails else ""))
+    return all(ok)
+
+
 if __name__ == "__main__":
+    if "demo" in sys.argv:
+        sys.exit(0 if demo() else 1)
     sys.exit(main())
