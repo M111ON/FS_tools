@@ -27,6 +27,39 @@ import inbox_bridge
 PORT = int(os.environ.get("POOL_PORT", 8390))
 _lock = threading.Lock()
 
+# ── ANN search backend (I:/tools/ann) ──────────────────────────────────
+# The pool has no vector search of its own. The standalone ANN fork answers
+# POST /v1/state/search {query, topk} -> {hits:[{sid,file,score,...}], route}.
+# It is an OPTIONAL upstream: absent/down = /semantic reports "unavailable",
+# the pool never blocks or crashes on it.
+ANN_URL = os.environ.get("POOL_ANN_URL", "http://127.0.0.1:8096")
+_ANN_TIMEOUT = float(os.environ.get("POOL_ANN_TIMEOUT", "30"))
+
+
+def _ann_search(query, topk=5, timeout=None):
+    """POST to the ANN server. Returns (ok, status, payload).
+
+    status is the HTTP code when the ANN server answered (even an error, e.g.
+    400 topk_out_of_range) or None when it could not be reached. Never raises:
+    the pool is a proxy, so it must relay the upstream's verdict, not invent
+    one. The ANN server is the single source of truth for its own topk max."""
+    body = json.dumps({"query": query, "topk": int(topk)}).encode("utf-8")
+    req = urllib.request.Request(
+        ANN_URL.rstrip("/") + "/v1/state/search", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or _ANN_TIMEOUT) as r:
+            return True, r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            payload = {"error": "ann http %s" % e.code}
+        return False, e.code, payload
+    except Exception as e:
+        return False, None, {"error": "%s: %s" % (type(e).__name__, e)}
+
+
 # ── task board page ───────────────────────────────────────────────────
 # Its own file, not a string in here: it grew from a read-only list into the
 # thing people actually work in — new/edit/status/tag, a status vocabulary you
@@ -4403,6 +4436,37 @@ class PoolHandler(BaseHTTPRequestHandler):
                     lines = f.read().count(b"\n")
             self._json(200, {"ok": True, "lines": lines, "log": pool.LOG})
 
+        elif parsed.path == "/semantic":
+            # proxy to the standalone ANN search server (I:/tools/ann). The
+            # pool has no vector search of its own — this is the ONE read that
+            # leaves the box, so it is explicit: ?q=<text>&k=<1..32>.
+            # The ANN upstream is optional; down = 200 with ok:false so a
+            # caller can tell "no results" from "search unavailable".
+            q = (qs.get("q", [""])[0] or "").strip()
+            if not q:
+                self._json(400, {"error": "?q=<text> required"})
+                return
+            k = self._int_param(qs, "k", 5, cap=32)
+            if k is _REFUSED:
+                return
+            ok, status, payload = _ann_search(q, k)
+            if ok:
+                hits = payload.get("hits", [])
+                self._json(200, {"ok": True, "query": q, "k": k, "count": len(hits),
+                                 "hits": hits, "route": payload.get("route", {}),
+                                 "upstream": ANN_URL})
+            elif status is not None:
+                # the ANN server answered, but refused (e.g. 400
+                # topk_out_of_range). Relay ITS verdict and its own limit —
+                # this proxy does not invent a max.
+                self._json(status, {"ok": False, "query": q, "k": k,
+                                    "error": payload.get("error", "ann refused"),
+                                    "upstream": ANN_URL, "ann": payload})
+            else:
+                # could not reach the ANN server at all
+                self._json(200, {"ok": False, "error": payload.get("error", "ann unavailable"),
+                                 "upstream": ANN_URL, "query": q})
+
         elif parsed.path == "/tail":
             n = self._int_param(qs, "n", 10, cap=500)
             if n is _REFUSED:
@@ -5093,6 +5157,7 @@ def main():
     print(f"  GET  /patterns           (whole plane's link shape: islands/springs/wells + hubs)")
     print(f"  GET  /curator?prune=1    (what the feed hides AND what the plane prunes)")
     print(f"  GET  /tail?n=10   /view?n=20&cloud=0|1   /stream?n=5 (SSE)   /health")
+    print(f"  GET  /semantic?q=&k=   (semantic search via ANN at {ANN_URL})")
     print(f"  GET  /tasks?status=&owner=&parent=&tag=&q=&view=  (open|folded|all — the board's own split)")
     print(f"  GET  /tasks/ui      (writable board page)      /tasks/summary   /holds")
     print(f"  POST /task {{app, title, desc?, parent?, owner?, due?, tags?, refs?, status?}}")
