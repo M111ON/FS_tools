@@ -64,12 +64,51 @@ curl -s -X POST -H "Content-Type: application/json" \
 Verified ad-hoc 8/8 (scratch port, fresh route log): build, novel anchor mode,
 two overlapping queries reduce, warm top-k == OFF top-k, OFF repeat identical.
 
-## Relationship to the Confident Guideline
+## Relationship to the Confident Guideline — the amplifier (wired 2026-10-08)
 
-Two separate axes, both env-gated and composable:
+Two axes, both env-gated and composable:
 
 - **structural** (`ANN_GRAFT`): which code a query is about — static, baked.
 - **hot/cold** (`ANN_TOMBSTONE_WARM`): which routes were just walked — per query.
 
-The tombstone is the amplifier: a route it keeps warm can later carry a stronger
-cluster weight. Keep the two switches independent.
+The tombstone is the amplifier, and the two are now **composed in code**: with
+`ANN_AMP_BOOST=1`, an entry sitting in a bucket the tombstone kept warm has its
+graft bias multiplied by `ANN_AMP_K` (default 2.0). The multiplier applies to the
+bias only (never the cosine score), so it is a strict no-op unless *both* axes are
+on. Response field `route.amp = {on, k, applied}` reports it.
+
+## Tuning the warm path so it actually pays (2026-10-08)
+
+The warm path is inert at `topk ≥ 3` because the default route walks
+`topb = topk + 4` buckets — enough to cover the whole index (B1). Pin the bucket
+count with the existing `LZ_ROUTE_BUCKETS` knob; at `LZ_ROUTE_BUCKETS=5` the route
+is a genuine subset and the warm path (and the amplifier) are live at `topk=5`:
+
+| config | mode | items_scored | amp.applied |
+|---|---|---|---|
+| `topk=5`, default topb=9→8 | warm (inert) | 56570 / 57076 | — |
+| `topk=5`, `LZ_ROUTE_BUCKETS=5` | warm | 48210 / 57076 | **87** |
+
+Measured amplifier effect (`ANN_GRAFT=1 ANN_TOMBSTONE_WARM=1 LZ_ROUTE_BUCKETS=5`,
+fresh route log, warm pass) — identical scored set, re-ranked toward the warm
+cluster:
+
+| query | OFF top-5 | ON top-5 |
+|---|---|---|
+| `core/geo_wang_latch.h tombstone warm route` | ebf0bbc0bb, 97296c1abc, 131f34e983, 800a03cad6, 579f5156b0 | ebf0bbc0bb, 97296c1abc, 131f34e983, **cf764fd707**, **404ad7b548** |
+| `core/geo_id_route_log.h p3 log crc` | 4c44d797bb, f162046894, 664262fa40, 00348f39d5, 7c0cd6480d | 4c44d797bb, f162046894, 664262fa40, **6f6b78a06f**, **fbc67f9a2a** |
+
+Warm entries climb into the top-5 on **3/5** path-bearing queries; the warm
+entries gain exactly `+λ` (0.05) — the multiplier on the structural weight, not on
+the cosine score. Receipts: `I:\tmp\amp_test\amp_final.py` (A/B),
+`I:\tmp\amp_test\amp_sanity.py` (raw `amp` field, OFF applied=0 / ON applied=87).
+
+## Honest limits (amplifier)
+
+- **Graft keys gate it.** The boost only fires for entries that carry file keys
+  (`data/graft/keys.tsv`) and queries that name a repo path (`core/x.h`). A query
+  with no path token has `g_qn=0`, so the bias is 0 and the amplifier is inert.
+- **Two small flips, not a recall change.** It re-ranks within the scored set; it
+  is a nudge, not a filter. Novel-query recall is untouched by construction.
+- **Both switches required.** `ANN_AMP_BOOST` without `ANN_GRAFT=1` or without a
+  live warm route does nothing (reported as `amp.applied=0`).

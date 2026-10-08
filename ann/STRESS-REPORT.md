@@ -8,9 +8,20 @@
 > freezes the service), **#5** `/health` now probes the embed sidecar
 > (`status:ok|degraded`, `embed:ok|down`), **#6/#7** embed failure → `503`, missing
 > query → `400`. Verified ad-hoc (10/10) and live (Thai via chat-pool `/semantic`
-> now matches raw UTF-8). Still open, lower severity: **#8** SO_REUSEADDR split-brain
-> (SO_EXCLUSIVEADDRUSE added — verify), **#9** stale cache on same-second rewrite,
-> **#10** 2047-char truncation, **#11** topk coercion, **#12–15** telemetry/hygiene.
+> now matches raw UTF-8). Still open, lower severity: **#9** stale cache on
+> same-second rewrite, **#10** 2047-char truncation, **#11** topk coercion,
+> **#12–15** telemetry/hygiene.
+>
+> **#8 — VERIFIED, AND THE FIRST FIX WAS WRONG (corrected 2026-10-08).** The
+> first attempt set `SO_REUSEADDR` *then* `SO_EXCLUSIVEADDRUSE`. On Windows the
+> two are **mutually exclusive**: the exclusive `setsockopt` fails
+> `WSAEINVAL(10022)` and the port stays shareable, so two instances still bound
+> `:8096` (reproduced against the shipped binary: both processes alive, split
+> brain). The correct fix is **`SO_EXCLUSIVEADDRUSE` alone** (no `SO_REUSEADDR`
+> on Windows); the second bind then fails `WSAEADDRINUSE(10048)` and the process
+> exits 1. Receipts: `I:\tmp\verify8_sock.c` (three socket regimes) and
+> `I:\tmp\ann_v8b\bind_test.py` (A/B against the real binary). Non-Windows keeps
+> `SO_REUSEADDR` (fast restart, no split-brain there).
 
 **Target:** `I:/tools/ann` (standalone ANN server, fork of DWGLS `8c85f9f`)
 **Box:** Windows 10.0.19045 (MSYS_NT-10.0-19045), x86_64, gcc 8.1.0, Python 3.14.7, curl 8.18.0
@@ -283,6 +294,17 @@ Two processes bind `:8104` with no error; which one answers a given connection i
 undefined. The keepalive supervisor's "never kill a healthy server — we only ever START"
 policy (README) makes duplicate starts plausible (e.g. two `--once` runs racing), so this
 is a real split-brain risk.
+
+### Resolution (verified 2026-10-08)
+
+Fixed by binding with **`SO_EXCLUSIVEADDRUSE` only** on Windows. The first attempt
+(`SO_REUSEADDR` then `SO_EXCLUSIVEADDRUSE`) was a silent no-op — the two options
+are mutually exclusive, the exclusive `setsockopt` returns `WSAEINVAL(10022)`, and
+the port stays shareable (measured: two shipped-binary instances both alive on one
+port). With `SO_EXCLUSIVEADDRUSE` alone the second instance's `bind` fails
+`WSAEADDRINUSE(10048)` and it exits 1. Receipts:
+`I:\tmp\verify8_sock.c` (regimes A/B/C) and `I:\tmp\ann_v8b\bind_test.py`
+(A/B against the real binary: committed = SPLIT-BRAIN, fixed = SAFE).
 
 ---
 

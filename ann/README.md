@@ -141,6 +141,8 @@ ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
 | `ANN_GRAFT_LAMBDA` | `0.05` | bias strength (0 = off) |
 | `ANN_GRAFT_MAXN` | `4` | max file keys per entry |
 | `ANN_GRAFT_DIR` | `data/graft` | tables dir |
+| `ANN_AMP_BOOST` | `0` | tombstone × graft amplifier: multiply the bias of warm-bucket entries (needs `ANN_GRAFT=1` + `ANN_TOMBSTONE_WARM=1`) |
+| `ANN_AMP_K` | `2.0` | warm-bucket weight multiplier |
 
 Model (relation/confidence weights, neighbor mode `direct|2hop|max|sum`, damp,
 k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.
@@ -149,11 +151,19 @@ k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.
 share in top-10 rose 0.395 → 0.83 at λ=0.05, but the top-10 order also
 changed ~44% — λ=0.02 is the conservative point (+22% cluster, 22% reorder).
 
-**Tombstone is the amplifier.** This bias is the *structural* axis (which code
-a query is about — static, baked). The fog latch / tombstone is the *hot/cold*
-axis (which routes were just walked — changes per query). They compose: a route
-the tombstone keeps warm can carry a stronger cluster weight later. Keep them
-separate.
+**Tombstone is the amplifier — now wired and measured.** This bias is the
+*structural* axis (which code a query is about — static, baked). The fog latch /
+tombstone is the *hot/cold* axis (which routes were just walked — changes per
+query). They now **compose**: with `ANN_AMP_BOOST=1`, an entry that sits in a
+bucket the tombstone kept warm has its graft bias **multiplied by `ANN_AMP_K`**
+(default 2.0). The boost multiplies the bias only — never the cosine score — so
+with either axis off it is a strict no-op and recall is untouched.
+
+Measured (57k memcore index, `ANN_GRAFT=1 ANN_TOMBSTONE_WARM=1 LZ_ROUTE_BUCKETS=5`,
+warm pass): a warm route scores the same items, but the multiplier promotes the
+warm cluster — `route.amp.applied` = 87 entries, and warm entries climb into the
+top-5 on 3/5 path-bearing queries (e.g. `cf764fd707`, `404ad7b548`). Off by
+default; keep the two switches independent.
 
 ## Tombstone warm path (hot/cold axis) — OPTIONAL, OFF by default
 

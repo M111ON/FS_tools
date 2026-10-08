@@ -273,12 +273,27 @@ typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; i
 
 /* graft bias hooks (defined after lz_mem_search; used inside it) */
 static void graft_init(LZEntry *ents, int nent);
-static float graft_bias(const LZEntry *e, const int *qkeys, int qn);
+static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm);
 static void graft_query_keys(const char *q);
 static int g_graft_on = 0;                 /* master switch (env ANN_GRAFT) */
 static int g_qkeys[16], g_qn = 0;          /* query-side file keys, per request */
 static int g_graft_ready = 0;              /* bias tables loaded (or off) */
 static void graft_ensure_init(void);       /* loads the tables once */
+
+/* ── tombstone × graft amplifier ──────────────────────────────────────
+ * The tombstone (fog latch) is the hot/cold axis: it knows which entries sit
+ * in a bucket this query just walked warm. The graft bias is the structural
+ * axis: a static weight toward the query's file cluster. Composed, a WARM
+ * entry — one whose bucket the tombstone already shut — may carry a STRONGER
+ * structural weight, because a route we keep hot is the route we trust.
+ * The boost MULTIPLIES the graft bias only (never the cosine score), so with
+ * the tombstone off or the graft bias off it is a strict no-op. */
+static int  g_amp_boost = 0;               /* ANN_AMP_BOOST (default 0 = off) */
+static float g_amp_k = 2.0f;               /* ANN_AMP_K, warm-bucket weight multiplier */
+static unsigned char *g_warm_flag = NULL;  /* [nent] 1 if entry is in a warm bucket */
+static int g_warm_flag_n = 0;
+static int g_warm_ord = 0;                 /* set by lz_mem_search: a warm path ran */
+static int g_amp_applied = 0;              /* entries whose bias was boosted (telemetry) */
 
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
@@ -430,6 +445,14 @@ static int lz_mem_search(const float *qv, int qd,
     int nent = 0;
     int use_cache = lz_index_cached(&ents, &nent);
     if (!g_graft_ready) graft_init(ents, nent);   /* load bias tables once */
+    /* the warm-entry flags are per request; lz_mem_search is serialized under
+     * g_lock, so a single reusable buffer is safe. */
+    g_warm_ord = 0;
+    g_amp_applied = 0;
+    if (g_warm_flag_n < nent) {
+        unsigned char *nf = (unsigned char *)realloc(g_warm_flag, (size_t)(nent ? nent : 1));
+        if (nf) { g_warm_flag = nf; g_warm_flag_n = nent; }
+    }
     char rm[16];
     snprintf(rm, sizeof(rm), "%s", "brute");
     int rb[ANN_MAXK];
@@ -469,7 +492,9 @@ static int lz_mem_search(const float *qv, int qd,
              * before. NOTE: an EXACT repeat routes to the same buckets, which
              * the previous run just shut, so the warm set equals the walked set
              * (no reduction); the gain appears when a query's route OVERLAPS
-             * previously-walked buckets. Measured — see WARM-PATH.md. */
+             * previously-walked buckets. Measured — see WARM-PATH.md.
+             * The warm set is also handed to the graft bias (below) as the
+             * "tombstone × graft" amplifier. */
             if (g_warm_on && rnb > 0) {
                 int shut[ANN_MAXK];
                 int nshut = 0;
@@ -492,6 +517,7 @@ static int lz_mem_search(const float *qv, int qd,
                                 int a = ents[i].anchor, a2 = ents[i].anchor2, in = 0;
                                 for (int b = 0; b < rnb; b++)
                                     if (shut[b] && (a == rb[b] || a2 == rb[b])) { in = 1; break; }
+                                if (g_warm_flag) g_warm_flag[i] = (unsigned char)in;
                                 if (in) o2[w++] = (uint32_t)i;
                             }
                             for (int i = 0; i < nent; i++) {
@@ -504,6 +530,7 @@ static int lz_mem_search(const float *qv, int qd,
                             ord_own = o2; ord = o2;
                             budget = cov;
                             snprintf(rm, sizeof(rm), "%s", "warm");
+                            g_warm_ord = 1;   /* a warm path ran: the amplifier is live */
                         }
                     }
                 }
@@ -541,8 +568,16 @@ static int lz_mem_search(const float *qv, int qd,
             double sc = (ents[ei].norm > 0) ? dot / (qn * ents[ei].norm) : -1;
             /* Confident Guideline: a soft cluster bias (never a filter). It only
              * ADDS to the score, so recall cannot drop; ranking is nudged toward
-             * structurally-related entries. Off unless ANN_GRAFT=1. */
-            if (g_graft_on) sc += graft_bias(&ents[ei], g_qkeys, g_qn);
+             * structurally-related entries. Off unless ANN_GRAFT=1.
+             * Tombstone × graft amplifier: if this entry sits in a bucket the
+             * tombstone kept warm, its structural weight is multiplied. */
+            if (g_graft_on) {
+                int warm = (g_warm_ord && g_warm_flag && ei < g_warm_flag_n) ? g_warm_flag[ei] : 0;
+                float b = graft_bias(&ents[ei], g_qkeys, g_qn, warm);
+                sc += b;
+                /* count only entries whose bias was actually multiplied */
+                if (warm && g_amp_boost && b != 0.0f) g_amp_applied++;
+            }
             scored++;
             for (int ti = 0; ti < topk; ti++) {
                 if (sc > top_sc[ti]) {
@@ -692,6 +727,7 @@ static void graft_free(void) {
     free(g_ent_gn); g_ent_gn = NULL;
     free(g_ent_gkeys); g_ent_gkeys = NULL;
     free(g_sid_hash); g_sid_hash = NULL;
+    free(g_warm_flag); g_warm_flag = NULL; g_warm_flag_n = 0;
     for (int i = 0; i < g_fn_cap; i++) free(g_fnames[i]);
     free(g_fnames); g_fnames = NULL;
     g_nb_nf = g_nb_n = g_ent_n = g_sid_cap = g_fn_cap = 0;
@@ -812,6 +848,10 @@ static void graft_load_keys(const char *path, LZEntry *ents, int nent) {
 
 static void graft_init(LZEntry *ents, int nent) {
     graft_free();
+    /* the amplifier flags are read unconditionally so the (graft-off) path
+     * still knows the user's intent; it stays inert without a graft bias. */
+    { const char *ab = getenv("ANN_AMP_BOOST"); g_amp_boost = (ab && atoi(ab)) ? 1 : 0; }
+    { const char *ak = getenv("ANN_AMP_K"); if (ak && atof(ak) > 0) g_amp_k = (float)atof(ak); }
     const char *on = getenv("ANN_GRAFT");
     if (!on || !atoi(on)) { g_graft_ready = 1; return; }   /* off by design */
     g_graft_on = 1;
@@ -842,14 +882,16 @@ static void graft_ensure_init(void) {
 }
 
 /* soft bias for one entry: sum over the entry's file keys of the neighborhood
- * score of any key shared with the query's keys. Returns 0 when off/absent. */
-static float graft_bias(const LZEntry *e, const int *qkeys, int qn) {
+ * score of any key shared with the query's keys. Returns 0 when off/absent.
+ * When `warm` and the amplifier is on, the result is scaled by g_amp_k — the
+ * tombstone strengthens the structural weight of a route it keeps hot. */
+static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm) {
     if (!g_graft_on || !g_graft_ready || e->gn <= 0 || qn <= 0) return 0.0f;
     float best = 0.0f;
     for (int i = 0; i < e->gn; i++) {
         int k = g_ent_gkeys[e->goff + i];
         for (int j = 0; j < qn; j++) {
-            if (k == qkeys[j]) return g_graft_lambda;   /* exact file match */
+            if (k == qkeys[j]) { best = g_graft_lambda; i = e->gn; break; }  /* exact file match */
             /* neighbor of the query key? */
             int a = g_nb_off[k], b = g_nb_off[k + 1];
             for (int t = a; t < b; t++) if (g_nb_id[t] == qkeys[j]) {
@@ -858,6 +900,7 @@ static float graft_bias(const LZEntry *e, const int *qkeys, int qn) {
             }
         }
     }
+    if (warm && g_amp_boost) best *= g_amp_k;   /* tombstone × graft amplifier */
     return best;
 }
 
@@ -1099,8 +1142,11 @@ static int handle_search(sock_t cli, const char *rq) {
             "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,",
             block_reads, items_scored, nent, us_per_item, budget, truncated);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u}}}",
+            "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u},",
             fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE);
+        srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
+            "\"amp\":{\"on\":%d,\"k\":%.2f,\"applied\":%d}}}",
+            (g_amp_boost && g_graft_on) ? 1 : 0, (double)g_amp_k, g_amp_applied);
     } else {
         srlen = snprintf(sresp, sizeof(sresp),
             "{\"status\":\"error\",\"error\":\"embed_unavailable\","
@@ -1189,11 +1235,20 @@ int main(int argc, char **argv) {
     sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == SOCK_INVALID) { fprintf(stderr, "socket fail\n"); return 1; }
     int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
-    /* On Windows SO_REUSEADDR alone lets a SECOND instance bind the same port
-     * (split-brain); SO_EXCLUSIVEADDRUSE makes the second bind fail loudly. */
+    /* STRESS-REPORT #8 — exclusive bind, verified. On Windows SO_REUSEADDR
+     * lets a SECOND instance bind the SAME port (split-brain). The first fix
+     * attempt set SO_REUSEADDR *then* SO_EXCLUSIVEADDRUSE, but on Windows the
+     * two are mutually exclusive: the exclusive setsockopt fails
+     * WSAEINVAL(10022) and the port stays shareable — verified: two live
+     * instances on one port. So do NOT set SO_REUSEADDR on Windows; keep only
+     * SO_EXCLUSIVEADDRUSE, which makes a second bind fail loudly with
+     * WSAEADDRINUSE(10048). Non-Windows keeps SO_REUSEADDR (standard
+     * fast-restart semantics; there is no split-brain there). */
 #ifdef SO_EXCLUSIVEADDRUSE
-    setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof(one));
+    if (setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof(one)) != 0)
+        fprintf(stderr, "[ann_search] SO_EXCLUSIVEADDRUSE setsockopt failed: %d\n", WSAGetLastError());
+#else
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
 #endif
     struct sockaddr_in sa;
     sa.sin_family = AF_INET;
