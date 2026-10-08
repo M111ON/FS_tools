@@ -471,15 +471,24 @@ static int lz_mem_search(const float *qv, int qd,
 /* ── GET /health ── */
 static int handle_health(sock_t cli) {
     LZEntry *ents = NULL; int nent = 0;
-    int cached = lz_index_cached(&ents, &nent);
+    lz_index_cached(&ents, &nent);
     int routed = lz_route_cached(nent);
-    char b[512];
+    if (!g_fog_ready) lz_fog_init();
+    int sh = 0;
+    for (unsigned wi = 0; wi < WL_WORDS; wi++) {
+        uint64_t w = g_fog.w[wi];
+        while (w) { sh += (int)(w & 1ull); w >>= 1; }
+    }
+    /* the index path is a Windows path — escape it or the JSON is invalid
+     * (\t, \a, \k are not legal escapes). */
+    char esc[512];
+    lz_json_escape(esc, sizeof(esc), PATH_INDEX);
+    char b[768];
     int bl = snprintf(b, sizeof(b),
         "{\"status\":\"ok\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
         "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"maxk\":%d,"
-        "\"fog\":{\"replayed\":%d,\"open\":%d}}",
-        PATH_INDEX, nent, routed, ANN_MAXK, g_fog_replayed, 0);
-    if (!cached) { /* still report, but flag */ }
+        "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
+        esc, nent, routed, ANN_MAXK, g_fog_replayed, sh, (unsigned)WL_FREE);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
