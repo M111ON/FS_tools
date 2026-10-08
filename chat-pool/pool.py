@@ -75,13 +75,43 @@ def _sha(path):
     return h.hexdigest()
 
 
+def _last_record_bytes():
+    """The last COMPLETE line of the log, as bytes, however long it is.
+
+    The old tail read the final 4096 bytes and took split(b"\n")[-1]. That is
+    the last line only while every record fits in 4096 bytes. One real line was
+    5799 B, so the window started mid-record, [-1] was a fragment, and
+    json.loads raised — which took append() down for EVERY writer, not just the
+    long one. Read backwards in chunks and stop at a real newline instead of
+    trusting a fixed window. Empty file -> b"" (caller decides what that means).
+    """
+    size = os.path.getsize(LOG) if os.path.exists(LOG) else 0
+    if size == 0:
+        return b""
+    CHUNK = 65536
+    with open(LOG, "rb") as f:
+        pos = size
+        buf = b""
+        while pos > 0:
+            step = min(CHUNK, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+            body = buf.rstrip(b"\r\n")
+            nl = body.rfind(b"\n")
+            if nl != -1:
+                return body[nl + 1:]
+            # no separator found yet: the last record is longer than what we read
+        return buf.strip(b"\r\n")
+
+
 def _prev():
     if not os.path.exists(LOG) or os.path.getsize(LOG) == 0:
         return "GENESIS"
-    with open(LOG, "rb") as f:
-        f.seek(max(0, os.path.getsize(LOG) - 4096))
-        last = f.read().decode("utf-8", "ignore").strip().split("\n")[-1]
-    return json.loads(last)["hash"]
+    last = _last_record_bytes()
+    if not last:
+        return "GENESIS"
+    return json.loads(last.decode("utf-8", "ignore"))["hash"]
 
 
 TAG_RE = re.compile(r"@([A-Za-z0-9_\-]+)")
@@ -1149,17 +1179,13 @@ def _last_line_is(body):
     back and matching the hash is exact on both platforms and needs no such
     assumption."""
     try:
-        size = os.path.getsize(LOG)
-        with open(LOG, "rb") as f:
-            f.seek(max(size - 4096, 0))
-            tailb = f.read()
+        tailb = _last_record_bytes()
     except OSError:
         return False
-    ends = [ln for ln in tailb.split(b"\n") if ln.strip()]
-    if not ends:
+    if not tailb.strip():
         return False
     try:
-        return json.loads(ends[-1].decode("utf-8")).get("hash") == body.get("hash")
+        return json.loads(tailb.decode("utf-8")).get("hash") == body.get("hash")
     except (ValueError, UnicodeDecodeError):
         return False
 
@@ -2976,6 +3002,16 @@ def _demo_body():
     assert _last_line_is({"hash": "0" * 64}) is False, "the tail is not a line we did not write"
     assert _last_line_is(tail(1)[0]) is True, "and it is the line we did write"
     assert open(LOG, "rb").read().endswith(b"\n"), "lines end in a newline on every platform"
+    # a record LONGER than the old 4096-byte tail window must still be read as a
+    # whole line: the previous _prev() started mid-record, took a fragment as
+    # [-1], and json.loads raised — killing append() for every writer
+    big = append("bench", "chat", "x" * 8000)
+    assert len(json.dumps(big, ensure_ascii=False).encode("utf-8")) > 4096, \
+        "the fixture really is longer than the old window"
+    assert _prev() == big["hash"], "a >4 KiB record is read whole (the 4096 window bug)"
+    assert _last_line_is(big) is True, "and the tail guard agrees"
+    assert json.loads(_last_record_bytes().decode("utf-8"))["hash"] == big["hash"], \
+        "the shared tail reader returns the complete record"
     # ── blocks: the story/method layer ─────────────────────────────────
     # refs must point at lines that exist NOW: the synthetic bench log above
     # rewrote this file (with fake hashes), so the bond lines are gone and the
