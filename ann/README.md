@@ -155,6 +155,15 @@ axis (which routes were just walked — changes per query). They compose: a rout
 the tombstone keeps warm can carry a stronger cluster weight later. Keep them
 separate.
 
+## Tombstone warm path (hot/cold axis) — OPTIONAL, OFF by default
+
+`ANN_TOMBSTONE_WARM=1` makes the walk read the fog latch before walking: buckets
+already SHUT (walked by an earlier query) are scored first, then the scan stops
+after them. An overlapping query scores fewer items with the **same top-k**; a
+novel query is unchanged. Inert at `topk>=3` on the 57k index (the route already
+covers everything — the B1 wall). Full numbers, limits, and reproduce steps in
+[`WARM-PATH.md`](WARM-PATH.md).
+
 ## Run as a service (Windows)
 
 The server is kept alive by a supervisor + a Task Scheduler entry, the same

@@ -241,6 +241,7 @@ static wl_log_t g_fog_log;
 static int g_fog_log_open = 0;
 static int g_fog_replayed = 0;
 typedef struct { int open; int shut; int lit; int replayed; } LZFog;
+static int g_warm_on = 0;       /* tombstone warm path (env ANN_TOMBSTONE_WARM) */
 static void lz_fog_init(void) {
     memset(&g_fog, 0, sizeof(g_fog));
     wl_reset(&g_fog);
@@ -252,6 +253,8 @@ static void lz_fog_init(void) {
         g_fog_log_open = (wl_log_open(&g_fog_log, lp) == 0);
     }
     g_fog_ready = 1;
+    const char *we = getenv("ANN_TOMBSTONE_WARM");
+    g_warm_on = (we && atoi(we)) ? 1 : 0;
 }
 static inline uint32_t lz_fog_id(int bucket) {
     int c = bucket % 144;
@@ -457,6 +460,56 @@ static int lz_mem_search(const float *qv, int qd,
             routed = 1;
             snprintf(rm, sizeof(rm), "%s", "anchor");
             if (!g_fog_ready) lz_fog_init();
+
+            /* ── tombstone warm path (env ANN_TOMBSTONE_WARM=1) ──────────
+             * Read the latch BEFORE walking: a bucket walked by an earlier
+             * query is SHUT. Order the walk so entries in SHUT buckets are
+             * scored first, then stop after them (budget = their count). This
+             * is the hot/cold axis: it never prunes a route that was not walked
+             * before. NOTE: an EXACT repeat routes to the same buckets, which
+             * the previous run just shut, so the warm set equals the walked set
+             * (no reduction); the gain appears when a query's route OVERLAPS
+             * previously-walked buckets. Measured — see WARM-PATH.md. */
+            if (g_warm_on && rnb > 0) {
+                int shut[ANN_MAXK];
+                int nshut = 0;
+                for (int i = 0; i < rnb; i++) {
+                    shut[i] = !wl_is_open(&g_fog, lz_fog_id(rb[i]));
+                    if (shut[i]) nshut++;
+                }
+                if (nshut > 0 && nshut < rnb) {   /* some shut, some open */
+                    int cov = 0;
+                    for (int i = 0; i < nent; i++) {
+                        int a = ents[i].anchor, a2 = ents[i].anchor2;
+                        for (int b = 0; b < rnb; b++)
+                            if (shut[b] && (a == rb[b] || a2 == rb[b])) { cov++; break; }
+                    }
+                    if (cov > 0 && cov < nent) {
+                        uint32_t *o2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
+                        if (o2) {
+                            int w = 0;
+                            for (int i = 0; i < nent; i++) {
+                                int a = ents[i].anchor, a2 = ents[i].anchor2, in = 0;
+                                for (int b = 0; b < rnb; b++)
+                                    if (shut[b] && (a == rb[b] || a2 == rb[b])) { in = 1; break; }
+                                if (in) o2[w++] = (uint32_t)i;
+                            }
+                            for (int i = 0; i < nent; i++) {
+                                int a = ents[i].anchor, a2 = ents[i].anchor2, in = 0;
+                                for (int b = 0; b < rnb; b++)
+                                    if (shut[b] && (a == rb[b] || a2 == rb[b])) { in = 1; break; }
+                                if (!in) o2[w++] = (uint32_t)i;
+                            }
+                            if (ord_own) free(ord_own);
+                            ord_own = o2; ord = o2;
+                            budget = cov;
+                            snprintf(rm, sizeof(rm), "%s", "warm");
+                        }
+                    }
+                }
+            }
+
+            /* the route WALKED shuts the latch (monotone), then persist it */
             for (int rbi = 0; rbi < rnb; rbi++)
                 wl_traverse_log(&g_fog, lz_fog_id(rb[rbi]),
                                 g_fog_log_open ? &g_fog_log : NULL);
