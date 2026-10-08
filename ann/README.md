@@ -145,6 +145,7 @@ ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
 | `ANN_AMP_K` | `2.0` | warm-bucket weight multiplier |
 | `ANN_GRAFT_CAND` | index size | cap on graph-proposed candidates in the train-free route |
 | `ANN_GRAFT_BACKWARD` | `0` | expand graph candidates via in-edges (files that point at the query's file) |
+| `ANN_GRAFT_BUCKETS` | `0` | with a trained route, ADD the graph-endorsed buckets to the walked set (monotone) |
 
 The reciprocal ("magnetic") mix is **not** a server env var — it is baked into
 `nb.tsv` by `scripts/graft_bias.py --magnet indirect --rho 0.5`. See

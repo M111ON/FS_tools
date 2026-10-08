@@ -296,6 +296,7 @@ static int g_warm_flag_n = 0;
 static int g_warm_ord = 0;                 /* set by lz_mem_search: a warm path ran */
 static int g_amp_applied = 0;              /* entries whose bias was boosted (telemetry) */
 static int g_backward = 0;                 /* ANN_GRAFT_BACKWARD: expand candidates via in-edges */
+static int g_graft_buckets = 0;            /* ANN_GRAFT_BUCKETS: add graph-endorsed buckets to the anchor route */
 
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
@@ -485,6 +486,37 @@ static int lz_mem_search(const float *qv, int qd,
             routed = 1;
             snprintf(rm, sizeof(rm), "%s", "anchor");
             if (!g_fog_ready) lz_fog_init();
+
+            /* graph + anchor: the trained route picks buckets by vector
+             * geometry; the file graph knows the query's STRUCTURAL cluster.
+             * When ANN_GRAFT_BUCKETS=1 we ADD the buckets the graph endorses
+             * (the buckets its proposed entries land in) to the walked set, so
+             * the walk covers both the geometric and the structural route.
+             * Only ADDS buckets — never removes — so recall cannot drop. */
+            if (g_graft_buckets && g_graft_on && g_qn > 0 && rnb < ANN_MAXK) {
+                uint32_t gc[64];
+                int gn = graft_candidates(gc, 64);
+                if (gn > 0) {
+                    int bvote[ANCHR_MAXK];
+                    for (int b = 0; b < ANCHR_MAXK; b++) bvote[b] = 0;
+                    for (int i = 0; i < gn; i++) {
+                        const LZEntry *e = &ents[gc[i]];
+                        if (e->anchor >= 0 && e->anchor < ANCHR_MAXK) bvote[e->anchor]++;
+                        if (e->anchor2 >= 0 && e->anchor2 < ANCHR_MAXK) bvote[e->anchor2]++;
+                    }
+                    int added = 0;
+                    for (int a = 0; a < K && rnb < ANN_MAXK; a++) {
+                        int best = -1, bi = -1;
+                        for (int b = 0; b < ANCHR_MAXK; b++) if (bvote[b] > best) { best = bvote[b]; bi = b; }
+                        if (bi < 0 || best <= 0) break;
+                        bvote[bi] = -1;
+                        int dup = 0;
+                        for (int r = 0; r < rnb; r++) if (rb[r] == bi) { dup = 1; break; }
+                        if (!dup) { rb[rnb++] = bi; added++; }
+                    }
+                    if (added) snprintf(rm, sizeof(rm), "%s", "anchor+g");
+                }
+            }
 
             /* ── tombstone warm path (env ANN_TOMBSTONE_WARM=1) ──────────
              * Read the latch BEFORE walking: a bucket walked by an earlier
@@ -904,6 +936,7 @@ static void graft_init(LZEntry *ents, int nent) {
     { const char *ab = getenv("ANN_AMP_BOOST"); g_amp_boost = (ab && atoi(ab)) ? 1 : 0; }
     { const char *ak = getenv("ANN_AMP_K"); if (ak && atof(ak) > 0) g_amp_k = (float)atof(ak); }
     { const char *bw = getenv("ANN_GRAFT_BACKWARD"); g_backward = (bw && atoi(bw)) ? 1 : 0; }
+    { const char *gb = getenv("ANN_GRAFT_BUCKETS"); g_graft_buckets = (gb && atoi(gb)) ? 1 : 0; }
     const char *on = getenv("ANN_GRAFT");
     if (!on || !atoi(on)) { g_graft_ready = 1; return; }   /* off by design */
     g_graft_on = 1;

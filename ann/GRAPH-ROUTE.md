@@ -130,12 +130,38 @@ and are not structurally adjacent to it. Structure (forward or backward) is a
 rough map, not the semantic answer. Both directions remain env-gated; forward is
 the default.
 
+## Bake + graph+anchor (2026-10-08, measured on the real 57k index)
+
+**Magnet baked into `data/graft`.** `scripts/graft_bias.py --magnet indirect
+--rho 0.5` regenerated the shipped tables (275/2,091 non-zero neighbour weights;
+backup of the one-way tables kept). Recall vs the one-way tables is **unchanged**
+(mean R@10 0.233) but the candidate set is **smaller** (e.g. `gguf_lazy_serve.c`
+266 → 56) — magnet drops the one-way-only edges and keeps the reciprocal ones, so
+it is more *selective*, not more accurate.
+
+**Graph + anchor bucket union** (`ANN_GRAFT_BUCKETS=1`): when a trained route
+exists, the buckets the graph's proposed entries land in are **added** to the
+walked set. Measured at `LZ_ROUTE_BUCKETS=4` (a genuine subset), `topk=5`:
+
+| | mean R@5 vs exact | buckets |
+|---|---|---|
+| A4 anchor, 4 buckets, λ=0 | 0.967 | 4 |
+| AG4 anchor + graph buckets, λ=0 | 0.967 | 4–7 |
+
+The union is **monotone** (adding buckets never lowers recall) but buys **no
+recall here** — the 4-bucket anchor route already covers the exact top-5.
+
+**Honest caveat — the bias, not the union, moves ranking.** With the graft bias
+ON (λ=0.05), the same config *lowered* mean R@5 to 0.367 — the +λ cluster nudge
+promotes structurally-related entries that are **not** the cosine top-5. The
+bucket union is safe; the **bias** is the thing that reorders results. Do not
+attribute the drop to the union. This is exactly why the bias is default-OFF and
+separate from the routing knobs.
+
 ## Next levers (not done)
 
 - **Front-tier fallback**: return graph hits, and fall back to the full scan
   when the graph subset is tiny or the top score is below a confidence floor.
-- **Graph + anchor**: once a route IS trained, use the graph to *bias the bucket
-  order* (the structural axis) rather than to propose candidates.
 
 ## Reproduce
 
