@@ -1,0 +1,11 @@
+# Local DB snapshots — hundreds of MB, machine-specific, regenerable.
+# Restore procedure is documented in HERMES-MC-BRIDGE.md ("Backups").
+backups/
+
+# Sync watermark: session ids + timestamps, regenerated on every run.
+hermes_mc_sync_state.json
+
+# The root .gitignore has a bare `*.cmd` rule aimed at kernel-module build
+# artifacts. This wrapper is a real script (Task Scheduler entry point), so
+# re-include it explicitly.
+!hermes_mc_sync.cmd

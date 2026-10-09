@@ -1,0 +1,51 @@
+=== code under test ===
+d79aa0d65636d9a5455a3c68d95ccf8a2fcc8b933bcfb67342258e68ff983edc *hermes_mc_sync.py
+cbd066bad96d642b354d71c4072ac92a03075b2c427c9080406b0fcd862ee198 *magic_context_mcp_server.py
+a3e11a3496876be4e9b3ca175507739601c049303c6b4dead76cb078bb3415db *verify_bridge.py
+=== ad-hoc verification run: 2026-10-09T14:01:18Z ===
+A. hermes_mc_sync.py
+  [PASS] A1 normalized_hash matches plugin on live rows  - 387/400 exact
+  [PASS] A2a identity uses sorted root commit, not HEAD  - git:174753f2375c19a1c0ce... (2 roots; HEAD=901c1ac8)
+  [PASS] A2a2 sorting is load-bearing (>1 root commit)  - 2 roots
+  [PASS] A2b nested dir resolves via ancestor walk
+  [PASS] A2c repo-less dir -> dir:<md5-12>  - dir:a808c7ec5940
+  [PASS] A2d missing path -> None
+  [PASS] A3a digest strips harness plumbing  - leaked=[]
+  [PASS] A3b digest within per-session budget  - 150 tok
+  [PASS] A3c digest carries provenance
+  [PASS] A6 run_sync is a callable function
+  [PASS] A7a gesture prompts are rejected  - leaked=[]
+  [PASS] A7b real prompts are kept
+  [PASS] A7c empty outcome patterns rejected
+  [PASS] A4 idempotent on re-run (insert 0, update 0)  - run1 insert=0, run2 insert=0 update=0
+  [PASS] A5 all synced rows pass isMemoryRow()  - 37 rows, dropped=[]
+  [PASS] A5b all synced rows use source_type=agent
+  [PASS] A8a no synced digest contains gesture/empty-outcome junk  - junky=[]
+  [PASS] A8b all synced digests have a real ask or outcome
+  [PASS] A8c re-run reaps instead of duplicating  - before=37 after=37
+  [PASS] C1 injection query returns synced rows  - 920 injectable for git:29b0837d0207dc7c55fa6b9e1d05e9e0ae14c238
+  [PASS] C2 memories_fts consistent after UPDATE  - fts=37 memories=37
+  [PASS] C2b quick_check ok
+B. magic_context_mcp_server.py
+  [PASS] B1a MAGIC_CONTEXT_DB wins
+  [PASS] B1b MAGIC_CONTEXT_STORAGE_DIR honored
+  [PASS] B1c XDG_DATA_HOME honored
+  [PASS] B1d falls back to platform default
+  [PASS] B2 DB_PATH points at temp copy
+  [PASS] B3 all 10 tools register  - ['magic_compartment_detail', 'magic_compartments', 'magic_notes', 'magic_probe', 'magic_recent', 'magic_remember', 'magic_search', 'magic_stats', 'magic_sync_hermes', 'magic_user_profile']
+  [PASS] B3b magic_sync_hermes present
+  [PASS] B3c magic_remember present
+  [PASS] B4 valid write accepted
+  [PASS] B4b writes source_type=agent (the invisibility bug)  - agent
+  [PASS] B4c duplicate detected within scope
+  [PASS] B4d same content + different category is a new row
+  [PASS] B5 invalid category rejected
+  [PASS] B5b invalid scope rejected
+  [PASS] B5c project identity auto-resolved when omitted  - git:174753f2375c19a1c0ce1388ef592bfa02d2b056
+  [PASS] B6 magic_sync_hermes in-process, no hang  - 1.12s status=ok
+  [PASS] B6b summary has the expected keys
+  [PASS] B7 magic_sync_hermes rejects bad mode
+  [PASS] B7b sync engine pointed at this server's DB
+  [PASS] B8 all bridge-written rows pass isMemoryRow()  - 3 rows
+
+AD-HOC VERIFICATION: 42 passed, 0 failed
