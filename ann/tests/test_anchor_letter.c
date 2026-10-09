@@ -151,6 +151,44 @@ int main(void) {
         ok("K<6 orbit still < 720", orb < AL_ORBITS);
     }
 
+    /* ── 6. orientation: flip is an involution, upright pass is idempotent ── */
+    {
+        int invol = 1;
+        for (int f = 0; f < AL_FACES; f++)
+            for (int b = 0; b < KC; b++)
+                if (al_face_flip(f, al_face_upright(f, b, KC)) != 0)
+                    invol = 0;   /* the returned value is always upright */
+        ok("upright(face) is never flipped (flip(upright(x)) == 0)", invol);
+
+        int letters[AL_FACES];
+        al_letter_of(KC, C, DI, letters);
+        int before[AL_FACES];
+        memcpy(before, letters, sizeof(before));
+        int flips = al_orient(letters, KC);
+        int again = al_orient(letters, KC);
+        int valid = 1;
+        for (int f = 0; f < AL_FACES; f++)
+            if (letters[f] < 0 || letters[f] >= KC) valid = 0;
+        ok("orient pass is idempotent (second pass flips 0)", again == 0);
+        ok("orient keeps every bucket in [0,K)", valid);
+        ok("orient reports flips and stays stable", flips >= 0);
+    }
+
+    /* ── 7. case char: lower upright, upper mirrored ── */
+    {
+        int case_ok = 1;
+        for (int f = 0; f < AL_FACES; f++)
+            for (int b = 0; b < KC; b++) {
+                char c = al_face_case(f, b);
+                int up = ('a' <= c && c <= 'z');
+                int lo = ('A' <= c && c <= 'Z');
+                if (!up && !lo) case_ok = 0;
+                if (up && al_face_flip(f, b)) case_ok = 0;
+                if (lo && !al_face_flip(f, b)) case_ok = 0;
+            }
+        ok("case char: lower <=> upright, upper <=> mirrored", case_ok);
+    }
+
     printf("%s\n", failures ? "FAILED" : "ALL PASS");
     return failures ? 1 : 0;
 }
