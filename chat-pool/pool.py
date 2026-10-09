@@ -269,7 +269,7 @@ SESSION = "chat-pool"
 # noise — a 16MB hourly file embedded as ONE chunk. The searchable index
 # keeps 5 keys; the raw log + outbox .pushed files stay the full record.
 INDEX_KEEP = ("app", "kind", "t", "to", "text")
-INDEX_SKIP_KINDS = ("bond", "pointer")  # graph data: query via /explore, not search
+INDEX_SKIP_KINDS = ("bond", "pointer", "kv-anchor", "kv-delta")  # graph + KV frames: query via /explore or the bridge, not search
 INDEX_CHUNK_BYTES = 16384  # max ~16KB per chunk, split on line boundaries
 
 

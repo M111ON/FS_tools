@@ -29,6 +29,9 @@ SUITES = [
     ("latency_check",     [sys.executable, "latency_check.py"]),
     ("taskboard demo",    [sys.executable, "taskboard.py"]),
     ("taskboard_check",   [sys.executable, "taskboard_check.py"]),
+    # KV frames over the pool log: deltas as ordinary lines, anchor bases in
+    # a side blob file. Temp-dir isolated (never touches the live log).
+    ("kv_pool_bridge",    [sys.executable, "kv_pool_bridge.py"]),
     ("keepalive demo",    [sys.executable, "pool_keepalive.py", "demo"]),
 ]
 
