@@ -113,22 +113,30 @@ int main(void) {
     int train_ok = train_memcmp && files_identical;
     printf("RECEIPT TRAIN_IDENTICAL %s\n", train_ok ? "yes" : "no");
 
-    /* ── 2. ASSIGN+ROUTE fixed query set TWICE -> identical ids+order ── */
+    /* ── 2. ASSIGN+ROUTE fixed query set TWICE -> identical ids+order ── *
+     * anch_route() writes out[0..K-1] (see its contract: "out must hold K
+     * ints"), so the scratch buffer is full K per query, not just TOPB.
+     * The top-TOPB prefix of a buffer whose tail holds the rest of the
+     * partial sort is what the router's ranking contract exposes. */
     static int b1[DET_NQ], b2[DET_NQ];
+    static int r1buf[DET_NQ][DET_K], r2buf[DET_NQ][DET_K];
     static int r1[DET_NQ * DET_TOPB], r2[DET_NQ * DET_TOPB];
     int route_ok = 1;
     for (int q = 0; q < DET_NQ; q++) {
         b1[q] = anch_assign(Q + (size_t)q * DET_DIM, C1, DET_K, DET_DIM);
         b2[q] = anch_assign(Q + (size_t)q * DET_DIM, C1, DET_K, DET_DIM);
         int n1 = anch_route(Q + (size_t)q * DET_DIM, C1, DET_K, DET_DIM,
-                            DET_TOPB, r1 + (size_t)q * DET_TOPB);
+                            DET_TOPB, r1buf[q]);
         int n2 = anch_route(Q + (size_t)q * DET_DIM, C1, DET_K, DET_DIM,
-                            DET_TOPB, r2 + (size_t)q * DET_TOPB);
+                            DET_TOPB, r2buf[q]);
         if (b1[q] != b2[q] || n1 != DET_TOPB || n2 != DET_TOPB) { route_ok = 0; break; }
-        for (int t = 0; t < DET_TOPB; t++)
+        for (int t = 0; t < DET_TOPB; t++) {
+            r1[(size_t)q * DET_TOPB + t] = r1buf[q][t];
+            r2[(size_t)q * DET_TOPB + t] = r2buf[q][t];
             if (r1[(size_t)q * DET_TOPB + t] != r2[(size_t)q * DET_TOPB + t]) {
                 route_ok = 0; break;
             }
+        }
         if (!route_ok) break;
     }
     /* oracle cross-check (spec, not impl): assign == route[0] for every query */
