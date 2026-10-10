@@ -531,7 +531,7 @@ static int lz_mem_search(const float *qv, int qd,
                          char route_mode[16], int route_bk[], int *route_nb_out,
                          int *block_reads_out, int *items_scored_out, int *nent_out,
                          int *budget_out, int *truncated_out, double *us_per_item_out,
-                         LZFog *fog_out) {
+                         LZFog *fog_out, int *fallback_out) {
     if (top_sc) for (int ti = 0; ti < ANN_MAXK; ti++) top_sc[ti] = -2;
     if (top_sid) for (int ti = 0; ti < ANN_MAXK; ti++) top_sid[ti][0] = '\0';
     if (top_file) for (int ti = 0; ti < ANN_MAXK; ti++) top_file[ti][0] = '\0';
@@ -560,10 +560,31 @@ static int lz_mem_search(const float *qv, int qd,
     for (int ri = 0; ri < ANN_MAXK; ri++) rb[ri] = 0;
     int rnb = 0, breads = 1, scored = 0;
     int truncated = 0;
+    int fallback = 0;
     int budget = LZ_SEARCH_BUDGET_DEF;
+    int cap = 0;
     { const char *be = getenv("LZ_SEARCH_BUDGET");
       if (be && atoi(be) > 0) budget = atoi(be);
       else if (nent > budget) budget = nent; }
+    /* ── bucket-restricted walk (env ANN_WALK_PRUNE=1) ──────────────────
+     * The default walk STEPS over all nent entries in placement order and
+     * only counts scoring toward the budget, so the table's bucket choice
+     * cannot change the scored set (measured: 4 seed tables, buckets differ
+     * 30/30, hits identical 30/30). With PRUNE=1 the walk visits ONLY bucket
+     * members (one O(nent) gather of cheap integer compares, then cosine on
+     * members alone) — different tables now score different sets.
+     * ANN_WALK_FLOOR=f adds a confidence floor: if the pruned walk's top
+     * score is below f, the query falls back to a full scan (mode
+     * "anchor+full", fallback=1), so recall is never worse than today.
+     * Both default OFF/0.0 = byte-identical behaviour to before. */
+    int walk_prune = 0; double walk_floor = 0.0;
+    { const char *wp = getenv("ANN_WALK_PRUNE");
+      if (wp && atoi(wp) > 0) walk_prune = 1; }
+    { const char *wf = getenv("ANN_WALK_FLOOR");
+      if (wf) walk_floor = atof(wf); }
+    uint32_t *pmem = NULL;          /* member-only walk sequence (owned) */
+    unsigned char *pseen = NULL;    /* dedupe across buckets (owned) */
+    const uint32_t *walk = NULL; int nwalk = 0;
     double us_per_item = 0;
     if (ents && qn > 0) {
         const uint32_t *ord = NULL;
@@ -702,17 +723,49 @@ static int lz_mem_search(const float *qv, int qd,
                 if (ord_own) { for (int i = 0; i < nent; i++) ord_own[i] = (uint32_t)i; ord = ord_own; }
             }
         }
+        /* prune: gather bucket members BUCKET-MAJOR (rb[0]'s members first,
+         * then rb[1], ...) so a budget cut keeps the NEAREST bucket's
+         * entries — this is what makes the table steer the scored set.
+         * (Ord order inside a bucket keeps block locality.) */
+        walk = ord; nwalk = nent;
+        if (walk_prune && routed && rnb > 0 && ord && nent > 0) {
+            pmem = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
+            pseen = (unsigned char *)calloc((size_t)(nent ? nent : 1), 1);
+            if (pmem && pseen) {
+                int w = 0;
+                for (int r = 0; r < rnb && w < nent; r++)
+                    for (int i = 0; i < nent; i++) {
+                        int ei = (int)ord[i];
+                        if (ei < 0 || ei >= nent) continue;
+                        if (pseen[ei]) continue;
+                        if (ents[ei].anchor == rb[r] || ents[ei].anchor2 == rb[r]) {
+                            pseen[ei] = 1;
+                            pmem[w++] = (uint32_t)ei;
+                        }
+                    }
+                if (w > 0) {
+                    walk = pmem; nwalk = w;
+                    size_t rl = strlen(rm);
+                    if (rl + 2 < sizeof(rm)) { rm[rl] = '+'; rm[rl+1] = 'p'; rm[rl+2] = '\0'; }
+                }
+                else { free(pmem); pmem = NULL; free(pseen); pseen = NULL; }   /* empty: normal walk */
+            }
+            else { if (pmem) free(pmem); if (pseen) free(pseen); pmem = NULL; pseen = NULL; }
+        }
         LARGE_INTEGER qf, qt0, qt1;
         QueryPerformanceFrequency(&qf);
         QueryPerformanceCounter(&qt0);
         int in_run = 0;
         breads = 0;
-        for (int oi = 0; ord && oi < nent; oi++) {
-            int ei = (int)ord[oi];
+        int full2 = 0;      /* fallback pass: unrestricted full walk */
+        cap = budget;
+        for (;;) {
+        for (int oi = 0; walk && oi < nwalk; oi++) {
+            int ei = (int)walk[oi];
             if (ei < 0 || ei >= nent) continue;
             int sel = 1;
             if (sid_filter[0] && strcmp(ents[ei].sid, sid_filter) != 0) sel = 0;
-            if (sel && routed && rnb > 0) {
+            if (sel && routed && rnb > 0 && !full2) {
                 sel = (ents[ei].anchor < 0);
                 for (int rbi = 0; rbi < rnb && !sel; rbi++)
                     if (ents[ei].anchor == rb[rbi] || ents[ei].anchor2 == rb[rbi]) sel = 1;
@@ -751,12 +804,30 @@ static int lz_mem_search(const float *qv, int qd,
                     break;
                 }
             }
-            if (scored >= budget) { truncated = 1; break; }
+            if (scored >= cap) { truncated = 1; break; }
+        }
+        /* confidence fallback: pruned top below floor -> full scan once */
+        if (walk_prune && !full2 && walk_floor > 0.0 && pmem && top_sc[0] < walk_floor) {
+            full2 = 1; fallback = 1;
+            walk = ord; nwalk = nent; cap = nent; truncated = 0;
+            scored = 0; breads = 0;
+            for (int ti = 0; ti < ANN_MAXK; ti++) {
+                top_sc[ti] = -2;
+                if (top_sid) top_sid[ti][0] = '\0';
+                if (top_file) top_file[ti][0] = '\0';
+                if (top_np) top_np[ti] = 0;
+            }
+            snprintf(rm, sizeof(rm), "%s", "anchor+full");
+            continue;
+        }
+        break;
         }
         QueryPerformanceCounter(&qt1);
         if (scored > 0 && qf.QuadPart > 0)
             us_per_item = (double)(qt1.QuadPart - qt0.QuadPart) * 1e6 / (double)qf.QuadPart / scored;
         free(ord_own);
+        if (pmem) free(pmem);
+        if (pseen) free(pseen);
         if (!routed) breads = nent ? 1 : 0;
     }
     if (!use_cache) lz_index_free(ents, nent);
@@ -766,8 +837,9 @@ static int lz_mem_search(const float *qv, int qd,
     if (block_reads_out) *block_reads_out = breads;
     if (items_scored_out) *items_scored_out = scored;
     if (nent_out) *nent_out = nent;
-    if (budget_out) *budget_out = budget;
+    if (budget_out) *budget_out = cap;
     if (truncated_out) *truncated_out = truncated;
+    if (fallback_out) *fallback_out = fallback;
     if (us_per_item_out) *us_per_item_out = us_per_item;
     if (fog_out) {
         if (!g_fog_ready) lz_fog_init();
@@ -1419,14 +1491,14 @@ static int handle_search(sock_t cli, const char *rq) {
         int top_np[ANN_MAXK]; double top_sc[ANN_MAXK];
         char route_mode[16];
         int route_bk[ANN_MAXK], route_nb = 0, block_reads = 0;
-        int items_scored = 0, nent = 0, budget = 0, truncated = 0;
+        int items_scored = 0, nent = 0, budget = 0, truncated = 0, fallback = 0;
         double us_per_item = 0;
         LZFog fog = { (int)WL_FREE, 0, 0, 0 };
         lz_mem_search(qv, qd, sid_filter, stopk,
             top_sid, top_file, top_np, top_sc,
             route_mode, route_bk, &route_nb,
             &block_reads, &items_scored, &nent,
-            &budget, &truncated, &us_per_item, &fog);
+            &budget, &truncated, &us_per_item, &fog, &fallback);
         srlen = snprintf(sresp, sizeof(sresp), "{\"status\":\"ok\",\"hits\":[");
         for (int ti = 0; ti < stopk && top_sc[ti] > -2; ti++) {
             char esid[256], efile[1024];
@@ -1443,8 +1515,8 @@ static int handle_search(sock_t cli, const char *rq) {
             srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
                 "%s%d", rb ? "," : "", route_bk[rb]);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,",
-            block_reads, items_scored, nent, us_per_item, budget, truncated);
+            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,",
+            block_reads, items_scored, nent, us_per_item, budget, truncated, fallback);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u},",
             fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE);

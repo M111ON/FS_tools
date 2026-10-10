@@ -66,6 +66,8 @@ curl -s -X POST -H "Content-Type: application/json" \
 | `ANN_PORT` | `8096` | listen port (or `--serve N`) |
 | `LZ_ROUTE_BUCKETS` | auto (`topk+4`) | buckets walked |
 | `LZ_SEARCH_BUDGET` | index size | candidate budget |
+| `ANN_WALK_PRUNE` | `0` | bucket-major pruned walk (scores members only) |
+| `ANN_WALK_FLOOR` | `0.0` | confidence floor: pruned top below this falls back to full scan |
 
 ## Response shape
 
@@ -74,7 +76,7 @@ curl -s -X POST -H "Content-Type: application/json" \
  "hits":[{"sid":"...","file":"...","npast":400,"score":0.8793}],
  "route":{"mode":"anchor","buckets":[2,4,3,7,1,0,6],
           "block_reads":1,"items_scored":2881,"items_total":2881,
-          "us_per_item":31.99,"budget":2881,"truncated":1,
+          "us_per_item":31.99,"budget":2881,"truncated":1,"fallback":0,
           "fog":{"lit":7,"open":10359,"shut":7,"replayed":25,"free":10366}}}
 ```
 
@@ -195,6 +197,24 @@ Measured on the real 57k index with the anchor route disabled: the graph scores
 exact brute is only **0.34** (0.60 on files well-represented in the index, 0.00 on
 sparse ones). It is a *rough* map / front tier, not an exact route. Full numbers:
 [`GRAPH-ROUTE.md`](GRAPH-ROUTE.md).
+
+## Pruned walk (bucket-major) — OPTIONAL, OFF by default
+
+The default anchor walk STEPS over all `nent` entries in placement order and
+only counts scoring toward the budget, so the table's bucket choice cannot
+change the scored set (measured: 4 seed tables, buckets differ 30/30, hits
+identical 30/30). With `ANN_WALK_PRUNE=1` the walk visits ONLY bucket members,
+gathered bucket-major (`rb[0]`'s members first), so a budget cut keeps the
+NEAREST bucket's entries and the table steers the set. `ANN_WALK_FLOOR=f`
+adds a confidence floor: a pruned top below `f` falls back to a full scan
+(`mode:"anchor+full"`, `fallback:1`), so recall is never worse than today.
+
+Measured (59,752-entry memcore index, 30 queries, `LZ_ROUTE_BUCKETS=5`,
+`LZ_SEARCH_BUDGET=8000`, 17% scan): pure prune top-1 **13/30**, overlap
+**2.70/5** (trained) / **2.17/5** (training-free derived table — same tier,
+no training); floor `0.5` never fires on this index (tops run ≥0.5); floor
+`0.95` fires and matches full hits exactly. Both knobs default off =
+byte-identical behaviour (verified: same top-1, `mode:"anchor"`).
 
 ## Run as a service (Windows)
 
