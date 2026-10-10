@@ -226,4 +226,51 @@ static inline int anch_load(const char *path, float *C, int capK, int capD,
     return r;
 }
 
+/* Order-pair header (H2 fix): the placement perm is bound to the table that
+ * labeled it. Header = magic,K,ntr,table_cksum,perm_cksum (5 u32), then perm.
+ * table_cksum = anch_cksum(table C): an order stamped under table B fails
+ * against table A even when sizes match (re-anchor w/o retrain is refused,
+ * not silently served). perm_cksum = FNV-1a over perm bytes. Readers are
+ * STRICT: headerless or mismatched files fail (over-refusing is safe;
+ * the healer is regrow, which writes conforming files). */
+#define ORDH_MAGIC 0x5244524Fu /* "ORDR" */
+static inline uint32_t ord_fnv(const void *p, size_t nb) {
+    uint32_t h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < nb; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+static inline int ord_save(const char *path, const uint32_t *perm, int n,
+                           int K, int ntr, uint32_t tcksum) {
+    if (!path || !perm || n <= 0 || K <= 0) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t hdr[5] = { ORDH_MAGIC, (uint32_t)K, (uint32_t)ntr, tcksum,
+                        ord_fnv(perm, (size_t)n * sizeof(uint32_t)) };
+    int ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+             fwrite(perm, sizeof(uint32_t), (size_t)n, f) == (size_t)n;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+/* 0 = pair valid (perm[] filled); -1 = refuse (missing/header/shape/
+ * table-bind/perm-crc mismatch). n = index entries, K/tcksum = loaded table. */
+static inline int ord_load(const char *path, uint32_t *perm, int n,
+                           int K, uint32_t tcksum) {
+    if (!path || !perm || n <= 0 || K <= 0) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint32_t hdr[5];
+    int r = -1;
+    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == ORDH_MAGIC &&
+        (int)hdr[1] == K && (int)hdr[2] == n && hdr[3] == tcksum &&
+        fread(perm, sizeof(uint32_t), (size_t)n, f) == (size_t)n &&
+        ord_fnv(perm, (size_t)n * sizeof(uint32_t)) == hdr[4]) {
+        /* exact size: no trailing bytes (torn appends fail) */
+        int c = fgetc(f);
+        if (c == EOF) r = 0;
+    }
+    fclose(f);
+    return r;
+}
+
 #endif /* ANCHOR_ROUTE_H */
