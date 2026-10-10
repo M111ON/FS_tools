@@ -3,7 +3,7 @@
 
 The standalone DWGLS tooling (core/kv_temporal.h, tools/kv_temporal_llama.c)
 already proves the model: a chat turn is a seekable FRAME, stored as a tiny
-token delta, with a full anchor base every K frames. This file is the pool
+token delta, with a full anchor base at each round boundary. This file is the pool
 side of that model — it lets the SAME records ride the production chat-pool
 log, without changing pool.py's core:
 
@@ -36,7 +36,9 @@ import pool
 
 KV_KINDS = ("kv-anchor", "kv-delta")
 KV_APP = "kv-temporal"
-ANCHOR_EVERY = 8            # must match KVT_ANCHOR_EVERY in core/kv_temporal.h
+ROUND = 144               # steps per round — must match KVT_ROUND in core/kv_temporal.h.
+                          # An anchor is cut at the first step of every round
+                          # (turn 1, 145, 289, ...), never "every K frames".
 
 _BLOB_PATH = os.path.join(pool.DIR, "kv_blobs.bin")
 # KVDeltaHdr / KVTAnchor as laid out in core/kv_temporal.h — kept here so a
@@ -166,19 +168,22 @@ def main():
                 failures += 1
                 print(f"  FAIL: {msg}")
 
-        N, K = 20, ANCHOR_EVERY
+        N = 300
         for t in range(1, N + 1):
             toks = [t * 1000 + i for i in range(4 + (t % 5))]
-            if t % K == 0:
+            round_start = ((t - 1) // ROUND) * ROUND + 1
+            if t == round_start:
                 blob = bytes((t * 7 + i) & 0xFF for i in range(tokens_len(toks) * 1024))
                 frame_anchor(t, base_n_tokens=t, blob=blob, type_k=8, type_v=2)
-            frame_delta(t, toks, parent=(t if t % K == 0 else 0))
+            frame_delta(t, toks, parent=round_start)
 
         deltas, anchors = collect()
         print(f"tempdir frames: {len(deltas)} deltas, {len(anchors)} anchors")
 
         check(len(deltas) == N, "one delta per frame")
-        check(len(anchors) == N // K, "one anchor every K")
+        check(len(anchors) == 3, "3 anchors in 300 frames (t=1,145,289)")
+        check([a["turn"] for a in anchors] == [1, 145, 289],
+              "anchor turns are exactly {1,145,289}")
 
         # every delta's tokens round-trip through the pool log
         by_turn = {d["turn"]: d for d in deltas}
@@ -198,16 +203,18 @@ def main():
                 ok = False
         check(ok, "anchor blob round-trip byte-exact (fnv + content)")
 
-        # seek plan
+        # seek plan (round rule: anchors at 1, 145, 289)
         s = seek(anchors, 13)
-        check(s["have_anchor"] and s["anchor"]["turn"] == 8, "seek(13) -> anchor@8")
-        check(s["first_delta"] == 9 and s["n_deltas"] == 5, "seek(13) -> replay t9..t13")
-        s = seek(anchors, 5)
-        check(not s["have_anchor"] and s["first_delta"] == 1, "seek(5) -> no anchor")
-        s = seek(anchors, 16)
-        check(s["anchor"]["turn"] == 16 and s["n_deltas"] == 0, "seek(16) -> anchor itself")
-        s = seek(anchors, 20)
-        check(s["anchor"]["turn"] == 16 and s["n_deltas"] == 4, "seek(20) -> anchor@16 +4")
+        check(s["have_anchor"] and s["anchor"]["turn"] == 1, "seek(13) -> anchor@1")
+        check(s["first_delta"] == 2 and s["n_deltas"] == 12, "seek(13) -> replay t2..t13")
+        s = seek(anchors, 144)
+        check(s["anchor"]["turn"] == 1 and s["n_deltas"] == 143, "seek(144) -> replay t2..t144")
+        s = seek(anchors, 200)
+        check(s["anchor"]["turn"] == 145 and s["n_deltas"] == 55, "seek(200) -> anchor@145 +55")
+        s = seek(anchors, 289)
+        check(s["anchor"]["turn"] == 289 and s["n_deltas"] == 0, "seek(289) -> anchor itself")
+        s = seek(anchors, 300)
+        check(s["anchor"]["turn"] == 289 and s["n_deltas"] == 11, "seek(300) -> anchor@289 +11")
 
         # the log lines are ordinary pool lines with a valid hash chain
         chain = pool.verify_chain() if hasattr(pool, "verify_chain") else None
