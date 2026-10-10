@@ -144,9 +144,17 @@ def _start_ann():
                LZ_EMBED_HOST="127.0.0.1", LZ_EMBED_PORT=str(EMBED_PORT),
                ANN_INDEX_PATH=idx, ANN_ANCH_PATH=anch,
                ANN_ORDER_PATH=order, ANN_ROUTE_LOG=log,
-               # tuned 2026-10-09: pin walked buckets to 5 (A/B 24 queries:
-               # med 61ms vs 97ms, top-1 identical 24/24). Env overrides.
-               LZ_ROUTE_BUCKETS=os.environ.get("LZ_ROUTE_BUCKETS", "5"))
+                # tuned 2026-10-09: pin walked buckets to 5 (A/B 24 queries:
+                # med 61ms vs 97ms, top-1 identical 24/24). Env overrides.
+                LZ_ROUTE_BUCKETS=os.environ.get("LZ_ROUTE_BUCKETS", "5"),
+                # prune walk live 2026-10-11 (re-label verdict + stale-exe
+                # upgrade): score only routed-bucket members (bucket-major,
+                # nearest first), cap 8000 scored, full-scan fallback when
+                # pruned top < 0.5. Measured big-N 210: trained overlap
+                # 0.13 -> 0.45. Env overrides.
+                LZ_SEARCH_BUDGET=os.environ.get("LZ_SEARCH_BUDGET", "8000"),
+                ANN_WALK_PRUNE=os.environ.get("ANN_WALK_PRUNE", "1"),
+                ANN_WALK_FLOOR=os.environ.get("ANN_WALK_FLOOR", "0.5"))
     out = open(os.path.join(DIR, ".server.log"), "ab")
     err = open(os.path.join(DIR, ".server.err"), "ab")
     flags = 0
