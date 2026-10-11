@@ -136,6 +136,33 @@ int main(void) {
         remove(path);
     }
 
+    /* T6 — the serve-path append discipline: a bucket must be logged ONLY on
+     * its OPEN->SHUT transition, never on a repeat walk. Without the guard the
+     * P3 log grows without bound (measured: 5661 records for 7 distinct slots,
+     * 808x). This reproduces the guard both servers must use. */
+    {
+        const char *path = "wlt_t6.txt";
+        remove(path);
+        wl_latch_t L6; wl_reset(&L6);
+        wl_log_t lg6;
+        CHECK(wl_log_open(&lg6, path) == 0, "T6 log opens");
+        uint32_t ids6[3] = { wl_id(20, 1), wl_id(30, 2), wl_id(40, 3) };
+        for (int rep = 0; rep < 4; rep++)          /* walk the same 3 branches 4x */
+            for (int i = 0; i < 3; i++) {
+                uint32_t id = ids6[i];
+                if (wl_is_open(&L6, id))            /* the guard under test */
+                    wl_traverse_log(&L6, id, &lg6);
+            }
+        CHECK(lg6.n_appended == 3, "T6 guard appends 3 records for 3 branches over 4 repeats");
+        fflush(lg6.fp);
+        wl_log_close(&lg6);
+        wl_latch_t r6;
+        CHECK(wl_replay_log_file(&r6, path) == 3, "T6 replay applies exactly 3 records");
+        for (int i = 0; i < 3; i++)
+            CHECK(!wl_is_open(&r6, ids6[i]), "T6 branch SHUT after guarded walk");
+        remove(path);
+    }
+
     printf(fails ? "FAIL %d\n" : "ALL PASS (%d)\n", fails);
     return fails != 0;
 }
