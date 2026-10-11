@@ -365,7 +365,7 @@ static inline uint32_t lz_fog_id(int bucket) {
 #define LZ_ANCH_MAXK 8
 #define LZ_OVERLAP_TOPB 2
 #define LZ_ROUTE_HEADROOM_DEF 4
-#define LZ_SEARCH_BUDGET_DEF 512
+#define LZ_SEARCH_BUDGET_DEF 8000
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
 typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; int goff; int gn; } LZEntry;
 
@@ -689,10 +689,16 @@ static int lz_mem_search(const float *qv, int qd,
                 }
             }
 
-            /* the route WALKED shuts the latch (monotone), then persist it */
-            for (int rbi = 0; rbi < rnb; rbi++)
-                wl_traverse_log(&g_fog, lz_fog_id(rb[rbi]),
-                                g_fog_log_open ? &g_fog_log : NULL);
+            /* the route WALKED shuts the latch (monotone), then persist it.
+             * Only the OPEN->SHUT transition is a new fingerprint; a repeat
+             * walk is a no-op, not a log record — otherwise the P3 log grows
+             * without bound on repeat queries. */
+            for (int rbi = 0; rbi < rnb; rbi++) {
+                uint32_t fid = lz_fog_id(rb[rbi]);
+                if (wl_is_open(&g_fog, fid))
+                    wl_traverse_log(&g_fog, fid,
+                                    g_fog_log_open ? &g_fog_log : NULL);
+            }
             if (g_fog_log_open && g_fog_log.fp) fflush(g_fog_log.fp);
         } else {
             /* no trained anchor route (or dim mismatch): the file-relationship
