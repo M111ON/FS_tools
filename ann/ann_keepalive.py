@@ -149,10 +149,12 @@ def _start_ann():
                 LZ_ROUTE_BUCKETS=os.environ.get("LZ_ROUTE_BUCKETS", "5"),
                 # prune walk live 2026-10-11 (re-label verdict + stale-exe
                 # upgrade): score only routed-bucket members (bucket-major,
-                # nearest first), cap 8000 scored, full-scan fallback when
-                # pruned top < 0.5. Measured big-N 210: trained overlap
-                # 0.13 -> 0.45. Env overrides.
-                LZ_SEARCH_BUDGET=os.environ.get("LZ_SEARCH_BUDGET", "8000"),
+                # nearest first), cap scored, full-scan fallback when
+                # pruned top < 0.5. Budget 8000 -> 24000 on 2026-10-11 after an
+                # independent recall sweep (40 real-vec queries vs numpy oracle):
+                # R@10 0.47@8000, 0.90@16000, 0.96@24000, 0.995@full. 24000 is
+                # near the flat knee. Env overrides.
+                LZ_SEARCH_BUDGET=os.environ.get("LZ_SEARCH_BUDGET", "24000"),
                 ANN_WALK_PRUNE=os.environ.get("ANN_WALK_PRUNE", "1"),
                 ANN_WALK_FLOOR=os.environ.get("ANN_WALK_FLOOR", "0.5"))
     out = open(os.path.join(DIR, ".server.log"), "ab")

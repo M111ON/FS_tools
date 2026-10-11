@@ -365,7 +365,7 @@ static inline uint32_t lz_fog_id(int bucket) {
 #define LZ_ANCH_MAXK 8
 #define LZ_OVERLAP_TOPB 2
 #define LZ_ROUTE_HEADROOM_DEF 4
-#define LZ_SEARCH_BUDGET_DEF 8000
+#define LZ_SEARCH_BUDGET_DEF 24000
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
 typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; int goff; int gn; } LZEntry;
 
@@ -563,9 +563,15 @@ static int lz_mem_search(const float *qv, int qd,
     int fallback = 0;
     int budget = LZ_SEARCH_BUDGET_DEF;
     int cap = 0;
+    /* env LZ_SEARCH_BUDGET wins; otherwise the source default applies as-is.
+     * NO silent widen-to-full-scan: that trap (kept until 2026-10-11) made the
+     * default unreachable for any index larger than it, so every query paid a
+     * full scan while reporting truncated=0. Recall is steep in budget
+     * (measured 2026-10-11, 40 real-vec queries vs numpy oracle, pruned top-5):
+     * R@10 0.47 @8000, 0.90 @16000, 0.96 @24000, 0.995 @full. The default now
+     * sits at the near-flat knee; raise/lower it explicitly here or via env. */
     { const char *be = getenv("LZ_SEARCH_BUDGET");
-      if (be && atoi(be) > 0) budget = atoi(be);
-      else if (nent > budget) budget = nent; }
+      if (be && atoi(be) > 0) budget = atoi(be); }
     /* ── bucket-restricted walk (env ANN_WALK_PRUNE=1) ──────────────────
      * The default walk STEPS over all nent entries in placement order and
      * only counts scoring toward the budget, so the table's bucket choice
