@@ -1,0 +1,21 @@
+========================================================================
+D5 — budget vs recall (independent: raw-vec queries vs numpy oracle)
+========================================================================
+  index : I:/tools/ann\data\memcore\ann_index.jsonl
+  loading (N x dim) ...
+  entries=59756  dim=384
+  oracle: brute cosine top-10 over all 59756 for 300 queries ...
+  oracle done in 0.7s
+
+  budget      scored     trunc | R@1   | R@5   | R@10 
+  ----------------------------------------------------
+  8000           8000     59756     1 | 0.5533 | 0.5140 | 0.5080
+  16000         16000     59756     1 | 0.9767 | 0.8993 | 0.8770
+  24000         24000     59756     1 | 1.0000 | 0.9667 | 0.9603
+  32000         32000     59756     1 | 1.0000 | 0.9860 | 0.9820
+  unbounded     24000     59756     1 | 1.0000 | 0.9667 | 0.9603
+
+  delta (unbounded - 8000): R@1=+0.4467  R@5=+0.4527  R@10=+0.4523
+  worst recall lost by capping at 8000: +0.4527
+  => 8000 LOSES recall vs unbounded — cap is loading-bearing
+

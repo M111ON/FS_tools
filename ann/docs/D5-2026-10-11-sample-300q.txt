@@ -1,0 +1,17 @@
+========================================================================
+D5 — budget vs recall (independent: raw-vec queries vs numpy oracle)
+========================================================================
+  index : I:/tools/ann/data/sample/ann_index.jsonl
+  loading (N x dim) ...
+  entries=2881  dim=384
+  oracle: brute cosine top-10 over all 2881 for 300 queries ...
+  oracle done in 0.1s
+
+  budget      scored     trunc | R@1   | R@5   | R@10 
+  ----------------------------------------------------
+  500             500      2881     1 | 0.6933 | 0.6320 | 0.5987
+  1000           1000      2881     1 | 1.0000 | 0.9393 | 0.9263
+  2000           2000      2881     1 | 1.0000 | 0.9960 | 0.9957
+  2881           2507      2881     0 | 1.0000 | 0.9973 | 0.9967
+
+

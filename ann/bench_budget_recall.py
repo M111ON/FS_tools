@@ -198,7 +198,14 @@ def main():
         log = os.path.join(args.scratch, f"route_b{B}.log")
         if os.path.exists(log):
             os.remove(log)
-        p, h = spawn(idx, anch, order, log, port, B)
+        # 0 = unbounded. Since the 2026-10-11 widen-trap removal, an unset
+        # LZ_SEARCH_BUDGET falls back to the 24000 DEFAULT, not a full scan —
+        # so map 0 -> N explicitly or the "unbounded" row silently measures
+        # the default and prints scored=24000. (The pruned walk still stops at
+        # the covered-entry count; that is the real ceiling, reported honestly
+        # as items_scored in the row.)
+        Bspawn = N if B == 0 else B
+        p, h = spawn(idx, anch, order, log, port, Bspawn)
         hits = {k: 0 for k in ks}
         tot = {k: 0 for k in ks}
         scored_last = 0

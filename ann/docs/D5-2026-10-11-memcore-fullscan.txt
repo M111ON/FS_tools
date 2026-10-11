@@ -1,0 +1,14 @@
+========================================================================
+D5 — budget vs recall (independent: raw-vec queries vs numpy oracle)
+========================================================================
+  index : I:/tools/ann\data\memcore\ann_index.jsonl
+  loading (N x dim) ...
+  entries=59756  dim=384
+  oracle: brute cosine top-10 over all 59756 for 300 queries ...
+  oracle done in 1.0s
+
+  budget      scored     trunc | R@1   | R@5   | R@10 
+  ----------------------------------------------------
+  59756         44938     59756     0 | 1.0000 | 0.9993 | 0.9980
+
+
