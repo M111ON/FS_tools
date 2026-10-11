@@ -4,11 +4,18 @@
  *
  * WHAT THIS IS
  *   A minimal HTTP server that answers POST /v1/state/search over a
- *   build/kv_index.jsonl vector index, using the anchor-bucket route +
+ *   build/ann_index.jsonl vector index, using the anchor-bucket route +
  *   geo_wang_latch tombstone from DWGLS. It is the SEARCH half of
  *   tools/gguf_lazy_serve.c, extracted whole and cut free of every GGUF /
  *   llama / model-load dependency. No llama.h, no ggml, no backend DLLs, no
  *   .gguf file: the embedder is an EXTERNAL sidecar reached over HTTP.
+ *
+ * KV IS A USER, NOT PART OF THIS
+ *   This is the general ANN search core. KV (cold-KV, kv_tess_cache, etc.) is
+ *   a separate field that USES it: KV manages its own storage and feeds a
+ *   result to ANN. Do not fold KV storage/format into this file, and do not
+ *   name the index/anchors "kv_*" — those filenames are a leftover of KV
+ *   having been the first consumer (now renamed ann_*; see KV-USER.md).
  *
  * FORKED FROM
  *   repo:   I:/DWGLS-native-fs  (origin https://github.com/M111ON/DWGLS.git)
@@ -50,16 +57,20 @@ typedef SOCKET sock_t;
 #include "anchor_route.h"
 #include "geo_wang_latch.h"
 
-/* ── paths (overridable so the fork is not hard-wired to one checkout) ── */
-static const char *PATH_INDEX;   /* kv_index.jsonl  */
-static const char *PATH_ANCH;    /* kv_anchors.bin  */
-static const char *PATH_ORDER;   /* kv_index.order  */
-static const char *PATH_LOG;     /* P3 route log    */
+/* ── paths (overridable so the fork is not hard-wired to one checkout) ──
+ * ANN is the search core; KV is a USER of it, not part of it. The default
+ * filenames are therefore neutral (ann_*), not kv_*: the kv_ prefix was a
+ * leftover of KV being the first consumer and made the core read as "the KV
+ * thing". Any existing kv_* checkout still works by setting the env vars. */
+static const char *PATH_INDEX;   /* ann_index.jsonl  */
+static const char *PATH_ANCH;    /* ann_anchors.bin  */
+static const char *PATH_ORDER;   /* ann_index.order  */
+static const char *PATH_LOG;     /* P3 route log     */
 static void paths_init(void) {
     const char *e;
-    e = getenv("ANN_INDEX_PATH"); PATH_INDEX = (e && e[0]) ? e : "data/kv_index.jsonl";
-    e = getenv("ANN_ANCH_PATH");  PATH_ANCH  = (e && e[0]) ? e : "data/kv_anchors.bin";
-    e = getenv("ANN_ORDER_PATH"); PATH_ORDER = (e && e[0]) ? e : "data/kv_index.order";
+    e = getenv("ANN_INDEX_PATH"); PATH_INDEX = (e && e[0]) ? e : "data/ann_index.jsonl";
+    e = getenv("ANN_ANCH_PATH");  PATH_ANCH  = (e && e[0]) ? e : "data/ann_anchors.bin";
+    e = getenv("ANN_ORDER_PATH"); PATH_ORDER = (e && e[0]) ? e : "data/ann_index.order";
     e = getenv("ANN_ROUTE_LOG");  PATH_LOG   = (e && e[0]) ? e : "data/lz_route.log";
 }
 

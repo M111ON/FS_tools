@@ -132,9 +132,9 @@ def load_index(path):
 def main():
     ap = argparse.ArgumentParser()
     base = os.path.join(ANN, "data", "memcore")
-    ap.add_argument("--index", default=os.path.join(base, "kv_index.jsonl"))
-    ap.add_argument("--anch", default=os.path.join(base, "kv_anchors.bin"))
-    ap.add_argument("--order", default=os.path.join(base, "kv_index.order"))
+    ap.add_argument("--index", default=os.path.join(base, "ann_index.jsonl"))
+    ap.add_argument("--anch", default=os.path.join(base, "ann_anchors.bin"))
+    ap.add_argument("--order", default=os.path.join(base, "ann_index.order"))
     ap.add_argument("--scratch", default=r"I:\tmp\ann_budget")
     ap.add_argument("--queries", type=int, default=40)
     ap.add_argument("--ks", default="1,5,10")
@@ -179,9 +179,9 @@ def main():
 
     # scratch copies so a scratch server never touches repo data
     import shutil
-    idx = os.path.join(args.scratch, "kv_index.jsonl")
-    anch = os.path.join(args.scratch, "kv_anchors.bin")
-    order = os.path.join(args.scratch, "kv_index.order")
+    idx = os.path.join(args.scratch, "ann_index.jsonl")
+    anch = os.path.join(args.scratch, "ann_anchors.bin")
+    order = os.path.join(args.scratch, "ann_index.order")
     if not os.path.exists(idx):
         shutil.copyfile(args.index, idx)
     if not os.path.exists(anch):

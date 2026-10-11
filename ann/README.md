@@ -17,7 +17,7 @@ No GGUF, no llama, no model in-process. The embedder is an external sidecar
 include/   vendored headers (byte-identical copies from DWGLS core/)
 src/       ann_search.c — the whole server
 tests/     anchor-route + wang-latch tests (copies; green upstream)
-data/      kv_index.jsonl · kv_index.order · kv_anchors.bin  (regenerated upstream)
+data/      ann_index.jsonl · ann_index.order · ann_anchors.bin  (regenerated upstream)
 FORK.md    provenance + re-sync instructions
 ```
 
@@ -59,9 +59,9 @@ curl -s -X POST -H "Content-Type: application/json" \
 |---|---|---|
 | `LZ_EMBED_HOST` | `127.0.0.1` | embed sidecar host |
 | `LZ_EMBED_PORT` | `18095` | embed sidecar port |
-| `ANN_INDEX_PATH` | `data/kv_index.jsonl` | vector index |
-| `ANN_ANCH_PATH` | `data/kv_anchors.bin` | trained centroids |
-| `ANN_ORDER_PATH` | `data/kv_index.order` | bucket-major placement perm |
+| `ANN_INDEX_PATH` | `data/ann_index.jsonl` | vector index |
+| `ANN_ANCH_PATH` | `data/ann_anchors.bin` | trained centroids |
+| `ANN_ORDER_PATH` | `data/ann_index.order` | bucket-major placement perm |
 | `ANN_ROUTE_LOG` | `data/lz_route.log` | tombstone (P3) log — **must be a native Windows path** |
 | `ANN_PORT` | `8096` | listen port (or `--serve N`) |
 | `LZ_ROUTE_BUCKETS` | auto (`topk+4`) | buckets walked |
@@ -94,12 +94,12 @@ sidecar serves — so its 57,076 entries index **without re-embedding**:
 
 ```sh
 # 1. base index from the store (no embedding; reads stored vec blobs)
-python scripts/build_index.py --out data/memcore/kv_index.jsonl
+python scripts/build_index.py --out data/memcore/ann_index.jsonl
 
 # 2. train anchors + place + write the anchor fields (server-side)
-ANN_INDEX_PATH=data/memcore/kv_index.jsonl \
-ANN_ANCH_PATH=data/memcore/kv_anchors.bin \
-ANN_ORDER_PATH=data/memcore/kv_index.order \
+ANN_INDEX_PATH=data/memcore/ann_index.jsonl \
+ANN_ANCH_PATH=data/memcore/ann_anchors.bin \
+ANN_ORDER_PATH=data/memcore/ann_index.order \
   ./build/ann_search.exe --serve 8099
 curl -s -X POST http://127.0.0.1:8099/v1/state/regrow    # ~60 s on 57k
 ```

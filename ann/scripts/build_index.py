@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build_index.py — memcore (fact_store.v2) -> ann base index (kv_index.jsonl).
+"""build_index.py — memcore (fact_store.v2) -> ann base index (ann_index.jsonl).
 
 Reads the memcore SQLite store (entries + embeddings) and writes the ANN base
 index in the format ann_search's parser expects:
@@ -21,7 +21,7 @@ import argparse, json, os, sqlite3, struct, sys, time
 
 DEFAULT_DB = r"I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUT = os.path.join(_ROOT, "data", "kv_index.jsonl")
+DEFAULT_OUT = os.path.join(_ROOT, "data", "ann_index.jsonl")
 
 
 def sanitize(t: str, max_chars: int) -> str:

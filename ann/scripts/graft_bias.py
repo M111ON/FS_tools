@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEFAULT_WIRING = r"I:\DWGLS-native-fs\graft\.graph\wiring.json"
 DEFAULT_DB = r"I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3"
-DEFAULT_INDEX = os.path.join(ROOT, "data", "memcore", "kv_index.jsonl")
+DEFAULT_INDEX = os.path.join(ROOT, "data", "memcore", "ann_index.jsonl")
 OUT_DIR = os.path.join(ROOT, "data", "graft")
 
 PATH_RE = re.compile(

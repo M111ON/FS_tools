@@ -73,18 +73,27 @@ def _healthy(url=HEALTH, key="status", want="ok", timeout=3):
 
 
 def _index_paths():
-    """Pick the corpus: the derived memcore index if it exists, else the sample."""
+    """Pick the corpus: the derived memcore index if it exists, else the sample.
+
+    ANN owns the index (ann_*); kv_* is the legacy name kept working for older
+    checkouts. Prefer ann_*, fall back to kv_* if only that exists."""
+    def pick(d):
+        idx = os.path.join(d, "ann_index.jsonl")
+        if not os.path.exists(idx):
+            idx = os.path.join(d, "kv_index.jsonl")
+        anch = os.path.join(d, "ann_anchors.bin")
+        if not os.path.exists(anch):
+            anch = os.path.join(d, "kv_anchors.bin")
+        order = os.path.join(d, "ann_index.order")
+        if not os.path.exists(order):
+            order = os.path.join(d, "kv_index.order")
+        return (idx, anch, order, os.path.join(d, "lz_route.log"))
+
     mem = os.path.join(DIR, "data", "memcore")
-    if os.path.exists(os.path.join(mem, "kv_index.jsonl")):
-        return (os.path.join(mem, "kv_index.jsonl"),
-                os.path.join(mem, "kv_anchors.bin"),
-                os.path.join(mem, "kv_index.order"),
-                os.path.join(mem, "lz_route.log"))
-    s = os.path.join(DIR, "data", "sample")
-    return (os.path.join(s, "kv_index.jsonl"),
-            os.path.join(s, "kv_anchors.bin"),
-            os.path.join(s, "kv_index.order"),
-            os.path.join(s, "lz_route.log"))
+    if os.path.exists(os.path.join(mem, "ann_index.jsonl")) or \
+       os.path.exists(os.path.join(mem, "kv_index.jsonl")):
+        return pick(mem)
+    return pick(os.path.join(DIR, "data", "sample"))
 
 
 def _only_instance():
