@@ -99,19 +99,45 @@ def spawn(idx, anch, order, log, port, budget, extra_env=None):
     if extra_env:
         pairs.update(extra_env)
     os.makedirs(os.path.dirname(log) or ".", exist_ok=True)
-    bat = os.path.join(os.path.dirname(log), f"run_{port}.bat")
-    with open(bat, "w", encoding="utf-8", newline="") as f:
-        f.write("@echo off\r\n")
-        for k, v in pairs.items():
-            f.write(f'set "{k}={v}"\r\n')
-        f.write(f'"{EXE}"\r\n')
-    p = subprocess.Popen([bat], cwd=ANN,
+    # Launch the exe DIRECTLY with env= — do NOT wrap it in a .bat. A .bat makes
+    # cmd.exe the child, so terminate() kills cmd.exe and leaks a resident
+    # ann_search.exe per budget (measured: 19 orphans after a few sweeps).
+    # Spawning the exe makes the Popen handle the real process, so terminate()
+    # reaches it. kill_server() is the belt-and-braces reaper.
+    env = {**os.environ, **pairs}
+    p = subprocess.Popen([EXE], cwd=ANN, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     h = wait_health(port)
     if h is None:
-        p.terminate()
+        kill_server(p, port)
         raise SystemExit(f"scratch server on :{port} (budget={budget}) never became healthy")
     return p, h
+
+
+def kill_server(p, port=None):
+    """Stop a scratch server and make sure the PORT is actually free again.
+
+    terminate() is enough when the exe was spawned directly, but be defensive:
+    if the process is still alive after the wait, taskkill the tree by PID
+    (and, as a last resort, by the port's owning PID). Idempotent — safe to
+    call on an already-dead server. Never touches the live :8096 instance
+    (that is a different PID/port)."""
+    try:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if p.poll() is None:                       # still alive -> kill the tree
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        except Exception:
+            pass
 
 
 def load_index(path):
@@ -225,11 +251,7 @@ def main():
                 want = set(truth[r][:k])
                 hits[k] += len(want & set(got[:k]))
                 tot[k] += len(want)
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            pass
+        kill_server(p, port)
         rec = {k: (hits[k] / tot[k] if tot[k] else 0.0) for k in ks}
         curve[B] = rec
         label = "unbounded" if B == 0 else str(B)
