@@ -377,6 +377,12 @@ static inline uint32_t lz_fog_id(int bucket) {
 #define LZ_OVERLAP_TOPB 2
 #define LZ_ROUTE_HEADROOM_DEF 4
 #define LZ_SEARCH_BUDGET_DEF 24000
+/* Recall knee is corpus-size-relative (measured 2026-10-11, 300q x2 corpora
+ * vs a numpy oracle: memcore knee ~0.40*N, sample ~0.69*N), so a FIXED default
+ * under-serves a growing corpus. budget = min(N, max(FLOOR, frac*N)) — the
+ * floor keeps the default identical for N <= FLOOR/frac (= 60k), above which
+ * it scales. Explicit LZ_SEARCH_BUDGET still overrides both. */
+#define LZ_SEARCH_BUDGET_FRAC_DEF 0.40
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
 typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; int goff; int gn; } LZEntry;
 
@@ -574,15 +580,31 @@ static int lz_mem_search(const float *qv, int qd,
     int fallback = 0;
     int budget = LZ_SEARCH_BUDGET_DEF;
     int cap = 0;
-    /* env LZ_SEARCH_BUDGET wins; otherwise the source default applies as-is.
-     * NO silent widen-to-full-scan: that trap (kept until 2026-10-11) made the
-     * default unreachable for any index larger than it, so every query paid a
-     * full scan while reporting truncated=0. Recall is steep in budget
-     * (measured 2026-10-11, 40 real-vec queries vs numpy oracle, pruned top-5):
-     * R@10 0.47 @8000, 0.90 @16000, 0.96 @24000, 0.995 @full. The default now
-     * sits at the near-flat knee; raise/lower it explicitly here or via env. */
+    /* Budget resolution, in order:
+     *   1. env LZ_SEARCH_BUDGET (>0) wins outright.
+     *   2. else min(N, max(FLOOR, frac*N)): the floor keeps the historical
+     *      24000 for N <= 60000 (today's corpora are 2881 / 59756, so nothing
+     *      changes there), and the corpus scales past that so a growing index
+     *      is not silently under-served by a fixed number. frac via
+     *      LZ_SEARCH_BUDGET_FRAC (default 0.40 = the measured memcore knee).
+     *   3. NO silent widen-to-full-scan: that trap (removed 2026-10-11) made a
+     *      default larger than N unreachable and reported truncated=0 forever.
+     * Recall is steep in budget (measured 2026-10-11, 300 real-vec queries x2
+     * corpora vs numpy oracle, pruned top-5): memcore R@10 0.51 @8k, 0.88 @16k,
+     * 0.96 @24k (0.40*N), 0.998 @full; sample R@10 0.61 @500, 0.94 @1000,
+     * 0.995 @2000 (0.69*N). */
     { const char *be = getenv("LZ_SEARCH_BUDGET");
-      if (be && atoi(be) > 0) budget = atoi(be); }
+      if (be && atoi(be) > 0) {
+          budget = atoi(be);
+      } else {
+          double frac = LZ_SEARCH_BUDGET_FRAC_DEF;
+          { const char *fe = getenv("LZ_SEARCH_BUDGET_FRAC");
+            if (fe && atof(fe) > 0.0 && atof(fe) <= 1.0) frac = atof(fe); }
+          long scaled = (long)(frac * (double)nent + 0.5);
+          if (scaled < LZ_SEARCH_BUDGET_DEF) scaled = LZ_SEARCH_BUDGET_DEF;
+          if (nent > 0 && scaled > nent) scaled = nent;
+          budget = (int)scaled;
+      } }
     /* ── bucket-restricted walk (env ANN_WALK_PRUNE=1) ──────────────────
      * The default walk STEPS over all nent entries in placement order and
      * only counts scoring toward the budget, so the table's bucket choice
