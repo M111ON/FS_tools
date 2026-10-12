@@ -51,6 +51,21 @@ only; live :8096 untouched.
    number the handoff reported. R@10 at that ceiling is 0.9980, so 24000
    (0.9603) gives up ~0.038 to buy ~2.6× fewer scored items.
 
+## Follow-up IMPLEMENTED (2026-10-12, ann 84b863b)
+
+The finding above ("knee is corpus-size-relative → a fixed default is the wrong
+shape") is now coded: the serve resolves the default budget as
+`min(N, max(24000, frac*N))` with `frac = LZ_SEARCH_BUDGET_FRAC_DEF = 0.40`
+(env `LZ_SEARCH_BUDGET_FRAC`, default 0.40 = the measured memcore knee). An
+explicit `LZ_SEARCH_BUDGET` still wins outright.
+
+- The **24000 floor** means today's corpora are byte-identical: memcore 59756 →
+  24000, sample 2881 → 2881. Scaling only engages past N = 60000.
+- Verified on the new build (scratch servers): memcore default 24000, frac=0.60
+  → 35854, env 16000 → 16000, frac=0.01 → floor 24000; sample → 2881.
+- Suite: test_anchor_route 5/0, test_anchor_routed 13/0, test_wang_latch ALL
+  PASS. Deployed to live :8096 (budget still 24000, no behaviour change).
+
 ## Tooling bug found and fixed (same session)
 
 `bench_budget_recall.py --budgets 0` is documented "0 = unbounded", but after the
