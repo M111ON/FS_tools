@@ -12,6 +12,16 @@
    and the scan stops after them (`route.mode = "warm"`).
 3. The walk then shuts the latch as before (monotone) and appends to the P3 log.
 
+**Gate (fixed 2026-10-14).** The warm reorder only runs when it actually skips
+work: `cov < budget`. `cov` is the number of entries the SHUT buckets cover, and
+a single bucket covers 24–30% of the index (B1), so `budget = cov` could *raise*
+the cap above `LZ_SEARCH_BUDGET` — a repeat of `geofs mdim` scored **47027 vs the
+24000 cold cap** on the 59756-row index. The warm path must do **less** work,
+never more. The bug was latent: D5 made 24000 a hard cutoff on 2026-10-11, while
+this doc was written 2026-10-08 when the budget still auto-raised to N (so
+`cov < nent` was always true then). When `cov >= budget` there is nothing to
+skip, so the cold walk is left untouched.
+
 This is the **hot/cold axis** only. It never prunes a route that was not walked
 before — a novel query has no SHUT bucket and keeps its full behaviour.
 
@@ -29,6 +39,34 @@ buckets. Three related queries, warm ON vs OFF:
 - **Gate met**: an overlapping query scores fewer items, and the **top-k is
   identical** to the OFF baseline (recall preserved).
 - Novel query unchanged (54750 = OFF).
+
+> ⚠️ **These 2026-10-08 numbers predate the D5 budget change** and the row
+> `budget = cov` that produced them is the bug fixed 2026-10-14. At the current
+> default (`LZ_SEARCH_BUDGET=24000`) the warm path is **inert** on this index:
+> 5 buckets already cover >24000 entries, so `cov >= budget` and the cold walk
+> is kept. Re-measured below with an explicit budget.
+
+### Re-measured after the fix (2026-10-14, 59,756-entry index, 60 queries)
+
+`bench_warm_recall.py` — raw index rows as queries, oracle = numpy brute top-K
+over all N. `--budget 60000` (above N, so the warm set is a genuine subset):
+
+| pass | mode | items_scored (mean) | R@1 | R@5 | R@10 |
+|---|---|---|---|---|---|
+| OFF novel | anchor+p | 46265.6 | 1.0000 | 1.0000 | 1.0000 |
+| ON novel (cold) | anchor+p / warm+p | 46002.7 | 1.0000 | 1.0000 | 1.0000 |
+| ON repeat | warm+p | 46264.8 | 1.0000 | 1.0000 | 1.0000 |
+| OFF overlap | anchor+p | 47812.0 | 0.9833 | 1.0000 | 0.9983 |
+| ON overlap (warm) | warm+p | **47603.8** | 0.9833 | 1.0000 | 0.9983 |
+
+- **C1 (novel recall unchanged)**: warm ON == OFF on recall@1/5/10 and top-k; the
+  warm pass scores *fewer* items (46003 vs 46266), never more.
+- **C2 (warm scores fewer)**: the overlapping query scores 47604 vs 47812 OFF,
+  with recall **identical** and top-k == OFF.
+
+At the production default (`LZ_SEARCH_BUDGET=24000`) both the OFF and ON runs
+score exactly 24000 and every recall figure is identical — the warm path is a
+correct no-op there.
 
 ## Honest limits (measured, do not overclaim)
 
@@ -51,14 +89,17 @@ buckets. Three related queries, warm ON vs OFF:
 ## Reproduce
 
 ```sh
-# warm ON, topk=1, related queries
+# the full A/B measurement (novel vs repeat vs overlap, numpy oracle)
+python bench_warm_recall.py --queries 60 --ks 1,5,10 --sigmas 0.05 --budget 60000
+
+# or by hand: warm ON, topk=1, related queries
 ANN_TOMBSTONE_WARM=1 ANN_ROUTE_LOG=data/memcore/lz_route.log \
   ./build/ann_search.exe --serve 8096
 curl -s -X POST -H "Content-Type: application/json" \
   -d '{"query":"geofs mdim","topk":1}' http://127.0.0.1:8096/v1/state/search
 curl -s -X POST -H "Content-Type: application/json" \
   -d '{"query":"geofs mdim multivolume","topk":1}' http://127.0.0.1:8096/v1/state/search
-# second call reports route.mode="warm" and fewer items_scored
+# second call reports route.mode="warm" and fewer items_scored (budget permitting)
 ```
 
 Verified ad-hoc 8/8 (scratch port, fresh route log): build, novel anchor mode,
