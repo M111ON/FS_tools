@@ -51,9 +51,13 @@ p3-tools: $(BUILD)/p3_compact_verify.exe $(BUILD)/p3_append_test.exe
 # Dry-run the compactor (no writes). Apply with:
 #   python scripts/p3_compact.py --log data/memcore/lz_route.log --apply
 p3-compact-dry: | $(BUILD)
-	python scripts/p3_compact.py --log data/memcore/lz_route.log
+	$(PY) scripts/p3_compact.py --log data/memcore/lz_route.log
+
+# Where a query's time goes (embed vs scan). Needs the live server on :8096.
+latency-split:
+	$(PY) bench_latency_split.py
 
 clean:
 	rm -f $(BUILD)/ann_search.exe $(BUILD)/test_*.exe $(BUILD)/p3_*.exe
 
-.PHONY: all test serve clean p3-tools p3-compact-dry
+.PHONY: all test serve clean p3-tools p3-compact-dry latency-split
