@@ -2,6 +2,9 @@ CC      := gcc
 CFLAGS  := -O2 -std=c11 -Wall -Wno-unused-parameter -Wno-sign-compare -Wno-format -Wno-unknown-pragmas -Iinclude
 LDFLAGS := -lws2_32 -lpsapi -lm
 BUILD   := build
+# The python tests need numpy, which the bare `python` on PATH does NOT have
+# (measured). I:\python3.14.4\python.exe does. Override with PY=... if needed.
+PY      ?= I:/python3.14.4/python.exe
 
 # Tests that are green in the upstream repo (byte-identical copies).
 # NOTE: test_anchor_determinism is deliberately NOT here — it fails in the
@@ -25,7 +28,9 @@ test: | $(BUILD)
 	  ./$(BUILD)/$$t.exe || fail=1; \
 	done; \
 	echo "--- test_p3_compact (python) ---"; \
-	python tests/test_p3_compact.py || fail=1; \
+	$(PY) tests/test_p3_compact.py || fail=1; \
+	echo "--- test_vec_format (python, needs numpy) ---"; \
+	$(PY) tests/test_vec_format.py || fail=1; \
 	if [ $$fail -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi; \
 	exit $$fail
 
