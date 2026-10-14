@@ -701,7 +701,21 @@ static int lz_mem_search(const float *qv, int qd,
                         for (int b = 0; b < rnb; b++)
                             if (shut[b] && (a == rb[b] || a2 == rb[b])) { cov++; break; }
                     }
-                    if (cov > 0 && cov < nent) {
+                    /* Take the warm path ONLY when it actually skips work:
+                     * cov < budget. Two reasons.
+                     *  1. The old `budget = cov` RAISED the cap: cov counts the
+                     *     entries covered by the SHUT buckets, and a single
+                     *     bucket covers 24-30% of the index (B1), so a repeat
+                     *     query pushed the budget ABOVE LZ_SEARCH_BUDGET —
+                     *     measured 2026-10-14: repeat scored 47027 vs the 24000
+                     *     cold cap. The warm path must never do MORE work than
+                     *     the cold one. (Latent since D5 made 24000 a hard cap
+                     *     on 2026-10-11; WARM-PATH.md predates that.)
+                     *  2. If cov >= budget there is nothing to skip, and
+                     *     reordering warm-first would only change WHICH entries
+                     *     are scored (a recall risk) for no speed win — so
+                     *     leave the cold walk untouched. */
+                    if (cov > 0 && cov < budget) {
                         uint32_t *o2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
                         if (o2) {
                             int w = 0;
