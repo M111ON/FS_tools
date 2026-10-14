@@ -30,7 +30,23 @@ test: | $(BUILD)
 serve: $(BUILD)/ann_search.exe
 	./$(BUILD)/ann_search.exe --serve 8096
 
-clean:
-	rm -f $(BUILD)/ann_search.exe $(BUILD)/test_*.exe
+# P3 route-log maintenance (the tombstone log). Compact is lossless by
+# construction: replay is last-event-wins per slot, so superseded records are
+# dropped and a replayed latch is bit-identical (verified by p3_compact_verify).
+$(BUILD)/p3_compact_verify.exe: tests/p3_compact_verify.c $(wildcard include/*.h) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/p3_compact_verify.c -lm
 
-.PHONY: all test serve clean
+$(BUILD)/p3_append_test.exe: tests/p3_append_test.c $(wildcard include/*.h) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/p3_append_test.c -lm
+
+p3-tools: $(BUILD)/p3_compact_verify.exe $(BUILD)/p3_append_test.exe
+
+# Dry-run the compactor (no writes). Apply with:
+#   python scripts/p3_compact.py --log data/memcore/lz_route.log --apply
+p3-compact-dry: | $(BUILD)
+	python scripts/p3_compact.py --log data/memcore/lz_route.log
+
+clean:
+	rm -f $(BUILD)/ann_search.exe $(BUILD)/test_*.exe $(BUILD)/p3_*.exe
+
+.PHONY: all test serve clean p3-tools p3-compact-dry
