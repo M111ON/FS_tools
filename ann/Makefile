@@ -24,6 +24,8 @@ test: | $(BUILD)
 	  $(CC) $(CFLAGS) -o $(BUILD)/$$t.exe tests/$$t.c -lm || { fail=1; continue; }; \
 	  ./$(BUILD)/$$t.exe || fail=1; \
 	done; \
+	echo "--- test_p3_compact (python) ---"; \
+	python tests/test_p3_compact.py || fail=1; \
 	if [ $$fail -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi; \
 	exit $$fail
 
