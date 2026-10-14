@@ -68,6 +68,39 @@ At the production default (`LZ_SEARCH_BUDGET=24000`) both the OFF and ON runs
 score exactly 24000 and every recall figure is identical — the warm path is a
 correct no-op there.
 
+## P3 route-log compaction (2026-10-14)
+
+The tombstone's truth is the P3 log, and the latch is MONOTONE within an epoch,
+so the log is append-only. Before the transition-only fix (2026-10-11) it
+recorded the SAME slot on every walk: the live log held **5,661 records for 7
+distinct slots (99% redundant)** and every boot replayed all of it. The fix
+stopped new growth but left the historical bulk.
+
+`scripts/p3_compact.py` compacts it **losslessly by construction** — replay is
+last-event-wins per `(name_hash, slot)`, so superseded records carry no
+information; `ANCHOR` (no state) and `CLEAR`-on-a-virgin-slot (a no-op) are
+dropped, and everything kept is copied byte-exact so CRCs stay valid.
+
+Measured on the live log, then deployed:
+
+| | before | after |
+|---|---|---|
+| records | 5661 | **7** |
+| bytes | 181,155 | **227** |
+| shut ids | 72,144,216,288,360,432,504 | identical |
+| live `fog.replayed` | 5661 | **7** |
+
+`tests/p3_compact_verify.c` (the real `wl_replay_log_file` the server uses)
+reports `LATCH IDENTICAL: YES`; `tests/p3_append_test.c` proves the compacted
+file still accepts appends (7 → 8 records, 0 old ids lost). Safety: dry-run by
+default, refuses on any CRC failure or state change, writes `.bak-<ts>` first.
+
+```sh
+python scripts/p3_compact.py --log data/memcore/lz_route.log            # dry-run
+python scripts/p3_compact.py --log data/memcore/lz_route.log --apply    # compact
+```
+Stop the server first (it holds the log open for append).
+
 ## Honest limits (measured, do not overclaim)
 
 1. **An EXACT repeat does not reduce.** A repeat routes to the same buckets the
