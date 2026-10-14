@@ -95,6 +95,10 @@ reports `LATCH IDENTICAL: YES`; `tests/p3_append_test.c` proves the compacted
 file still accepts appends (7 → 8 records, 0 old ids lost). Safety: dry-run by
 default, refuses on any CRC failure or state change, writes `.bak-<ts>` first.
 
+`tests/test_p3_compact.py` is wired into `make test` (4th group), so the
+canonical command covers this change: edge cases, refusals, shrink/idempotence,
+and the C-replay round-trip.
+
 ```sh
 python scripts/p3_compact.py --log data/memcore/lz_route.log            # dry-run
 python scripts/p3_compact.py --log data/memcore/lz_route.log --apply    # compact
