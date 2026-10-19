@@ -270,3 +270,26 @@ top-1 unchanged (`51b0fc3f…`), so no ranking regression.
 
 Next levers live upstream and are ported on demand: tombstone warm path, maze
 refine layer. Do not raise `ANCHR_MAXK` expecting pruning — measured negative.
+
+## Batch endpoint: `POST /v1/state/search-batch` (2026-10-20)
+
+One call, N≤32 queries. Body `{"queries":[...], "k":3}` (or `"topk"`).
+Response: `{"status":"ok","telemetry":{"n","embed_ms","took_ms"},"results":[…]}` —
+each `results[i]` has the SAME shape as a single `/v1/state/search` response
+(`status`, `hits[]`, `route{}`).
+
+Two wins it compounds:
+1. **One embed call per batch** — `input:[...]` array to the :18095 sidecar
+   instead of N calls (measured: B=1 12.3 ms, B=8 4.0 ms/ea, B=16 3.6 ms/ea).
+2. **One `g_lock` acquisition per batch** — all N scans run inside a single
+   critical section, so per-request lock overhead and cache re-warming are paid
+   once. Measured on the 62k live index shape (port 8097 scratch server):
+   batch B=8 ≈ 162–247 ms vs 8 serial singles ≈ 251 ms (kernel OFF)
+   / ≈ 183 ms (kernel ON).
+
+Float kernel (`ANN_FLOAT_KERNEL=1`, default OFF): hot loop uses `lz_dotf()`
+(pure-float 4-acc chain) with per-entry reciprocal `1/norm` precomputed at
+index load and per-query `1/qn`. Microbench (24k × 384, 9 reps): 353.9 ns/dot
+→ 242.4 ns/dot = **1.46×**; NOT bit-identical (reassociation, LAW 3b) —
+max_rel_diff 2.797e-07 over 50 pairs. End-to-end single-query p50 32 ms → 23 ms
+and top-k sids OFF == ON per query on the 62k index (8/8 identical).
