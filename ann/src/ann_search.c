@@ -296,6 +296,9 @@ static int lz_sanitize(char *dst, int cap, const char *src) {
     dst[di] = '\0';
     return di;
 }
+/* wall ms of the most recent embed POST (kept current by BOTH lz_embed and
+ * lz_embed_batch; the /v1/state/search-batch handler reads it for telemetry). */
+static double g_last_embed_ms = 0.0;
 /* fetch embedding for text; returns dim or -1. Sidecar: llama-server
  * /embedding with {"content": "..."} (multilingual-e5-small, 384-dim). */
 static int lz_embed(const char *text, float *vec, int maxdim) {
@@ -339,6 +342,61 @@ static int lz_embed(const char *text, float *vec, int maxdim) {
         while (*p && *p != ',' && *p != ']') p++;
     }
     return n;
+}
+
+/* ── batch embed (B<=32, additive): ONE POST to :18095 /v1/embeddings ──
+ * std OpenAI shape {"input":[...]}; response {"data":[{"embedding":[..]},..]}.
+ * Fails CLOSED: *ok=0 -> caller falls back to per-string lz_embed. */
+static float *lz_embed_batch(const char * const *qs, int nq, float *out,
+                             int *out_dims, int maxdim, int *ok) {
+    *ok = 0;
+    if (!qs || nq <= 0 || nq > 32 || !out || !out_dims) return NULL;
+    const char *eh = getenv("LZ_EMBED_HOST");
+    const char *ep = getenv("LZ_EMBED_PORT");
+    const char *host = (eh && eh[0]) ? eh : "127.0.0.1";
+    int port = (ep && atoi(ep)) ? atoi(ep) : 18095;
+    static char ebody[60000];
+    int ebo = snprintf(ebody, sizeof(ebody), "{\"input\":[");
+    static char sane[2048];
+    static char esc[2048];
+    for (int qi = 0; qi < nq; qi++) {
+        lz_sanitize(sane, (int)sizeof(sane), qs[qi]);
+        lz_json_escape(esc, sizeof(esc), sane);
+        ebo += snprintf(ebody + ebo, sizeof(ebody) - ebo,
+            "%s\"%s\"", qi ? "," : "", esc);
+        if (ebo < 0 || ebo >= (int)sizeof(ebody) - 8) return NULL;
+    }
+    ebo += snprintf(ebody + ebo, sizeof(ebody) - ebo, "]}");
+    LARGE_INTEGER qf, t0, t1;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&t0);
+    static char resp[65536];
+    int nr = lz_http_post(host, port, "/v1/embeddings", ebody, resp, sizeof(resp));
+    QueryPerformanceCounter(&t1);
+    g_last_embed_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+    const char *dp = (nr > 0) ? strstr(resp, "\"data\"") : NULL;
+    if (nr <= 0 || !dp) return NULL;
+    int got = 0;
+    dp = strchr(dp, '[');
+    for (int qi = 0; qi < nq; qi++) {
+        dp = (dp && *dp) ? strchr(dp, '[') : NULL;
+        if (!dp) break;
+        dp++;
+        int nd = 0;
+        while (*dp && *dp != ']' && nd < maxdim) {
+            while (*dp == ' ' || *dp == ',') dp++;
+            if (*dp == ']' || !*dp) break;
+            out[(size_t)qi * maxdim + nd] = (float)atof(dp);
+            nd++;
+            while (*dp && *dp != ',' && *dp != ']') dp++;
+        }
+        if (dp && *dp == ']') dp++;
+        out_dims[qi] = nd;
+        if (nd > 0) got++;
+    }
+    if (got != nq) return NULL;
+    *ok = 1;
+    return out;
 }
 
 /* ── fog latch over the anchor-bucket space (from L219-256) ──
@@ -471,10 +529,26 @@ static int lz_index_load(LZEntry **out, int *n_out) {
     *out = a; *n_out = n;
     return 0;
 }
+/* ── FLOAT-KERNEL parallel arrays (ANN_FLOAT_KERNEL=1) ─────────────── */
+static float *g_inv = NULL;
+static int g_inv_n = 0;
+static int g_float_kernel = 0;
+static void lazy_inv_build(LZEntry *ents, int nent) {
+    if (g_inv && g_inv_n == nent) return;
+    free(g_inv); g_inv = NULL; g_inv_n = 0;
+    g_inv = (float *)malloc((size_t)(nent > 0 ? nent : 1) * sizeof(float));
+    if (!g_inv) return;
+    for (int i = 0; i < nent; i++)
+        g_inv[i] = (ents[i].norm > 0) ? (float)(1.0 / ents[i].norm) : 0.0f;
+    g_inv_n = nent;
+}
 static void lz_index_free(LZEntry *a, int n) {
     if (!a) return;
     for (int i = 0; i < n; i++) free(a[i].vec);
     free(a);
+    free(g_inv);
+    g_inv = NULL;
+    g_inv_n = 0;
 }
 /* index cache: load-once, reload on mtime/size change (single-threaded). */
 static LZEntry *g_idx_cache = NULL;
@@ -546,6 +620,24 @@ static int lz_route_cached(int nent) {
  * and no unit-norm precondition; but reassociating the sum is not
  * bit-identical (max_rel_diff 2.5e-12). Speedup and the alternatives not
  * taken: RESULTS-ROUTE-COST-2026-10-19.md (variants H and G). */
+/* ── float kernel (env ANN_FLOAT_KERNEL=1, default OFF = old double path) ─
+ * Same 4-chain shape as lz_dot, but with float mul/adds — for use with
+ * reciprocal normalizers so no div shows up in the hot loop. NOT
+ * bit-identical to the double path: float accumulation + reassociation
+ * change rounding (see microbench; measured max_rel_diff < 1e-5). */
+static inline float lz_dotf(const float *a, const float *b, int d) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int j = 0;
+    for (; j + 4 <= d; j += 4) {
+        s0 += a[j]     * b[j];
+        s1 += a[j + 1] * b[j + 1];
+        s2 += a[j + 2] * b[j + 2];
+        s3 += a[j + 3] * b[j + 3];
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; j < d; j++) s += a[j] * b[j];
+    return s;
+}
 static inline double lz_dot(const float *a, const float *b, int d) {
     double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
     int j = 0;
@@ -580,6 +672,9 @@ static int lz_mem_search(const float *qv, int qd,
     double qn = 0;
     for (int qi = 0; qi < qd; qi++) qn += (double)qv[qi] * qv[qi];
     qn = sqrt(qn);
+    /* FLOAT-KERNEL per-query reciprocal (one division per QUERY instead of
+     * one per entry). Local stack — thread-safe without a lock. */
+    float qinv_local = (qn > 0.0) ? (float)(1.0 / qn) : 0.0f;
     LZEntry *ents = NULL;
     int nent = 0;
     int use_cache = lz_index_cached(&ents, &nent);
@@ -637,6 +732,10 @@ static int lz_mem_search(const float *qv, int qd,
      * score is below f, the query falls back to a full scan (mode
      * "anchor+full", fallback=1), so recall is never worse than today.
      * Both default OFF/0.0 = byte-identical behaviour to before. */
+    /* FLOAT-KERNEL env check (per call; restart not required between runs). */
+    { const char *fk = getenv("ANN_FLOAT_KERNEL");
+      g_float_kernel = (fk && atoi(fk)) ? 1 : 0; }
+    if (g_float_kernel && ents && nent > 0) lazy_inv_build(ents, nent);
     int walk_prune = 0; double walk_floor = 0.0;
     { const char *wp = getenv("ANN_WALK_PRUNE");
       if (wp && atoi(wp) > 0) walk_prune = 1; }
@@ -853,8 +952,16 @@ static int lz_mem_search(const float *qv, int qd,
             if (!sel) { in_run = 0; continue; }
             if (!in_run) { breads++; in_run = 1; }
             if (ents[ei].dim != qd) continue;
-            double dot = lz_dot(qv, ents[ei].vec, qd);
-            double sc = (ents[ei].norm > 0) ? dot / (qn * ents[ei].norm) : -1;
+            double sc;
+            if (g_float_kernel && g_inv && g_inv_n == nent &&
+                ents[ei].norm > 0 && ents[ei].dim == qd) {
+                /* FLOAT-KERNEL path (env ANN_FLOAT_KERNEL=1) */
+                sc = (double)(lz_dotf(qv, ents[ei].vec, qd) *
+                              qinv_local * g_inv[ei]);
+            } else {
+                double dot = lz_dot(qv, ents[ei].vec, qd);
+                sc = (ents[ei].norm > 0) ? dot / (qn * ents[ei].norm) : -1;
+            }
             /* Confident Guideline: a soft cluster bias (never a filter). It only
              * ADDS to the score, so recall cannot drop; ranking is nudged toward
              * structurally-related entries. Off unless ANN_GRAFT=1.
@@ -1499,8 +1606,10 @@ static int lz_json_float_array(const char *json, const char *key, float *out, in
     return n;
 }
 
-/* ── POST /v1/state/search ── */
-static int handle_search(sock_t cli, const char *rq) {
+/* ── batch-query forward decls (implementation below, additive) ── */
+static int lv_search_json(const float *qv, int qd, int topk, char *out, int out_cap, int *out_len);
+static int handle_search_batch(sock_t cli, const char *rq);
+static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int *out_len) {
     char *bd3 = strstr(rq, "\r\n\r\n");
     if (!bd3) { sock_close(cli); return 0; }
     bd3 += 4;
@@ -1611,10 +1720,196 @@ static int handle_search(sock_t cli, const char *rq) {
         sock_close(cli);
         return 0;
     }
+    /* stream the output if a caller buffer was supplied (search-batch uses
+     * this to emit one query's JSON into a shared buffer without the per-
+     * query 16 KB buffer; without a caller buffer nothing changes). */
+    if (out_cap > 0 && out) {
+        if (srlen < out_cap - 1) { memcpy(out, sresp, (size_t)srlen); out[srlen] = '\0'; }
+        else { memcpy(out, sresp, (size_t)(out_cap - 1)); out[out_cap - 1] = '\0'; }
+        if (out_len) *out_len = srlen;
+        return 1;
+    }
     lz_http_send(cli, "200 OK", "application/json", sresp, srlen);
     sock_close(cli);
     return 0;
 }
+
+/* per-connection critical section (pre-existing, shared). */
+static CRITICAL_SECTION g_lock;
+
+/* ── (additive) lv_search_json — one query, NO HTTP (batch holds g_lock) ──
+ * Materialize the float vector into a minimal synthetic search request and
+ * call handle_search with a caller buffer; cli=-1 is never touched on the
+ * streaming path (errors return before any socket use). */
+static int lv_search_json(const float *qv, int qd, int topk, char *out, int out_cap, int *out_len) {
+    static char mini_rq[24576];
+    int used = snprintf(mini_rq, sizeof(mini_rq),
+        "POST /v1/state/search HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    int n2 = snprintf(mini_rq + used, sizeof(mini_rq) - used, "{\"vec\":[");
+    used += n2;
+    for (int j = 0; j < qd; j++) {
+        n2 = snprintf(mini_rq + used, sizeof(mini_rq) - used, "%s%.9g", j ? "," : "", (double)qv[j]);
+        used += n2;
+        if (used >= (int)sizeof(mini_rq) - 4) break;
+    }
+    n2 = snprintf(mini_rq + used, sizeof(mini_rq) - used, "],\"topk\":%d}", topk);
+    used += n2;
+    int olen = 0;
+    handle_search(-1, mini_rq, out, out_cap, &olen);
+    if (out_len) *out_len = olen;
+    return olen;
+}
+
+/* ── POST /v1/state/search-batch (additive) ──────────────────────────
+ * BATCH QUERY endpoint: {"queries":["a","b",...],"k":3} (or "topk").
+ * ONE POST to :18095 /v1/embeddings for the whole input array (std OpenAI
+ * shape — the same sidecar the index build uses; measured B=8 4.0 ms/ea
+ * vs 12.3 ms per single string), then ALL N queries are scanned under ONE
+ * g_lock acquisition (the amortized scan). Shape of each result object ==
+ * today's single-query /v1/state/search body; top level adds
+ * {"telemetry":{"n","embed_ms","took_ms"}}. Cap N<=32 — malformed / empty /
+ * oversized / bad-k -> 400 with an "error" field. */
+static int handle_search_batch(sock_t cli, const char *rq) {
+    char *bd3 = strstr(rq, "\r\n\r\n");
+    if (!bd3) { sock_close(cli); return 0; }
+    bd3 += 4;
+    int bq_cap = 32;   /* hard cap; N>32 -> 400 */
+    static char qs[32][2048];
+    int nq = 0;
+    const char *bq = strstr(bd3, "\"queries\"");
+    int has_queries = 0;
+    if (bq) {
+        bq = strchr(bq + 8, ':');
+        if (bq) {
+            bq++;
+            while (*bq && (*bq == ' ' || *bq == '\t')) bq++;
+            if (*bq == '[') {
+                bq++;
+                has_queries = 1;
+                while (nq < bq_cap) {
+                    while (*bq == ' ' || *bq == '\t' || *bq == ',') bq++;
+                    if (*bq != '"') break;
+                    bq++;
+                    char *dst = qs[nq];
+                    lz_json_unescape(dst, 2048, bq);
+                    nq++;
+                    while (*bq && *bq != '"') { if (*bq == '\\' && bq[1]) bq++; bq++; }
+                    if (*bq == '"') bq++;
+                }
+            }
+        }
+    }
+    int overflow = 0;
+    /* STRING-AWARE overflow count: walk the raw body from the '[' that
+     * starts the queries array and count every real string member by
+     * decoding escapes; quarantined commas INSIDE a string never count. */
+    if (has_queries) {
+        int extra = 0;
+        const char *cap_arr = strchr(bd3, '[');
+        if (cap_arr) {
+            const char *w = cap_arr + 1;
+            while (*w) {
+                while (*w == ' ' || *w == '\t' || *w == ',') w++;
+                if (*w == ']') break;
+                if (*w != '"') break;
+                /* count this member: exactly one string-token boundary */
+                if (nq + extra >= bq_cap) { extra++; break; }   /* beyond cap: overflow */
+                w++;
+                while (*w && *w != '"') { if (*w == '\\' && w[1]) w++; w++; }
+                if (*w == '"') w++;
+                else break;                                /* unterminated string -> treat as non-member */
+            }
+        }
+        if (extra > 0) overflow = 1;
+    }
+    if (!has_queries || overflow) {
+        const char *eb = overflow
+            ? "{\"status\":\"error\",\"error\":\"too_many_queries\",\"cap\":32}"
+            : "{\"status\":\"error\",\"error\":\"missing_queries\",\"hint\":\"send {\\\"queries\\\":[..],\\\"k\\\":3} (cap 32)\"}";
+        lz_http_send(cli, "400 Bad Request", "application/json", eb, (int)strlen(eb));
+        sock_close(cli);
+        return 0;
+    }
+    if (nq == 0) {
+        const char *eb = "{\"status\":\"error\",\"error\":\"empty_queries\"}";
+        lz_http_send(cli, "400 Bad Request", "application/json", eb, (int)strlen(eb));
+        sock_close(cli);
+        return 0;
+    }
+    int bk = lz_json_int(bd3, "topk", -1);
+    if (bk < 0) bk = lz_json_int(bd3, "k", 3);
+    if (bk < 1) bk = 1;
+    if (bk > ANN_MAXK) {
+        char eb[160];
+        int el = snprintf(eb, sizeof(eb),
+            "{\"status\":\"error\",\"error\":\"topk_out_of_range\",\"requested\":%d,\"max\":%d}", bk, ANN_MAXK);
+        lz_http_send(cli, "400 Bad Request", "application/json", eb, el);
+        sock_close(cli);
+        return 0;
+    }
+    /* ONE embed round-trip for the whole batch. */
+    static float qvs[32][1024];
+    static int qdd[32];
+    int embed_ok = 0;
+    {
+        static const char *sq[32];
+        for (int qi = 0; qi < nq; qi++) sq[qi] = qs[qi];
+        float *r = lz_embed_batch((const char * const *)sq, nq,
+                                  (float *)qvs, qdd, 1024, &embed_ok);
+        (void)r;
+        if (!embed_ok) {
+            /* fallback path: per-string via the existing single-string path */
+            for (int qi = 0; qi < nq; qi++) {
+                static float t[1024];
+                int d = lz_embed(qs[qi], t, 1024);
+                if (d > 0) { memcpy(qvs[qi], t, sizeof(float) * d); qdd[qi] = d; }
+                else qdd[qi] = 0;
+            }
+        }
+    }
+    /* lock ONCE for the whole batch (the amortized scan). */
+    static char out_buf[76800];
+    int olen = 0;
+    LARGE_INTEGER qf, qt0, qt1;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qt0);
+    double emb_ms = g_last_embed_ms;
+    EnterCriticalSection(&g_lock);
+    static char row_buf[16384];
+    for (int qi = 0; qi < nq; qi++) {
+        row_buf[0] = '\0';
+        int chunk = 0;
+        if (qdd[qi] > 0) {
+            int rlen = 0;
+            chunk = lv_search_json(qvs[qi], qdd[qi], bk,
+                                   row_buf, (int)sizeof(row_buf) - 1, &rlen);
+            if (chunk > 0) chunk = rlen > 0 ? rlen : chunk;
+        }
+        const char *row = row_buf;
+        if (chunk <= 0) {   /* embed failing or buffer cap: emit an explicit error object */
+            row = "{\"status\":\"error\",\"error\":\"embed_unavailable\"}";
+            chunk = (int)strlen(row);
+        }
+        if (olen > 0 && olen < (int)sizeof(out_buf) - 1) { out_buf[olen++] = ','; }
+        if (olen + chunk >= (int)sizeof(out_buf) - 1) break;   /* cap: emit what we have */
+        memcpy(out_buf + olen, row, (size_t)chunk);
+        olen += chunk;
+        out_buf[olen] = '\0';
+    }
+    QueryPerformanceCounter(&qt1);
+    double took_ms = (double)(qt1.QuadPart - qt0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+    LeaveCriticalSection(&g_lock);
+    static char bresp[81920];
+    int brlen = snprintf(bresp, sizeof(bresp),
+        "{\"status\":\"ok\",\"telemetry\":{\"n\":%d,\"embed_ms\":%.2f,\"took_ms\":%.2f},\"results\":[",
+        nq, emb_ms, took_ms);
+    brlen += snprintf(bresp + brlen, sizeof(bresp) - brlen, "%.*s", olen, out_buf);
+    brlen += snprintf(bresp + brlen, sizeof(bresp) - brlen, "]}");
+    lz_http_send(cli, "200 OK", "application/json", bresp, brlen);
+    sock_close(cli);
+    return 0;
+}
+
 
 /* ── per-connection handling ──────────────────────────────────────────
  * The server was single-threaded with no socket timeout, so one idle or
@@ -1623,7 +1918,6 @@ static int handle_search(sock_t cli, const char *rq) {
  * core (shared index/anchor/fog caches) is guarded by a critical section so
  * the caches stay consistent — the same serialization as before, but a slow
  * client can no longer hold the accept loop. */
-static CRITICAL_SECTION g_lock;
 
 static void dispatch(sock_t cli, char *rq) {
     char method[16] = "", path[256] = "";
@@ -1641,7 +1935,9 @@ static void dispatch(sock_t cli, char *rq) {
         lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
         sock_close(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search") == 0) {
-        handle_search(cli, rq);
+        handle_search(cli, rq, NULL, 0, NULL);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search-batch") == 0) {
+        handle_search_batch(cli, rq);
     } else {
         const char *b = "{\"error\":\"not_found\",\"try\":\"/health or POST /v1/state/search\"}";
         lz_http_send(cli, "404 Not Found", "application/json", b, (int)strlen(b));
