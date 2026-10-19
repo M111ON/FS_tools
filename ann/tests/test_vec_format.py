@@ -95,44 +95,56 @@ def load_store(sids, dim):
 
 
 def blocks(X, mask=None):
+    """Yield (row_block, original_row_labels) for each chunk.
+
+    Labels are carried explicitly because the label space differs from the row
+    count whenever a mask drops rows: a masked chunk's first label is not its
+    position in the filtered array. Deriving labels from a running count
+    silently mislabels every row after a gap, which would compare the wrong
+    vectors in the overlap check.
+    """
     for i in range(0, len(X), CHUNK):
-        blk = X[i:i + CHUNK]
-        yield blk if mask is None else blk[mask[i:i + CHUNK]]
+        sl = slice(i, i + CHUNK)
+        blk = X[sl]
+        idx = np.arange(sl.start, sl.start + len(blk))
+        if mask is None:
+            yield blk, idx
+        else:
+            keep = mask[sl]
+            yield blk[keep], idx[keep]
 
 
 def binary_blocks(X):
     """The bytes we would actually write, read back - values must be identical."""
-    for blk in blocks(X):
-        yield np.frombuffer(blk.tobytes(), dtype=np.float32).reshape(blk.shape)
+    for blk, idx in blocks(X):
+        yield np.frombuffer(blk.tobytes(), dtype=np.float32).reshape(blk.shape), idx
 
 
 def int8_blocks(X):
     """Dequantise per block, so a full 95 MB float32 copy of C never exists."""
-    for blk in blocks(X):
+    for blk, idx in blocks(X):
         mx = np.abs(blk).max(axis=1, keepdims=True)
         q = np.round(blk / mx * 127.0).clip(-127, 127).astype(np.int8)
-        yield q.astype(np.float32) * mx / 127.0
+        yield q.astype(np.float32) * mx / 127.0, idx
 
 
 def topk_sets(chunks, Qn, topk=TOPK):
-    """Top-k index set per query, computed in corpus blocks (bounded RAM).
+    """Top-k label set per query, computed in corpus blocks (bounded RAM).
 
     Per-block argpartition, then merge the block winners and keep the global
     top-k - same result as one full-width argpartition for distinct sims.
     """
     cands = [[] for _ in range(len(Qn))]
-    base = 0
-    for blk in chunks:
+    for blk, idx in chunks:
         nb = np.linalg.norm(blk, axis=1, keepdims=True) + 1e-12
         sims = (blk / nb) @ Qn.T
         k = min(topk, sims.shape[0])
         for r in range(sims.shape[1]):
             part = np.argpartition(-sims[:, r], k - 1)[:k]
             merged = cands[r] + list(zip(sims[part, r].tolist(),
-                                        (part + base).tolist()))
+                                        idx[part].tolist()))
             merged.sort(key=lambda t: -t[0])
             cands[r] = merged[:topk]
-        base += len(blk)
     return [set(i for _, i in c) for c in cands]
 
 
@@ -149,7 +161,7 @@ def main():
 
     # 1. the current text format already differs from the store float32
     d_txt, cos_txt = 0.0, 1.0
-    for a, s in zip(blocks(A, found), blocks(S, found)):
+    for (a, _), (s, _) in zip(blocks(A, found), blocks(S, found)):
         if not len(a):
             continue
         d_txt = max(d_txt, float(np.abs(a - s).max()))
@@ -161,16 +173,16 @@ def main():
     check("text round-6 cosine ~1 (>0.99999)", cos_txt > 0.99999, cos_txt)
 
     # 2. binary float32 is lossless w.r.t. what we would write
-    rt = all(np.array_equal(blk, b) for blk, b in
+    rt = all(np.array_equal(blk, b) for (blk, _), (b, _) in
              zip(blocks(A), binary_blocks(A)))
     check("binary float32 round-trips byte-exact", rt)
     check("binary float32 changes NO value vs current text",
           all(float(np.abs(b - a).max()) == 0.0
-              for a, b in zip(blocks(A), binary_blocks(A))))
+              for (a, _), (b, _) in zip(blocks(A), binary_blocks(A))))
 
     # 3. int8 is lossy - measure it, do not assume
     d8 = 0.0
-    for a, c in zip(blocks(A), int8_blocks(A)):
+    for (a, _), (c, _) in zip(blocks(A), int8_blocks(A)):
         d8 = max(d8, float(np.abs(c - a).max()))
     print(f"  int8: max|diff|={d8:.2e}")
     check("int8 is measurably lossy (>1e-4)", d8 > 1e-4, d8)
