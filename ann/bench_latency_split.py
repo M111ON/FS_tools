@@ -41,11 +41,34 @@ QUERIES = ["tesspack format", "tombstone warm path", "hex address", "wang latch"
            "hyperbolic scale", "GGUF bake", "SIFT recall", "frustum composite"]
 
 
+def embed_queries(embed_port, queries):
+    """Embed each query through the sidecar, exactly as the server does.
+
+    The server's text path is query -> sidecar -> vector -> route. To measure the
+    scan half alone we need the same vector the server would have produced, so
+    we ask the same sidecar. A sidecar that cannot be reached is a hard error:
+    falling back to zeros would silently measure an idle server.
+    """
+    out = []
+    for q in queries:
+        body = json.dumps({"input": [q], "model": "e5-small"}).encode()
+        r = urllib.request.Request(f"http://127.0.0.1:{embed_port}/v1/embeddings",
+                                   data=body, headers={"Content-Type": "application/json"})
+        d = json.loads(urllib.request.urlopen(r, timeout=120).read())
+        v = d["data"][0]["embedding"]
+        if not v or not any(v):
+            raise SystemExit(f"FATAL: sidecar returned a zero vector for {q!r} — "
+                             f"the scan measurement would be void.")
+        out.append(v)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8096)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--embed-port", type=int, default=18095)
     args = ap.parse_args()
 
     print("=" * 68)
@@ -53,20 +76,25 @@ def main():
     print("=" * 68)
 
     text_ms, vec_ms = [], []
-    warm = None
+    # The vec-only pass must use the SAME query's real embedding. A zero vector
+    # makes the route miss every bucket, so the server scores 0 items and the
+    # "scan" number becomes the cost of doing nothing (measured 2026-10-19:
+    # zero-vec p50 = 1.5 ms with items_scored=0 vs real-vec p50 = 60 ms with
+    # items_scored=24000). Any latency claim from a zero vector is void.
+    real_vecs = embed_queries(args.embed_port, QUERIES)
     for r in range(args.reps):
         for q in QUERIES:
             ms, d = call(args.port, {"query": q, "topk": args.topk})
             text_ms.append(ms)
-            # the vector the server itself embedded (so the vec path is comparable)
-            if warm is None:
-                v = [0.0] * (d.get("route", {}).get("qd") or 384)
-                warm = v
-    # vec-only pass: use a real embedded vector from the index side if available,
-    # else zeros (cost is the same — the scan loop runs regardless of values)
+    # vec-only pass: the real embedding of the same query (scan only)
     for r in range(args.reps):
-        for _ in QUERIES:
-            ms, _ = call(args.port, {"vec": warm, "topk": args.topk})
+        for v in real_vecs:
+            ms, d = call(args.port, {"vec": v, "topk": args.topk})
+            scored = (d.get("route") or {}).get("items_scored")
+            if scored is not None and scored <= 0:
+                raise SystemExit(
+                    f"FATAL: vec-only query scored {scored} items — the server did no "
+                    f"work, so this run cannot measure scan cost. Aborting.")
             vec_ms.append(ms)
 
     def stat(name, xs):
