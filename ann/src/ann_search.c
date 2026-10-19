@@ -832,8 +832,37 @@ static int lz_mem_search(const float *qv, int qd,
             if (!sel) { in_run = 0; continue; }
             if (!in_run) { breads++; in_run = 1; }
             if (ents[ei].dim != qd) continue;
-            double dot = 0;
-            for (int wi = 0; wi < qd; wi++) dot += (double)qv[wi] * ents[ei].vec[wi];
+            /* H -> G: widen the dot accumulator from 1 to 4 independent chains.
+             * The add chain is the bottleneck, not the count: a scalar
+             * `dot += ...` is a serial dependency (4-cycle add latency on this
+             * G4400), so 384 dims cost ~1500 cycles before any throughput.
+             * Four independent accumulators let the adds overlap.
+             * Still double, still the stored per-entry norm — so there is NO
+             * precision LOSS (unlike the float variants) and no unit-norm
+             * precondition. It is NOT bit-identical to the old kernel though:
+             * reassociating the sum changes the rounding, measured
+             * max_rel_diff = 2.5e-12 over 20,000 random pairs (see the
+             * equivalence note in the commit body). Measured speedup on the
+             * live corpus (61,241 x 384, 3 independent runs, same-run pairs):
+             *     routed 1.62x / 1.78x / 1.73x     brute 1.70x / 1.92x / 1.80x
+             * with top5_match 200/200 in every run.
+             * Source: DWGLS-native-fs/experiments/ann-hnsw-vs-anchor-2026-10-14/
+             *          RESULTS-ROUTE-COST-2026-10-19.md (variants H and G).
+             * NOTE: a further win is available by dropping the norm entirely
+             * (float 4-acc, no norm: H->C = 2.04x/2.24x) but that needs the
+             * corpus to be exactly unit-norm. Measured max |‖x‖-1| = 1.053e-06
+             * on the live index, which is OUTSIDE the 1e-6 the experiment
+             * assumed — so the norm stays. */
+            double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            int wi = 0;
+            for (; wi + 4 <= qd; wi += 4) {
+                s0 += (double)qv[wi]     * ents[ei].vec[wi];
+                s1 += (double)qv[wi + 1] * ents[ei].vec[wi + 1];
+                s2 += (double)qv[wi + 2] * ents[ei].vec[wi + 2];
+                s3 += (double)qv[wi + 3] * ents[ei].vec[wi + 3];
+            }
+            double dot = (s0 + s1) + (s2 + s3);
+            for (; wi < qd; wi++) dot += (double)qv[wi] * ents[ei].vec[wi];
             double sc = (ents[ei].norm > 0) ? dot / (qn * ents[ei].norm) : -1;
             /* Confident Guideline: a soft cluster bias (never a filter). It only
              * ADDS to the score, so recall cannot drop; ranking is nudged toward
