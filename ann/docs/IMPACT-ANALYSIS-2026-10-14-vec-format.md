@@ -16,14 +16,22 @@
 *(ไม่คืนพื้นที่มากเท่าที่คิด เพราะ index โตต่อเนื่อง — แต่อัตราการโตช้าลง 5.4 เท่า)*
 
 ### 1.2 ความเร็ว: **ไม่เปลี่ยน** (สำคัญ)
-วัดจริงแล้ว แยกได้ชัด:
+> ⚠️ **CORRECTED 2026-10-19** — ตัวเลขเดิมในหัวข้อนี้เป็น **ต้นทุนของการไม่ทำอะไร**
+> `bench_latency_split.py` เดิมส่ง **zero vector** ไป (คอมเมนต์เดิมเขียนว่า "the scan loop runs
+> regardless of values" — **มันไม่จริง**: zero vector ไม่เข้า route bucket ไม่มี → server ให้คะแนน
+> 0 รายการ → **ไม่ scan เลย**) → แก้แล้วใน commit `e495151` (ส่งผ่าน sidecar :18095 ตัวเดียวกับ server
+> และ abort ถ้า vec-only ให้คะแนน 0 รายการ)
+
+วัดจริงแล้ว (2026-10-19, live server :8096, 61,693 entries, budget 24000):
 ```
-query ผ่านข้อความ = 29ms  (embed 27ms + scan 2ms)
-query ส่ง vec ตรง   =  2ms  (scan อย่างเดียว)
+zero vec : p50  1.5 ms  items_scored=0     mode=brute     ← ไม่ได้ scan
+real vec : p50 34-60 ms  items_scored=24000 mode=anchor    ← scan จริง
 ```
-- **scan = 2ms เท่านั้น** — และ `LZEntry.vec` เป็น `float *vec` (float32 ใน RAM) อยู่แล้ว
+**ของจริงคือ embed 10.5 ms + scan 34.3 ms** (8 queries × 5 reps)
+
+- **scan ≈ 2 ms ไม่จริง** — เป็นตัวเลขของ idle server
 - f16 บนดิสก์ถูก decode เป็น float32 **ตอน boot ครั้งเดียว** → dot product ยังเป็น float32
-- **สรุป: latency เท่าเดิม** (ต่างกันไม่ถึง 1ms จาก load ที่เร็วขึ้น)
+- **สรุป: latency เท่าเดิม** (f16 เปลี่ยนแค่เวลาโหลด ไม่เปลี่ยนเวลาตอน query)
 
 ### 1.3 ความแม่น: หาย 0.09%
 | | recall@10 |
