@@ -526,6 +526,30 @@ static int lz_index_load(LZEntry **out, int *n_out) {
         if (lz_entry_parse(line, &a[n]) == 0) n++;
     }
     fclose(ix);
+    /* STAMP SIDECAR OVERLAY (2026-10-20): rows' CURRENT anchor/anchor2 live
+     * in <PATH_INDEX>.stamp (8 bytes/row: n,anchor2 int32 pair) when it
+     * exists — the jsonl stamps may be stale after a perm-sidecar regrow
+     * (which no longer rewrites the jsonl). Overlay the sidecar when it
+     * covers exactly the loaded row count (records[i] i<n). A stale or
+     * partial sidecar is IGNORED silently (jsonl stamps stay authoritative),
+     * which is the same contract as before the sidecar existed. */
+    {
+        char sp[600];
+        snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+        struct stat ss;
+        if (stat(sp, &ss) == 0 && ss.st_size == (long)n * 8) {
+            FILE *sf = fopen(sp, "rb");
+            if (sf) {
+                for (int i = 0; i < n; i++) {
+                    int32_t rec[2];
+                    if (fread(rec, sizeof(rec), 1, sf) != 1) break;
+                    a[i].anchor = (int)rec[0];
+                    a[i].anchor2 = (int)rec[1];
+                }
+                fclose(sf);
+            }
+        }
+    }
     *out = a; *n_out = n;
     return 0;
 }
@@ -1744,29 +1768,59 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                 QueryPerformanceCounter(&t_route1);
                 tel->ms_route = (double)(t_route1.QuadPart - t_route0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                 if (rows && rows2 && perm && anch_perm(rows, n, K, perm) == 0) {
-                    /* 2) rewrite the index file (same body/atomic-rename as
-                     * the full path — the one unavoidable pass over 232 MB). */
-                    char tmp[512];
-                    snprintf(tmp, sizeof(tmp), "%s.tmp", PATH_INDEX);
-                    FILE *ix = fopen(tmp, "w");
+                    /* ISOLATED STAMP SIDECAR (2026-10-20, perm-sidecar
+                     * architecture): the 222 MB jsonl is NOT rewritten —
+                     * "apple stays in place, the branch moves". Only the
+                     * NEW rows' anchor/anchor2 stamps go to a delta sidecar
+                     * (<PATH_INDEX>.stamp): one 8-byte record per row
+                     * [n_prev..n), appended atomically. Read path applies
+                     * the sidecar over the jsonl stamps after load
+                     * (lz_index_load). Sidecar contract with regrow_state:
+                     * the state's n_prev tells which jsonl stamps are
+                     * valid; anything >= n_prev comes from the sidecar. */
                     int wrote = 0;
                     LARGE_INTEGER t_rw0, t_rw1, t_sv0, t_sv1;
                     QueryPerformanceCounter(&t_rw0);
-                    if (ix) {
-                        for (int i = 0; i < n; i++) {
-                            char esid[256], efile[1024];
-                            lz_json_escape(esid, sizeof(esid), a[i].sid);
-                            lz_json_escape(efile, sizeof(efile), a[i].file);
-                            fprintf(ix, "{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"anchor\":%d,\"anchor2\":%d,\"dim\":%d,\"vec\":[",
-                                    esid, efile, a[i].npast, rows[i], rows2[i], a[i].dim);
-                            for (int vi = 0; vi < a[i].dim; vi++)
-                                fprintf(ix, "%s%.6g", vi ? "," : "", (double)a[i].vec[vi]);
-                            fprintf(ix, "]}\n");
+                    {
+                        char sp[600];
+                        snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+                        FILE *sf;
+                        /* If we have no prior stamp file, or the sidecar
+                         * doesn't cover [0..n_prev) yet, bootstrap it by
+                         * appending ALL rows' stamps (n x 8 bytes, ~0.5 MB
+                         * at 62k rows — one-time cost, never on the hot
+                         * incremental path again). */
+                        long base_ofs = -1;
+                        {
+                            struct stat ss;
+                            if (stat(sp, &ss) == 0)
+                                base_ofs = (ss.st_size - (long)st.n_prev * 8) / 8 >= 0
+                                    ? st.n_prev * 8
+                                    : -1;
                         }
-                        fclose(ix);
-                        remove(PATH_INDEX);
-                        if (rename(tmp, PATH_INDEX) == 0) wrote = 1;
-                        else remove(tmp);
+                        if (base_ofs < 0) {
+                            /* bootstrap full stamp set for all n rows */
+                            FILE *b = fopen(sp, "wb");
+                            if (b) {
+                                for (int i = 0; i < n; i++) {
+                                    int32_t rec[2] = { (int32_t)rows[i], (int32_t)rows2[i] };
+                                    fwrite(rec, sizeof(rec), 1, b);
+                                }
+                                fclose(b);
+                                wrote = 1;
+                            }
+                        } else {
+                            sf = fopen(sp, "r+b");
+                            if (sf) {
+                                fseek(sf, st.n_prev * 8, SEEK_SET);
+                                for (int i = st.n_prev; i < n; i++) {
+                                    int32_t rec[2] = { (int32_t)rows[i], (int32_t)rows2[i] };
+                                    fwrite(rec, sizeof(rec), 1, sf);
+                                }
+                                fclose(sf);
+                                wrote = 1;
+                            }
+                        }
                     }
                     QueryPerformanceCounter(&t_rw1);
                     tel->ms_rewrite = (double)(t_rw1.QuadPart - t_rw0.QuadPart) * 1000.0 / (double)qf.QuadPart;
