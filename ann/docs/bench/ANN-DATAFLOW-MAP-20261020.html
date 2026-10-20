@@ -1,0 +1,89 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  :root{color-scheme:dark}
+  body{margin:0;font:13px/1.45 var(--font,system-ui);color:var(--foreground);background:transparent;padding:10px 14px}
+  h1{font-size:15px;margin:0 0 2px}
+  .sub{color:var(--muted-foreground);font-size:12px;margin-bottom:10px}
+  .flow{display:flex;flex-direction:column;gap:6px}
+  .row{display:flex;gap:6px;flex-wrap:nowrap;align-items:stretch}
+  .node{flex:0 0 auto;border:1px solid var(--border);background:var(--card);border-radius:8px;padding:5px 9px;font-size:12px;white-space:nowrap}
+  .node b{font-weight:600}
+  .node .ms{color:var(--muted-foreground);font-size:11px;margin-left:4px}
+  .ph{font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px}
+  .arr{align-self:center;color:var(--muted-foreground);font-size:11px;padding:0 2px}
+  .loop{border:1px dashed var(--border);border-radius:8px;padding:6px 8px;font-size:11px;color:var(--muted-foreground);margin-top:8px;max-width:560px}
+  .loop b{color:var(--foreground)}
+  .gate{border-style:dashed;color:var(--muted-foreground)}
+  details{margin-top:10px;max-width:720px}
+  summary{cursor:pointer;font-size:12px;color:var(--accent)}
+  .info{border:1px solid var(--border);background:var(--card);border-radius:8px;padding:8px 10px;font-size:11.5px;margin-top:6px;color:var(--muted-foreground)}
+  .grid{display:grid;grid-template-columns:max-content 1fr;gap:2px 10px}
+  .tag{display:inline-block;border-radius:5px;border:1px solid var(--border);padding:0 5px;margin-right:4px;font-size:10px;color:var(--muted-foreground)}
+</style></head>
+<body>
+<div><h1>ann_search :8096 — data flow (measured snapshot ...)</h1>
+<div class="sub">source-phase marked from src/ann_search.c · perf from perf-routes-20261020.json · 62,078 entries · dim 384</div>
+<div class="flow">
+
+<!-- Phase A -->
+<div><div class="ph">Phase A — ingest (offline, ann-sync)</div>
+<div class="row">
+  <div class="node gate">ann-sync rewrite index<b class="tag">race risk</b></div>
+  <div class="node">embed e5-small :18095 (batch 3.6–12.3 ms)</div>
+  <div class="node">data/memcore/ann_index.jsonl</div>
+</div></div>
+
+<!-- Phase B -->
+<div><div class="ph">Phase B — per-request runtime (repeated per query)</div>
+<div class="row">
+  <div class="node">GET /health <span class="ms">7 ms</span></div>
+  <div class="arr">→</div>
+  <div class="node">sanitize + prefix <span class="ms">e5 "query: "</span></div>
+  <div class="arr">→</div>
+  <div class="node"><b>embed query</b> <span class="ms">~12 ms</span></div>
+  <div class="arr">→</div>
+  <div class="node"><b>anchor route</b> (km top-5 of 8) <span class="ms">&lt;1 ms</span></div>
+  <div class="arr">→</div>
+  <div class="node"><b>scan 24,000</b> @ budget <span class="ms">~8 ms @ us_per_item .84–536</span></div>
+  <div class="arr">→</div>
+  <div class="node"><b>top-k</b></div>
+</div></div>
+
+<!-- Phase C -->
+<div><div class="ph">Phase C — emit</div>
+<div class="row">
+  <div class="node">hits[] + route{} JSON</div>
+  <div class="arr">→</div>
+  <div class="node">fog receipt {lit/open/shut/replayed}</div>
+</div></div>
+
+<!-- loops -->
+<div class="loop"><b>Loop L1 — fog latch feedback (tombstone)</b>: after each scan, walked buckets are SHUT
+&nbsp;→ <i>reference: latched in P3 route log (truth) · wl_is_open reads for warm path · default ANN_TOMBSTONE_WARM=0 → shut set recorded but unused at budget 24k (cov≥budget stays cold)</i>. Monotone per epoch; replay on boot.</div>
+
+<div class="loop"><b>Loop L2 — keepalive respawn (5-min)</b>: ann-keepalive checks /health, respawns if dead. Never kills healthy. <i>source: ann_keepalive.py, sched task ann-keepalive</i></div>
+
+<div class="loop"><b>Loop L3 — regrow (76.9 s, blocking)</b>: POST /v1/state/regrow → anchors+order rebuild (62k) <i>k=8 buckets</i>. Server stalls /health during rebuild (watched live 30 s no-response then recovered after 77 s).</div>
+
+<div class="loop"><b>Loop L4 — ann-sync vs live server</b>: ann-sync rewrites index on disk while server holds old mmap/mtime → /health hangs (race 4.1 of handoff). Atomic swap (.tmp→rename) not yet used.</div>
+
+<div class="loop"><b>Dormant gates (default off — turning knobs, not paths)</b>:
+ANN_TOMBSTONE_WARM=1 (warm path, needs cov&lt;budget), ANN_WALK_PRUNE=1 (bucket member scan), ANN_FLOAT_KERNEL=1 (new, 1.46× kernel + p50 32→23 ms, batch B=8 247→162 ms, top-k identical 8/8) — needs restart on new binary ann_search_batch.exe (committed a63e9b5).</div>
+
+<details><summary>info · per-route perf snapshot (2026-10-20, live :8096)</summary><div class="info grid">
+  <div>GET /health</div><div>7 ms (min observed)</div>
+  <div>search cold p50</div><div>47.9 ms · mode anchor · 24,000 scored · hits 3</div>
+  <div>search repeat p50</div><div>62.7 ms (fog warm timeout not active at default budget)</div>
+  <div>search k=1 p50</div><div>30.9 ms</div>
+  <div>search k=32 p50</div><div>31.9 ms (maxk bound, same shape as k=1)</div>
+  <div>regrow</div><div>76,885 ms · K=8 · nent 62,078 (blocks /health during)</div>
+  <div>grafts off by default</div><div>amp.on=0, ANN_GRAFT unset → verdict identical to graft-on</div>
+</div></details>
+<details><summary>info · node shorthand</summary><div class="info">
+  register semantic parity — sanitize + e5 prefix "query: " rule (README §sanitize)
+  anchor route — kmeans on anchors, topb=topk+headroom (LZ_ROUTE_BUCKETS)
+  scan 24,000 — budget=min(N,max(24000,0.40·N)); us_per_item telemetry = ns/dot (handoff 2026-10-19 corrected the unit)
+  fog receipt — {lit, open, shut, replayed, free} — replay carries state across restarts
+  hits[] — array of {sid, file, npast, score}
+</div></details>
+</div></div></body></html>
