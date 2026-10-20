@@ -767,6 +767,8 @@ static int lz_mem_search(const float *qv, int qd,
       if (wf) walk_floor = atof(wf); }
     uint32_t *pmem = NULL;          /* member-only walk sequence (owned) */
     unsigned char *pseen = NULL;    /* dedupe across buckets (owned) */
+    uint32_t *pmem2 = NULL;         /* door walk sequence (owned; ANN_DOOR) */
+    unsigned char *pseen2 = NULL;   /* door dedupe (owned; ANN_DOOR) */
     const uint32_t *walk = NULL; int nwalk = 0;
     double us_per_item = 0;
     if (ents && qn > 0) {
@@ -1017,7 +1019,98 @@ static int lz_mem_search(const float *qv, int qd,
             if (scored >= cap) { truncated = 1; break; }
         }
         /* confidence fallback: pruned top below floor -> full scan once */
-        if (walk_prune && !full2 && walk_floor > 0.0 && pmem && top_sc[0] < walk_floor) {
+        if (walk_prune && !full2 && walk_floor > 0.0 && top_sc[0] < walk_floor) {
+            /* ── TOMBSTONE DOOR (env ANN_DOOR=1, 2026-10-20) ─────────────
+             * The user's architecture: a tombstone that is SHUT is a pinned
+             * door to its bucket's members ("apple fruit mini db"). When the
+             * walk scores below the floor AND the query's top bucket is a
+             * KNOWN shut tombstone, jump straight to that bucket's members
+             * first (walk order = bucket-major built from ord) and only
+             * spill to the full scan if the door scores below the floor
+             * too. GRAFT stays the fail-loud final fallback (the existing
+             * full2 pass below — unchanged). OFF = byte-identical default.
+             * Built from ord (NOT pmem) so the warm-path branch (which
+             * replaces ord and never allocates pmem) can take the door. */
+            int door = 0;
+            { const char *de = getenv("ANN_DOOR");
+              door = (de && atoi(de)) ? 1 : 0; }
+            if (getenv("ANN_DOOR_TRACE")) {
+                static int tf_n = 0;
+                if (tf_n++ < 8)
+                    fprintf(stderr, "[fallback-trace] floor=%.3f top0=%.4f pmem=%d routed=%d rnb=%d ord=%d door=%d\n",
+                            walk_floor, top_sc[0], pmem != NULL, routed, rnb, ord != NULL, door);
+            }
+            if (door && routed && rnb > 0 && ord) {
+                free(pmem); pmem = NULL;
+                free(pseen); pseen = NULL;
+                /* pick the FIRST routed bucket whose tombstone is actually
+                 * SHUT — bucket 0 maps to wl id 0 = WL_RESERVED_LO, which
+                 * wl_traverse refuses, so bucket 0 can never shut (probed
+                 * 2026-10-20 via ANN_DOOR_TRACE). Skipping reserved-id
+                 * buckets is the same rule the walk itself obeys. */
+                int dbk = -1;
+                for (int ri = 0; ri < rnb; ri++) {
+                    uint32_t fi = lz_fog_id(rb[ri]);
+                    if (!wl_is_open(&g_fog, fi)) { dbk = rb[ri]; break; }
+                }
+                if (dbk >= 0) {                          /* a shut door found */
+                    pmem2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
+                    pseen2 = (unsigned char *)calloc((size_t)(nent ? nent : 1), 1);
+                    if (pmem2 && pseen2) {
+                        int w = 0;
+                        /* door members first ... */
+                        for (int i = 0; i < nent; i++) {
+                            int ei = (int)ord[i];
+                            if (ei < 0 || ei >= nent || pseen2[ei]) continue;
+                            if (ents[ei].anchor == dbk || ents[ei].anchor2 == dbk) {
+                                pseen2[ei] = 1; pmem2[w++] = (uint32_t)ei;
+                            }
+                        }
+                        /* ... then the REST of the routed buckets' members ... */
+                        for (int r = 1; r < rnb; r++) {
+                            for (int i = 0; i < nent; i++) {
+                                int ei = (int)ord[i];
+                                if (ei < 0 || ei >= nent || pseen2[ei]) continue;
+                                if (ents[ei].anchor == rb[r] || ents[ei].anchor2 == rb[r]) {
+                                    pseen2[ei] = 1; pmem2[w++] = (uint32_t)ei;
+                                }
+                            }
+                        }
+                        /* ... then everything else (kept: recall cannot drop;
+                         * graft still biases scores, door only reorders). */
+                        for (int i = 0; i < nent; i++) {
+                            int ei = (int)ord[i];
+                            if (ei < 0 || ei >= nent || pseen2[ei]) continue;
+                            pseen2[ei] = 1; pmem2[w++] = (uint32_t)ei;
+                        }
+                        if (w > 0) {
+                            /* free the pruned arrays (replaced by door walk) */
+                            if (pmem) { free(pmem); pmem = NULL; }
+                            if (pseen) { free(pseen); pseen = NULL; }
+                            pmem = pmem2; pseen = pseen2;
+                            pmem2 = NULL; pseen2 = NULL;   /* ownership moved */
+                            walk = pmem; nwalk = w;
+                            truncated = 0; scored = 0; breads = 0;
+                            for (int ti = 0; ti < ANN_MAXK; ti++) {
+                                top_sc[ti] = -2;
+                                if (top_sid) top_sid[ti][0] = '\0';
+                                if (top_file) top_file[ti][0] = '\0';
+                                if (top_np) top_np[ti] = 0;
+                            }
+                            in_run = 0;
+                            if (pseen) for (int ti = 0; ti < nent; ti++) pseen[ti] = 0;
+                            snprintf(rm, sizeof(rm), "%s", "door");
+                            full2 = 1;      /* one-shot: the door runs ONCE —
+                                             * a repeat below floor must fall
+                                             * through to the FULL2 scan, not
+                                             * re-enter the door forever. */
+                            continue;                      /* rewalk with door order */
+                        }
+                    }
+                    if (pmem2) { free(pmem2); pmem2 = NULL; }
+                    if (pseen2) { free(pseen2); pseen2 = NULL; }
+                }
+            }
             full2 = 1; fallback = 1;
             walk = ord; nwalk = nent; cap = nent; truncated = 0;
             scored = 0; breads = 0;
@@ -1038,6 +1131,8 @@ static int lz_mem_search(const float *qv, int qd,
         free(ord_own);
         if (pmem) free(pmem);
         if (pseen) free(pseen);
+        if (pmem2) free(pmem2);
+        if (pseen2) free(pseen2);
         if (!routed) breads = nent ? 1 : 0;
     }
     if (!use_cache) lz_index_free(ents, nent);

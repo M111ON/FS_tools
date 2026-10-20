@@ -203,8 +203,16 @@ def main():
     print(f"  top-{TOPK} overlap: text={o_txt:.4f} float32={o_bin:.4f} int8={o_i8:.4f}")
     check("float32 ranking == text ranking (no loss)",
           abs(o_bin - o_txt) < 1e-9, f"{o_bin} vs {o_txt}")
+    # NOTE (2026-10-20): float32 here is built from the 6-DIGIT TEXT round
+    # trip (A), whose values are ~5e-7 off the raw store. That perturbation
+    # is enough to flip NEAR-TIE neighbors inside a top-10 set, so the strict
+    # <=1e-9 pin on the store oracle contradicted this file's own docstring
+    # ("top-10 overlap vs the store oracle 99.93%") — measured 0.99967-
+    # 0.99970 stable across two runs. The exactness contract lives in the
+    # `float32 ranking == text ranking` check above (identical formats, pin
+    # 1e-9); the store oracle is a NEAR-TIE statistic, pin 1e-3.
     check("float32 ranking == store oracle (no loss)",
-          abs(o_bin - 1.0) < 1e-9, o_bin)
+          abs(o_bin - 1.0) < 1e-3, o_bin)
     # int8 loss is real and it GROWS with the corpus: 0.9910 @ 15,430 rows,
     # 0.9863 @ 30,861, 0.9873 @ 46,291, 0.9887 @ 61,722 (2026-10-19). A pin on
     # a single constant would be a pin on one corpus generation, so pin the
