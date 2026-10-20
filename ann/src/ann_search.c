@@ -1658,6 +1658,12 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
     tel->skipped = 0; tel->n_prev = 0; tel->n_new = 0;
     snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "brute");
     int rc = 1;
+    struct stat sti_load0;
+    long load0_mtime = 0, load0_size = 0;
+    if (stat(PATH_INDEX, &sti_load0) == 0) {
+        load0_mtime = (long)sti_load0.st_mtime;
+        load0_size  = (long)sti_load0.st_size;
+    }
     if (n >= LZ_ANCH_MIN && a[0].dim > 0 && a[0].dim <= ANCHR_MAXD) {
         int dim = a[0].dim, K = n >= 64 ? 8 : n >= 32 ? 4 : 2;
         if (K > LZ_ANCH_MAXK) K = LZ_ANCH_MAXK;
@@ -1666,6 +1672,25 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
         RegrowState st;
         regrow_state_load(&st);
         int incremental = (!force) && regrow_check_append(&st, a, n);
+        /* Fail-loud race guard: ann-sync may append while we parsed the
+         * snapshot. If the file changed under us (mtime/size differ from the
+         * load0 snapshot), the rows we hold are NOT the real file — writing
+         * them out would drop the concurrent rows. Abort incremental and
+         * re-run the FULL path (which re-loads internally? no: it reuses
+         * `a` — so instead flag and let the caller retry). We surface this
+         * as a "race" error so the operator retriggers regrow. */
+        if (incremental) {
+            struct stat sti_now;
+            if (stat(PATH_INDEX, &sti_now) == 0 &&
+                ((long)sti_now.st_mtime != load0_mtime ||
+                 (long)sti_now.st_size  != load0_size)) {
+                tel->n_prev = st.n_prev;
+                tel->n_new = -1;
+                snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "race");
+                rc = -2;
+                goto regrow_done;
+            }
+        }
         if (m >= K) {
             if (incremental) {
                 /* INCREMENTAL: load the existing anchors; no kmeans.
@@ -1679,6 +1704,17 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                         vd == dim) C_ok = 1;
                 }
                 if (!C_ok) { free(C); incremental = 0; goto full_pipeline; }
+                /* CRITICAL CONTRACT: anchors' ntr must equal the NEW nent,
+                 * otherwise lz_route_cached() rejects the pair (antr != nent)
+                 * and the server falls to a full brute scan forever. The
+                 * reused table's CENTROIDS are unchanged, so the checksum
+                 * stays the same — only the header ntr moves to n. Re-save
+                 * atomically even though the vectors are identical. This was
+                 * the 2026-10-20 incident: after an append the anchors kept
+                 * ntr=n_prev while order/index carried n → routed:0 + brute. */
+                if (anch_save_atomic(PATH_ANCH, C, K, dim, n) != 0) {
+                    free(C); incremental = 0; goto full_pipeline;
+                }
                 /* 1) re-route ONLY the new rows [n_prev .. n) into the
                  * existing C. rows[i<n_prev] restore the STAMPED anchors
                  * already stored in the index file's anchor/anchor2 fields.
@@ -2264,8 +2300,11 @@ static void dispatch(sock_t cli, char *rq) {
         int rrc = lz_anchor_refresh(force, &rK, &rN, &rt);
         QueryPerformanceCounter(&rq1);
         double rms = (double)(rq1.QuadPart - rq0.QuadPart) * 1000.0 / (double)rqf.QuadPart;
-        /* rc 0=full/incremental regrow, 1=brute<n/null, 2=unchanged fast path. */
-        const char *rmode = (rrc == 0 || rrc == 2) ? "anchor" : (rrc == 1 ? "brute" : "error");
+        /* rc 0=full/incremental regrow, 1=brute<n/null, 2=unchanged fast path,
+         * -2=race (index changed mid-regrow; operator should re-trigger). */
+        const char *rmode = (rrc == 0 || rrc == 2) ? "anchor"
+                          : (rrc == 1) ? "brute"
+                          : (rrc == -2) ? "race" : "error";
         char rresp[768];
         int rrlen = snprintf(rresp, sizeof(rresp),
             "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d,"
