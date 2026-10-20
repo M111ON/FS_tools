@@ -8,10 +8,15 @@ WHY THIS EXISTS
 
 WHAT IT DOES (once())
   1. if GET :8096/health says status ok -> the ANN server is fine, skip
-  2. else ensure the embed sidecar (:18095) is up, then start ann_search.exe
+  2. else ensure the embed sidecar (:18095) is up, then start the ANN server
      detached, then wait for /health (the 57k index loads for ~15-20 s first)
   3. if the sidecar is down too, start it (llama-server must run from its own
      dir — its exe needs sibling DLLs)
+
+WHICH ANN SERVER BINARY (activation order)
+  EXE prefers build/ann_search_batch.exe (committed a63e9b5: adds the
+  /v1/state/search-batch endpoint + the ANN_FLOAT_KERNEL float kernel) and
+  falls back to build/ann_search.exe when the batch one is absent.
 
 GUARDS (same contract as pool_keepalive.py)
   * one keeper at a time (PID file)
@@ -31,7 +36,11 @@ import urllib.error
 import urllib.request
 
 DIR = os.path.dirname(os.path.abspath(__file__))
-EXE = os.path.join(DIR, "build", "ann_search.exe")
+# EXE (activation order): prefer the batch+float-kernel binary; fall back to
+# the plain one if it is absent (same cwd/flags either way).
+EXE = (os.path.join(DIR, "build", "ann_search_batch.exe")
+       if os.path.exists(os.path.join(DIR, "build", "ann_search_batch.exe"))
+       else os.path.join(DIR, "build", "ann_search.exe"))
 PIDFILE = os.path.join(DIR, ".keepalive.pid")
 LOG = os.path.join(DIR, ".keepalive.log")
 
@@ -153,7 +162,19 @@ def _start_ann():
                LZ_EMBED_HOST="127.0.0.1", LZ_EMBED_PORT=str(EMBED_PORT),
                ANN_INDEX_PATH=idx, ANN_ANCH_PATH=anch,
                ANN_ORDER_PATH=order, ANN_ROUTE_LOG=log,
-                # tuned 2026-10-09: pin walked buckets to 5 (A/B 24 queries:
+               # tombstone warm path (env ANN_TOMBSTONE_WARM, default 0 in the
+               # server): fires ONLY when the route covers less than the
+               # budget (WARM-PATH.md hot/cold rule). Default ON here —
+               # the cover-vs-budget rule still gates it per query.
+               ANN_TOMBSTONE_WARM=os.environ.get("ANN_TOMBSTONE_WARM", "1"),
+               # float kernel (env ANN_FLOAT_KERNEL, default OFF in the
+               # server): pure-float 4-acc lz_dotf + per-entry reciprocal
+               # premul. Measured on this box: 353.9 -> 242.4 ns/dot on 24k x
+               # 384 microbench = 1.46x; end-to-end p50 32 -> 23 ms single
+               # query on the 62k index. Not bit-identical (max_rel_diff
+               # 2.797e-07) — a 1e-5-grade numerics change, see FORK.md.
+               ANN_FLOAT_KERNEL=os.environ.get("ANN_FLOAT_KERNEL", "1"),
+               # tuned 2026-10-09: pin walked buckets to 5 (A/B 24 queries:
                 # med 61ms vs 97ms, top-1 identical 24/24). Env overrides.
                 LZ_ROUTE_BUCKETS=os.environ.get("LZ_ROUTE_BUCKETS", "5"),
                 # prune walk live 2026-10-11 (re-label verdict + stale-exe

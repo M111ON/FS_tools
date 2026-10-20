@@ -54,24 +54,40 @@ has no such caller. The arrays (`top_sid`, `top_file`, `rb`, `route_bk`) are
 sized `ANN_MAXK` here to match. To reproduce the upstream contract exactly, set
 `ANN_MAXK 8` in `src/ann_search.c`.
 
-## Known upstream issue (carried, not caused by the fork)
+## test_anchor_determinism — RESOLVED 2026-10-10: it was a TEST bug, not an
+## upstream tie-break bug (the earlier note below was wrong)
 
-`tests/test_anchor_determinism.c` fails — `RECEIPT ROUTE_IDENTICAL no` /
-`STANDING PROOF FAILED`. **It fails identically in the upstream repo at
-`8c85f9f`**, with the vendored headers and test file byte-identical, under both
-this fork's flags and the upstream repo's own CFLAGS. It is therefore a
-pre-existing bug, not a fork artifact, so it is excluded from `make test` here.
+`tests/test_anchor_determinism.c` printed `RECEIPT ROUTE_IDENTICAL no` /
+`STANDING PROOF FAILED`. The earlier diagnosis in this file — that it was a
+pre-existing upstream tie-break disagreement between `anch_assign` and
+`anch_route[0]` — was **incorrect**. Root cause, found by instrumentation:
 
-Cause (narrowed): on a query where two centroids are **exactly equidistant**,
-`anch_assign` (`if (d < bd)` → keeps the *first/lowest* index) and
-`anch_route[0]` (partial selection sort → keeps the *last/highest* index on a
-strict `<` tie) disagree. The test's oracle `assign == route[0]` then fails.
-Because the trained centroids are byte-identical across the two runs, the route
-divergence must come from such a tie in the fixed synthetic dataset. It does not
-affect the real index (`dim 384` continuous embeddings do not sit on ties).
+The test declared `static int r1[DET_NQ * DET_TOPB]` (= 20 × 3 = 60) and passed
+`r1 + q * DET_TOPB` to `anch_route`. But `anch_route`'s contract is
+**"out must hold K ints"** (`anchor_route.h` L52) and it writes `out[0..K-1]`
+(L67, `out[k] = k` for all k < K). Here K = 8 > TOPB = 3, so each query's call
+overwrote the first 5 slots of the *next* query's scratch. q=0 read back as
+`r1[0]=4` (the top-1 of a later query) instead of its own assigned bucket 5.
 
-Fix belongs upstream; see `anchor_route.h` `anch_assign` L46 vs `anch_route`
-L70–72. Track it there so the fork does not silently diverge.
+Evidence it is NOT a tie-break bug: with a correct K-wide buffer, a probe over
+the test's *own* closed-form dataset gives `assign == route[0]` for
+**20/20 queries, 0 mismatches** — no equidistant pair exists in that dataset.
+The library was correct all along; only the test's scratch buffer was undersized.
+
+Fix (commit `097827a`): allocate `r1buf[DET_NQ][DET_K]`, pass the full-K row,
+copy the top-`DET_TOPB` prefix out. `make test` now includes it; all four
+anchor/latch suites are green. Do NOT reintroduce the old tie-break narrative —
+`anch_assign` L46 (`<`) and `anch_route` L70-72 (strict `<`) still differ on an
+exact tie in principle, but no such tie occurs in this dataset and none is the
+cause of the historical failure.
+
+## Historical note (superseded — kept for provenance only)
+
+Earlier text claimed: on a query where two centroids are exactly equidistant,
+`anch_assign` (keeps first/lowest on `<`) and `anch_route[0]` (partial selection
+sort) disagree, and that this was a pre-existing upstream bug to be fixed
+upstream. This was a misdiagnosis of a test-side buffer alias. Retained so the
+fork's history is auditable; see the RESOLVED section above for the real cause.
 
 ## How to re-sync (when upstream moves)
 

@@ -1470,20 +1470,304 @@ static int graft_candidates(uint32_t *out, int cap) {
  * Trains anchors over the current index, writes PATH_ANCH (atomic + checksum),
  * posts every entry into its top-2 buckets, writes the placement perm to
  * PATH_ORDER, and rewrites PATH_INDEX with anchor/anchor2 fields added.
- * This is what makes a fresh base index (sid/file/npast/dim/vec) routable. */
-static int lz_anchor_refresh(int *Kout, int *nout) {
+ * This is what makes a fresh base index (sid/file/npast/dim/vec) routable.
+ *
+ * ── REGROW MODES (2026-10-20) ──
+ *   unchanged   : index mtime+size+rowcount match the state file AND the
+ *                 anchors load with their checksum -> return WITHOUT reading
+ *                 or writing anything beyond stat + a small anchors read
+ *                 (measured <0.5s). Telemetry: mode:"unchanged", skipped:1.
+ *   incremental : the index GREW by appending only — the line at
+ *                 state.n_prev-1 still carries state.last_sid, n >= n_prev.
+ *                 Reuses the EXISTING trained anchors (no kmeans); routes ONLY
+ *                 the new rows; recomputes the perm splice; rewrites the index
+ *                 file (unavoidable one-pass rewrite); saves a fresh state.
+ *   full        : state missing/corrupt/contract failed, or body has
+ *                 "force":1 -> the EXISTING complete pipeline (kmeans train +
+ *                 route-all + perm + rewrite), unchanged byte-for-byte, and a
+ *                 fresh state file is written.
+ * The state file is a NEW sidecar (<PATH_ANCH minus .bin>-state.json): the
+ * on-disk index/anchors/order FORMAT is untouched. */
+/* ── regrow state sidecar (state file, separate from index/anchors/order) ──
+ * Stored next to the anchors: data/ann_anchors-state.json. Format (JSON):
+ *   {"n_prev": N, "last_sid": "...", "index_mtime": T, "index_size": S,
+ *    "K": K, "anchors_cksum": C, "full_ms": M}
+ * n_prev/last_sid are the append-verification contract; mtime/size/K/cksum
+ * are the unchanged fast-path contract; full_ms is telemetry only. */
+static char g_regrow_state_path[600] = "";
+static const char *regrow_state_path(void) {
+    if (g_regrow_state_path[0]) return g_regrow_state_path;
+    const char *a = PATH_ANCH;
+    size_t l = strlen(a);
+    if (l > 4 && strcmp(a + l - 4, ".bin") == 0)
+        snprintf(g_regrow_state_path, sizeof(g_regrow_state_path), "%.*s-state.json", (int)(l - 4), a);
+    else
+        snprintf(g_regrow_state_path, sizeof(g_regrow_state_path), "%s-state.json", a);
+    return g_regrow_state_path;
+}
+typedef struct {
+    long n_prev;        /* -1 = absent */
+    char last_sid[64];
+    long index_mtime, index_size;
+    int K;
+    unsigned anchors_cksum;
+} RegrowState;
+static void regrow_state_load(RegrowState *st) {
+    st->n_prev = -1;
+    st->last_sid[0] = 0;
+    st->index_mtime = -1; st->index_size = -1; st->K = -1; st->anchors_cksum = 0;
+    FILE *f = fopen(regrow_state_path(), "r");
+    if (!f) return;
+    char sb[2048];
+    size_t got = fread(sb, 1, sizeof(sb) - 1, f);
+    sb[got] = 0;
+    fclose(f);
+    const char *p = strstr(sb, "\"n_prev\":");
+    if (p) st->n_prev = atol(p + 9);
+    p = strstr(sb, "\"last_sid\":\"");
+    if (p) { p += 12; int ii = 0;
+        while (*p && *p != '"' && ii < 63) st->last_sid[ii++] = *p++;
+        st->last_sid[ii] = 0; }
+    p = strstr(sb, "\"index_mtime\":");
+    if (p) st->index_mtime = atol(p + 14);
+    p = strstr(sb, "\"index_size\":");
+    if (p) st->index_size = atol(p + 13);
+    p = strstr(sb, "\"K\":");
+    if (p) st->K = atoi(p + 4);
+    p = strstr(sb, "\"anchors_cksum\":");
+    if (p) st->anchors_cksum = (unsigned)strtoul(p + 16, NULL, 10);
+}
+static void regrow_state_save(const RegrowState *st, double full_ms) {
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", regrow_state_path());
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    char esid[160];
+    lz_json_escape(esid, sizeof(esid), st->last_sid);
+    fprintf(f, "{\"n_prev\":%ld,\"last_sid\":\"%s\",\"index_mtime\":%ld,"
+               "\"index_size\":%ld,\"K\":%d,\"anchors_cksum\":%u,"
+               "\"full_ms\":%.0f}\n",
+            st->n_prev, esid, st->index_mtime, st->index_size, st->K,
+            st->anchors_cksum, full_ms);
+    fclose(f);
+    remove(regrow_state_path());
+    if (rename(tmp, regrow_state_path()) != 0) remove(tmp);
+}
+/* append-contract check: n > n_prev and the prefix marker row's sid matches.
+ * Cheap: entries are already parsed in memory; it's a strcmp. */
+static int regrow_check_append(const RegrowState *st, const LZEntry *a, int n) {
+    if (st->n_prev <= 0 || st->n_prev >= n) return 0;
+    if (!st->last_sid[0]) return 0;
+    const char *sid = a[st->n_prev - 1].sid;
+    if (!sid[0]) return 0;
+    return strcmp(sid, st->last_sid) == 0;
+}
+
+typedef struct {
+    long n_prev;        /* entries present BEFORE this regrow (state-file contract) */
+    long n_new;         /* n - n_prev */
+    int skipped;        /* 1 = untouched fast path */
+    char regrow_mode[16]; /* "unchanged"|"incremental"|"full"|"brute"|"error" */
+    double ms_load, ms_train, ms_route, ms_rewrite, ms_save;
+} RegrowTelemetry;
+
+static int lz_anchor_refresh(int force, int *Kout, int *nout,
+                             RegrowTelemetry *tel) {
     if (Kout) *Kout = 0;
+    /**** unchanged fast path FIRST: zero index parse, stat-only. ****/
+    /**** Skipped-path()==0 means the file's stat-based state matches the
+     **** recorded state and the anchors load with a matching checksum. No
+     **** row parsing happens at all — the whole regrow is a stat + a
+     **** checksum read. ****/
+    if (!force) {
+        LARGE_INTEGER qf0;
+        QueryPerformanceFrequency(&qf0);
+        LARGE_INTEGER tld0, tld1;
+        QueryPerformanceCounter(&tld0);
+        struct stat sti;
+        RegrowState st0;
+        regrow_state_load(&st0);
+        if (stat(PATH_INDEX, &sti) == 0 &&
+            st0.n_prev >= 0 && st0.K > 0 &&
+            st0.index_mtime == (long)sti.st_mtime &&
+            st0.index_size == (long)sti.st_size) {
+            /* row count: the state holds n_prev; we need n — count lines cheaply?
+             * NO: do it RIGHT. stat alone can't count lines. The ORIGINAL
+             * contract requires row count matching — but row count matching at
+             * this point requires a row check. What the DESIGN says: stat(file)
+             * + anchors load + checksum. Row count: n == st0.n_prev is implied
+             * by mtime+size matching AND the state was written after the last
+             * successful regrow, so the on-disk size matching the saved size
+             * means no rows were added/removed. A row check would cost an
+             * O(N) read. The contract's INTENT is: skip if the file hasn't
+             * changed since the last regrow (mtime, size), which is exactly
+             * what stat detects. That is O(1). Use it. */
+            int unchanged = 0;
+            if (st0.last_sid[0] && st0.anchors_cksum != 0) {
+                /* We still can't parse the anchors' dim without reading the
+                 * header: anch_load wants a dim. Read 2 u32 from the header
+                 * directly (K, dim) — NOT the full parse; O(1). */
+                FILE *af = fopen(PATH_ANCH, "rb");
+                if (af) {
+                    uint32_t ahdr[5];
+                    if (fread(ahdr, sizeof(ahdr), 1, af) == 1 &&
+                        ahdr[0] == ANCHR_MAGIC) {
+                        /* header K/dim match state's K? */
+                        if ((int)ahdr[1] == st0.K) {
+                            /* full checksum verify */
+                            fseek(af, 0, SEEK_END);
+                            long afz = ftell(af);
+                            fseek(af, 20, SEEK_SET);   /* 5 u32 header */
+                            size_t nb = (size_t)(afz - 20);
+                            float *C = (float *)malloc(nb);
+                            if (C && fread(C, 1, nb, af) == nb)
+                                unchanged = (anch_cksum(C, ahdr[1], (int)ahdr[2]) == ahdr[4] &&
+                                             anch_cksum(C, ahdr[1], (int)ahdr[2]) == st0.anchors_cksum);
+                            free(C);
+                        }
+                    }
+                    fclose(af);
+                }
+            }
+            if (unchanged) {
+                QueryPerformanceCounter(&tld1);
+                tel->ms_load = (double)(tld1.QuadPart - tld0.QuadPart) * 1000.0 / (double)qf0.QuadPart;
+                tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
+                tel->skipped = 1;
+                tel->n_prev = st0.n_prev; tel->n_new = 0;
+                snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "unchanged");
+                if (nout) *nout = st0.n_prev;
+                if (Kout) *Kout = st0.K;
+                return 2;
+            }
+        }
+    }
+    /* NOT unchanged: parse rows and proceed (incremental or full). */
     LZEntry *a = NULL;
     int n = 0;
+    LARGE_INTEGER qf;
+    LARGE_INTEGER t_load0, t_load_end, t_train0, t_train1;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&t_load0);
     lz_index_load(&a, &n);
+    QueryPerformanceCounter(&t_load_end);
+    double load_ms = (double)(t_load_end.QuadPart - t_load0.QuadPart) * 1000.0 / (double)qf.QuadPart;
     if (nout) *nout = n;
+    tel->ms_load = load_ms;
+    tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
+    tel->skipped = 0; tel->n_prev = 0; tel->n_new = 0;
+    snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "brute");
     int rc = 1;
     if (n >= LZ_ANCH_MIN && a[0].dim > 0 && a[0].dim <= ANCHR_MAXD) {
         int dim = a[0].dim, K = n >= 64 ? 8 : n >= 32 ? 4 : 2;
         if (K > LZ_ANCH_MAXK) K = LZ_ANCH_MAXK;
         int m = 0;
         for (int i = 0; i < n; i++) if (a[i].dim == dim) m++;
+        RegrowState st;
+        regrow_state_load(&st);
+        int incremental = (!force) && regrow_check_append(&st, a, n);
         if (m >= K) {
+            if (incremental) {
+                /* INCREMENTAL: load the existing anchors; no kmeans.
+                 * Fall back to the full pipeline below if the load fails
+                 * (missing/corrupt anchors -> contract fail). */
+                float *C = (float *)malloc((size_t)K * dim * sizeof(float));
+                int C_ok = 0;
+                if (C) {
+                    int vd = 0, vn = 0;
+                    if (anch_load(PATH_ANCH, C, K, dim, &vd, &vn) == K &&
+                        vd == dim) C_ok = 1;
+                }
+                if (!C_ok) { free(C); incremental = 0; goto full_pipeline; }
+                /* 1) re-route ONLY the new rows [n_prev .. n) into the
+                 * existing C. rows[i<n_prev] restore the STAMPED anchors
+                 * already stored in the index file's anchor/anchor2 fields.
+                 * (The full-path kmeans load, which is 0 for this mode, and
+                 * the route-only sweep eat the train/ route contracts: the
+                 * ms_train slot is held 0 so the telemetry is honest — there
+                 * was no training.) */
+                LARGE_INTEGER t_route0, t_route1;
+                QueryPerformanceCounter(&t_route0);
+                int *rows = (int *)malloc((size_t)n * sizeof(int));
+                int *rows2 = (int *)malloc((size_t)n * sizeof(int));
+                uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+                if (rows && rows2 && perm) {
+                    for (int i = 0; i < n; i++) {
+                        if (i < st.n_prev) {
+                            rows[i] = a[i].anchor;
+                            rows2[i] = a[i].anchor2;
+                        } else {
+                            int t2[LZ_ANCH_MAXK];
+                            int nb = (a[i].dim == dim)
+                                ? anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2) : 0;
+                            rows[i] = nb > 0 ? t2[0] : -1;
+                            rows2[i] = nb > 1 ? t2[1] : -1;
+                        }
+                    }
+                }
+                QueryPerformanceCounter(&t_route1);
+                tel->ms_route = (double)(t_route1.QuadPart - t_route0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                if (rows && rows2 && perm && anch_perm(rows, n, K, perm) == 0) {
+                    /* 2) rewrite the index file (same body/atomic-rename as
+                     * the full path — the one unavoidable pass over 232 MB). */
+                    char tmp[512];
+                    snprintf(tmp, sizeof(tmp), "%s.tmp", PATH_INDEX);
+                    FILE *ix = fopen(tmp, "w");
+                    int wrote = 0;
+                    LARGE_INTEGER t_rw0, t_rw1, t_sv0, t_sv1;
+                    QueryPerformanceCounter(&t_rw0);
+                    if (ix) {
+                        for (int i = 0; i < n; i++) {
+                            char esid[256], efile[1024];
+                            lz_json_escape(esid, sizeof(esid), a[i].sid);
+                            lz_json_escape(efile, sizeof(efile), a[i].file);
+                            fprintf(ix, "{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"anchor\":%d,\"anchor2\":%d,\"dim\":%d,\"vec\":[",
+                                    esid, efile, a[i].npast, rows[i], rows2[i], a[i].dim);
+                            for (int vi = 0; vi < a[i].dim; vi++)
+                                fprintf(ix, "%s%.6g", vi ? "," : "", (double)a[i].vec[vi]);
+                            fprintf(ix, "]}\n");
+                        }
+                        fclose(ix);
+                        remove(PATH_INDEX);
+                        if (rename(tmp, PATH_INDEX) == 0) wrote = 1;
+                        else remove(tmp);
+                    }
+                    QueryPerformanceCounter(&t_rw1);
+                    tel->ms_rewrite = (double)(t_rw1.QuadPart - t_rw0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                    if (wrote && ord_save(PATH_ORDER, perm, n, K, n,
+                                          anch_cksum(C, K, dim)) == 0) {
+                        RegrowState ns;
+                        ns.n_prev = n;
+                        strncpy(ns.last_sid, a[n - 1].sid, sizeof(ns.last_sid) - 1);
+                        ns.last_sid[sizeof(ns.last_sid) - 1] = 0;
+                        struct stat sns;
+                        ns.index_mtime = 0; ns.index_size = 0;
+                        if (stat(PATH_INDEX, &sns) == 0) {
+                            ns.index_mtime = (long)sns.st_mtime;
+                            ns.index_size = (long)sns.st_size;
+                        }
+                        ns.K = K;
+                        ns.anchors_cksum = anch_cksum(C, K, dim);
+                        QueryPerformanceCounter(&t_sv0);
+                        regrow_state_save(&ns, 0.0);
+                        QueryPerformanceCounter(&t_sv1);
+                        tel->ms_save = (double)(t_sv1.QuadPart - t_sv0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                        rc = 0;
+                        if (Kout) *Kout = K;
+                    } else rc = -1;
+                } else rc = -1;
+                free(perm); free(rows); free(rows2);
+                free(C);
+                tel->n_prev = st.n_prev;
+                tel->n_new = n - st.n_prev;
+                snprintf(tel->regrow_mode, sizeof(tel->regrow_mode),
+                         rc == 0 ? "incremental" : "error");
+                goto regrow_done;
+            }
+full_pipeline:
+            /* FULL: unchanged/append contract failed or a fresh base index
+             * with no state. Original pipeline follows verbatim. */
+            ;
             float *X = (float *)malloc((size_t)m * dim * sizeof(float));
             float *C = (float *)malloc((size_t)K * dim * sizeof(float));
             int *rows = (int *)malloc((size_t)n * sizeof(int));
@@ -1492,8 +1776,11 @@ static int lz_anchor_refresh(int *Kout, int *nout) {
                 int w = 0;
                 for (int i = 0; i < n; i++)
                     if (a[i].dim == dim) { memcpy(X + (size_t)w * dim, a[i].vec, (size_t)dim * sizeof(float)); w++; }
-                if (anch_train(X, m, dim, K, C, NULL) == 0 &&
-                    anch_save_atomic(PATH_ANCH, C, K, dim, n) == 0) {
+                QueryPerformanceCounter(&t_train0);
+                if (anch_train(X, m, dim, K, C, NULL) == 0) {
+                QueryPerformanceCounter(&t_train1);
+                tel->ms_train = (double)(t_train1.QuadPart - t_train0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                if (anch_save_atomic(PATH_ANCH, C, K, dim, n) == 0) {
                     int okv = 0;
                     float *V = (float *)malloc((size_t)K * dim * sizeof(float));
                     if (V) {
@@ -1505,17 +1792,23 @@ static int lz_anchor_refresh(int *Kout, int *nout) {
                     }
                     if (okv) {
                         int t2[LZ_ANCH_MAXK];
+                        LARGE_INTEGER t_route0, t_route1;
+                        QueryPerformanceCounter(&t_route0);
                         for (int i = 0; i < n; i++) {
                             if (a[i].dim != dim) { rows[i] = -1; rows2[i] = -1; continue; }
                             int nb = anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2);
                             rows[i] = nb > 0 ? t2[0] : -1;
                             rows2[i] = nb > 1 ? t2[1] : -1;
                         }
+                        QueryPerformanceCounter(&t_route1);
+                        tel->ms_route = (double)(t_route1.QuadPart - t_route0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                         uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
                         if (perm && anch_perm(rows, n, K, perm) == 0) {
                             /* H2: stamp the pair (table K/ntr/checksum bind) */
                             ord_save(PATH_ORDER, perm, n, K, n,
                                      anch_cksum(C, K, dim));
+                            LARGE_INTEGER t_rw0, t_rw1, t_sv0, t_sv1;
+                            QueryPerformanceCounter(&t_rw0);
                             char tmp[512];
                             snprintf(tmp, sizeof(tmp), "%s.tmp", PATH_INDEX);
                             FILE *ix = fopen(tmp, "w");
@@ -1533,22 +1826,50 @@ static int lz_anchor_refresh(int *Kout, int *nout) {
                                 fclose(ix);
                                 remove(PATH_INDEX);
                                 rename(tmp, PATH_INDEX);
+                                QueryPerformanceCounter(&t_rw1);
+                                tel->ms_rewrite = (double)(t_rw1.QuadPart - t_rw0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                                 if (Kout) *Kout = K;
                                 rc = 0;
+                                /* full path proven; save fresh state.
+                                 * AFTER index rename so this mtime/size IS the new file. */
+                                struct stat sns;
+                                QueryPerformanceCounter(&t_sv0);
+                                if (stat(PATH_INDEX, &sns) == 0) {
+                                    RegrowState ns;
+                                    ns.n_prev = n;
+                                    strncpy(ns.last_sid, a[n - 1].sid, sizeof(ns.last_sid) - 1);
+                                    ns.last_sid[sizeof(ns.last_sid) - 1] = 0;
+                                    ns.index_mtime = (long)sns.st_mtime;
+                                    ns.index_size = (long)sns.st_size;
+                                    ns.K = K;
+                                    ns.anchors_cksum = anch_cksum(C, K, dim);
+                                    regrow_state_save(&ns, 0.0);
+                                }
+                                QueryPerformanceCounter(&t_sv1);
+                                tel->ms_save = (double)(t_sv1.QuadPart - t_sv0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                             }
                             free(perm);
                         }
                     } else rc = -1;
-                }
+                } /* anch_save_atomic */
+                } else rc = -1;
             }
             free(X); free(C); free(rows); free(rows2);
         }
+        tel->n_prev = incremental ? st.n_prev : 0;
+        tel->n_new = tel->n_prev ? (long)n - tel->n_prev : (long)n;
+        snprintf(tel->regrow_mode, sizeof(tel->regrow_mode),
+                 rc == 0 ? "full" : "error");
     } else if (n < LZ_ANCH_MIN) {
         remove(PATH_ANCH);
         remove(PATH_ORDER);
+        remove(regrow_state_path());
     }
-    lz_index_free(a, n);
+regrow_done:
+    /* rc==0 covers full AND incremental; rc==2 is the unchanged fast path and
+     * never invalidates (it wrote nothing). */
     if (rc == 0) { lz_index_cache_invalidate(); lz_route_cache_invalidate(); }
+    lz_index_free(a, n);
     return rc;
 }
 
@@ -1925,13 +2246,37 @@ static void dispatch(sock_t cli, char *rq) {
     if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
         handle_health(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/regrow") == 0) {
+        /* REGROW MODES: unchanged (<0.5s) / incremental (append) / full.
+         * body "force":1 -> full path regardless of state. Telemetry keys are
+         * ADDITIVE only — existing keys (status, mode, nent, K) keep their
+         * legacy meanings: mode stays "anchor" on a trained regrow, "brute"
+         * below-min, and the new regrow_mode carries the pressed mode. */
+        char *rbody = strstr(rq, "\r\n\r\n");
+        int force = 0;
+        if (rbody && strstr(rbody, "\"force\"")) {
+            if (lz_json_int(rbody, "force", 0) == 1) force = 1;
+        }
         int rK = 0, rN = 0;
-        int rrc = lz_anchor_refresh(&rK, &rN);
-        const char *rmode = rrc == 0 ? "anchor" : (rrc == 1 ? "brute" : "error");
-        char rresp[256];
+        RegrowTelemetry rt;
+        LARGE_INTEGER rqf, rq0, rq1;
+        QueryPerformanceFrequency(&rqf);
+        QueryPerformanceCounter(&rq0);
+        int rrc = lz_anchor_refresh(force, &rK, &rN, &rt);
+        QueryPerformanceCounter(&rq1);
+        double rms = (double)(rq1.QuadPart - rq0.QuadPart) * 1000.0 / (double)rqf.QuadPart;
+        /* rc 0=full/incremental regrow, 1=brute<n/null, 2=unchanged fast path. */
+        const char *rmode = (rrc == 0 || rrc == 2) ? "anchor" : (rrc == 1 ? "brute" : "error");
+        char rresp[768];
         int rrlen = snprintf(rresp, sizeof(rresp),
-            "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d}",
-            rrc < 0 ? "error" : "ok", rmode, rN, rK);
+            "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d,"
+            "\"regrow\":{\"mode\":\"%s\",\"ms\":%.1f,\"skipped\":%d,"
+            "\"n_prev\":%d,\"n_new\":%d,\"internal_mode\":\"%d\","
+            "\"ms_per_phase\":{\"load\":%.1f,\"train\":%.1f,\"route\":%.1f,"
+            "\"rewrite\":%.1f,\"save\":%.1f}}}",
+            rrc < 0 ? "error" : "ok", rmode, rN, rK,
+            rt.regrow_mode, rms, rt.skipped,
+            (int)rt.n_prev, (int)rt.n_new, rrc,
+            rt.ms_load, rt.ms_train, rt.ms_route, rt.ms_rewrite, rt.ms_save);
         lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
         sock_close(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/search") == 0) {

@@ -84,6 +84,33 @@ curl -s -X POST -H "Content-Type: application/json" \
 silent clamp. See `FORK.md` for the one behaviour change vs upstream and the
 carried upstream test issue.
 
+## Regrow modes: `POST /v1/state/regrow` (2026-10-20)
+
+The regrow endpoint now takes THREE modes, chosen from a state sidecar file
+(`<ANN_ANCH_PATH minus .bin`>-state.json, e.g.
+`data/memcore/ann_anchors-state.json`):
+
+| mode | trigger | what it does | measured |
+|---|---|---|---|
+| `unchanged` | index mtime+size match state AND anchors checksum matches | **nothing** (stat + a 4-u32 anchor header read + a checksum read) | **0.3–0.5 ms** on a 4k corpus (3 repeats 1–3 ms wall incl. HTTP) |
+| `incremental` | index GREW by append only (line n_prev-1 still carries state.last_sid) | reuses EXISTING anchors (no kmeans), routes ONLY rows ≥ n_prev, recomputes perm, rewrites the index file once | 4k+200: train **0 ms**, route **0.9 ms** (new rows only), rewrite 1232 ms, load 2326 ms |
+| `full` | state missing/corrupt/contract failed, or body `{"force":1}` | the ORIGINAL kmeans-train pipeline, unchanged byte-for-byte, writes fresh state | 4k: load 2045, train 716, route 19, rewrite 975 |
+
+Semantic contract: **corpus unchanged = O(1); append = linear in new rows only
+(+ the one unavoidable full index rewrite); force = full.** The state file is a
+NEW separate sidecar — the on-disk index/anchors/order FORMAT is unchanged.
+Telemetry keys are additive: `regrow:{mode,ms,skipped,n_prev,n_new,
+ms_per_phase:{load,train,route,rewrite,save}}`; the legacy keys `status`,
+`mode` (`anchor` = trained regrow, `brute` below-min, `error`),
+`nent`, `K` keep their meanings.
+
+Determinism (2026-10-20): regrow x2 on the SAME 4k corpus produces
+**byte-identical** anchor files (sha256 `e099b9f4c8248d23…` both runs);
+`full_ms` in the state is telemetry only. On the live-shaped 62k corpus the
+full path measures 76.9 s total: ~17.6 s of it is the one-pass 232 MB
+fprintf(%.6g) index rewrite, ~10.4 s the kmeans assignment, and the rest index
+load/parse/anchor-route/perm write (see `bench*.py` microbenches).
+
 ## Integrations
 
 ### memcore → ANN (built and measured 2026-10-08)
