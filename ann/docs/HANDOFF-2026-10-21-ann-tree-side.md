@@ -101,11 +101,14 @@ search: mode=anchor+p  items_scored=24,000 จาก 62,323  score ~0.86
 ```
 ann/src/ann_search.c        tree-side separation + dead-route fail-loud + restamp
                              + door recall contract (cap=nent) + door early exit
-                             + truthful /health + the upstream self-assign fix
+                             + graft hard fallback (cap=nent) + truthful /health
+                             + the upstream self-assign fix
 ann/ann_keepalive.py        ANN_DOOR=0 / ANN_DOOR_EXIT=0 (ship OFF, พร้อมเหตุผล)
+                             + WAIT_HEALTHY 180 + port check + STARTUP_GRACE
 ann/ann_route_watch.py      heal H2 (dead route) -> restamp -> fallback full regrow
 ann/tests/test_stamp_preserve.py   ใหม่ — 9 กลุ่ม (S1-S9)
 ann/tests/ab_door_live.py          ใหม่ — A/B กับ numpy oracle (ต้องใช้ ANN_TEST_EXE)
+ann/tests/ab_graft_fallback.py     ใหม่ — A/B ของ graft hard fallback
 ann/tests/probe_door_exit.py      ใหม่ — พิสูจน์ว่า early exit เข้าถึงได้จริง
 cloud_ws/memcore/ann_sync.py      rebuild แล้วต้อง regrow เสมอ (rebuilt flag)
 ```
@@ -123,6 +126,7 @@ cloud_ws/memcore/ann_sync.py      rebuild แล้วต้อง regrow เส
 | `tests/test_incr_fix.py` | ALL BEHAVED |
 | `tests/probe_door_exit.py` | ALL BEHAVED (exit ตัดที่ 1 แถวเมื่อ floor ต่ำ) |
 | `tests/ab_door_live.py --queries 300` | recall-neutral, 300/300 เท่ากัน |
+| `tests/ab_graft_fallback.py` | recall-neutral (0.4167 = 0.4167, 0/12 แย่กว่า) · `mode=graft+full` ยืนยันว่า branch ทำงาน |
 | architecture check (skill) | ALL CHECKS BEHAVED |
 
 **S9 (ใหม่)**: ถ้าผลไม้ถูก **สลับลำดับแถว** ป้ายกิ่ง (ซึ่งผูกกับตำแหน่งแถว) จะชี้ผิดแถวแบบเงียบ → append contract ต้องจับได้ (boundary sid ไม่ตรง → ไม่ใช่ incremental → full path วางใหม่ทุกแถว) และผลไม้ต้องไม่ถูกเขียนซ้ำ — ผ่าน
@@ -159,13 +163,20 @@ cloud_ws/memcore/ann_sync.py      rebuild แล้วต้อง regrow เส
 
 ## 9. OPEN ITEMS (owned, ไม่ซ่อน)
 
-1. **graft-as-hard-fallback** ยังไม่สร้าง (graft ยังเป็น soft bias ตามเดิม) — จุดต่อคือ door branch
-2. **`/v1/admin/compact`** (ล้าง jsonl ป้ายเป็น admin action) — deferred (full regrow ครอบคลุมแล้ว และตอนนี้ไม่เขียน jsonl อยู่แล้ว)
-3. **S2 (int8 pack + per-bucket scale) / S3 (contiguous reorder)** ยัง parked จากแผน 2026-10-14
-4. **`ANN_DOOR_EXIT`** เป็น latency trade ที่ยังไม่ได้วัดข้าง ๆ (exit floor เป็น heuristic → เสีย recall) — ถ้าจะใช้ต้องวัดกับ oracle
-5. **`ann_route_watch.py` ยังไม่มี scheduled task** — ต้องสร้าง (`\ann-route-watch`, `--once` ทุก 5 นาที) = live-touching → รอ owner อนุมัติ
-6. **`memory-daemon` + `hermes-mc-sync`** tasks ยัง DISABLED (รอการตัดสินใจ backfill)
-7. **ผลไม้ที่ถูกสลับลำดับแถว** → ป้ายผูกกับตำแหน่งแถว → ต้อง re-place ทั้งต้น (full path ทำให้) — ถ้าอยากรันจริงต้อง force regrow
+### ปิดแล้วในรอบนี้ (2026-10-21 ต่อ)
+
+1. **`ANN_DOOR_EXIT` วัดแล้ว** — เป็น **trade จริง ไม่ใช่ของฟรี**: recall@5 ตกจาก 0.9220 → **0.6570** (p95 ดีขึ้น 76 → 40 ms). เก็บไว้เป็น opt-in (default OFF) พร้อมเอกสารผล — ผู้ใช้ต้องยอมรับการเสีย recall
+2. **graft-as-hard-fallback สร้างแล้ว** (env `ANN_GRAFT_FALLBACK=1`, default OFF) — ตอน below-floor fallback ทำงาน กราฟจะเสนอลำดับเดิน (รายการที่ชี้ไฟล์เดียวกันก่อน) แล้วเดินที่เหลือตาม → วัดกับ numpy oracle: **recall-neutral** (0.4167 = 0.4167, 0/12 แย่กว่า) · ต้องแก้ `cap = nent` ก่อน (ครั้งแรก cap=budget ทำให้ recall ตก 0.2833)
+3. **scheduled task `\ann-route-watch`** — มีอยู่แล้วและทำงาน (`Last Result: 0`, ทุก 5 นาที) — พบว่า trigger เดิมใช้ `StartBoundary` เป็นวันที่ผ่านมาแล้ว (แสดง "Next Run 21/10/69" = พ.ศ. 2569 ไม่ใช่ปี 2069) → ไม่ต้องแก้
+4. **tasks `memory-daemon` / `hermes-mc-sync`** — เปิดอยู่แล้วและทำงาน (`Last Result: 0`)
+
+### ยังค้าง (เปิดหมด)
+
+5. **disk เต็ม** — `I:` เหลือ 0.55 GB จาก 111 GB (`ann_sync` ล้มด้วย disk guard ที่ 600 MB) ต้องจอดของเก่าลง drive อื่นหรือเพิ่มพื้นที่; รอบนี้จอดไฟล์ backup 4 ตัว (1.3 GB) ไปที่ `F:/parked/2026-10-21-ann-tree-side/` แล้ว
+6. **keepalive เพิ่มเวลารอ + เช็ค port ก่อนเปิด instance ที่สอง** — index 62k แถวโหลด 31 วินาที (health wait รวม 57 วินาที) ทำให้ budget 60 วินาทีล้มเหลวที่ขอบ → เปิด instance ซ้อน (instance ที่สอง bind ไม่ได้) → แก้: `WAIT_HEALTHY` 60 → **180** + ตรวจ port ก่อน + `STARTUP_GRACE`
+7. **`/v1/admin/compact`** (ล้าง jsonl ป้ายเป็น admin action) — deferred (full regrow ครอบคลุมแล้ว และตอนนี้ไม่เขียน jsonl อยู่แล้ว)
+8. **S2 (int8 pack + per-bucket scale) / S3 (contiguous reorder)** ยัง parked จากแผน 2026-10-14
+9. **ผลไม้ที่ถูกสลับลำดับแถว** → ป้ายผูกกับตำแหน่งแถว → ต้อง re-place ทั้งต้น (full path ทำให้) — ถ้าอยากรันจริงต้อง force regrow
 
 ---
 

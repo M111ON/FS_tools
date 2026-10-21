@@ -29,6 +29,7 @@ RUN
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -58,7 +59,17 @@ CHECK = 60
 BACKOFF_MIN = 60
 BACKOFF_MAX = 900
 FAST_DEATH = 20
-WAIT_HEALTHY = 60          # the 57k index takes ~15-20 s to load before bind
+# The index load is the long pole: 62,477 rows x 384 dims parsed from a
+# 257 MB jsonl took 31 s on this box (measured 2026-10-21, the regrow
+# telemetry's ms_per_phase.load), and the keepalive's own health wait
+# measured 57 s end-to-end. A 60 s budget therefore failed at the margin
+# and the supervisor logged "ann started but /health never answered" then
+# started a SECOND instance — which cannot bind (exclusive) and only adds
+# load. Give it room plus a margin, and treat "still starting" as not-dead.
+WAIT_HEALTHY = 180
+# A server that is still loading answers nothing; that is not a crash. The
+# fast-death backoff must not fire on a slow start.
+STARTUP_GRACE = 150
 
 
 def _log(msg):
@@ -218,9 +229,37 @@ def _wait_healthy(seconds=WAIT_HEALTHY):
     return False
 
 
+def _port_listening(port):
+    """True iff something accepts a connection on `port`.
+
+    The server binds the port BEFORE it finishes loading the index? No — it
+    binds AFTER the load (the load is in main(), before socket()). But a
+    previous instance may still hold the port while a NEW one is loading.
+    Either way: if the port answers a TCP connect, do NOT start another
+    instance — it would fail the exclusive bind and only add load.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def once():
     if _healthy():
         return True
+    # A server that is UP but busy (loading the index, or the embed sidecar
+    # is slow) answers no health yet still owns the port. Starting a second
+    # instance there is the 2026-10-21 incident: the second cannot bind
+    # (exclusive) and the supervisor then logged a false "never answered".
+    if _port_listening(PORT):
+        _log("ann port %d is busy (a server is up but not answering yet) "
+             "- waiting instead of starting a second" % PORT)
+        if _wait_healthy():
+            _log("ann UP")
+            return True
+        _log("ann port %d still busy after the wait" % PORT)
+        return False
     if not _healthy(EMBED_HEALTH, timeout=2):
         _start_embed()
     _log("ann DOWN -> starting")
@@ -232,7 +271,8 @@ def once():
     if _wait_healthy():
         _log("ann UP")
         return True
-    _log("ann started but /health never answered")
+    _log("ann started but /health never answered (still loading? the index "
+         "load takes ~31 s on 62k rows)")
     return False
 
 
@@ -252,7 +292,11 @@ def main():
             backoff = BACKOFF_MIN
             time.sleep(CHECK)
             continue
-        if time.time() - t0 < FAST_DEATH:
+        # A slow START is not a crash: the index load takes ~31 s and the
+        # health wait up to 180 s, so only a failure FASTER than the
+        # startup grace doubles the backoff. Before this, a 60 s health
+        # budget on a 57 s load made every slow start look like a crash.
+        if time.time() - t0 < STARTUP_GRACE:
             backoff = min(BACKOFF_MAX, backoff * 2)
         _log("retry in %ds" % backoff)
         time.sleep(backoff)

@@ -1247,6 +1247,92 @@ static int lz_mem_search(const float *qv, int qd,
                     if (pseen2) { free(pseen2); pseen2 = NULL; }
                 }
             }
+            /* ── GRAFT AS HARD FALLBACK (env ANN_GRAFT_FALLBACK=1) ─────────
+             * The open item from the 2026-10-20 handoff: "graft-as-hard-
+             * fallback (graft proposes the walk list when the route layer
+             * rejects) is NOT built — today graft kept its soft-bias
+             * contract. The door branch is the attachment point."
+             *
+             * Here it is, as an OPT-IN branch (default OFF = byte-identical):
+             * when the below-floor fallback fires and the graph can propose
+             * candidates, the walk order becomes the graph's proposal
+             * instead of the raw index order. The graph proposes a SMALLER
+             * set (structurally related entries), so the scan is cheaper;
+             * because the walk still covers everything the graph did not
+             * propose (the remainder follows), recall cannot drop below the
+             * full scan.
+             * The graph proposes from STRUCTURE (file keys), which is
+             * independent of the vector geometry — so this is a different
+             * axis, not a second copy of the route.
+             * OFF by default because a structural proposal narrows what a
+             * query can reach: it is only correct if the query really is
+             * about those files. Measure it before enabling. */
+            int graft_fb = 0;
+            { const char *gf = getenv("ANN_GRAFT_FALLBACK");
+              if (gf && atoi(gf) > 0) graft_fb = 1; }
+            if (graft_fb && g_graft_on && g_qn > 0 && nent > 0) {
+                int gcap = nent;
+                { const char *gc = getenv("ANN_GRAFT_CAND");
+                  if (gc && atoi(gc) > 0) gcap = atoi(gc); }
+                uint32_t *gcand = (uint32_t *)malloc((size_t)gcap * sizeof(uint32_t));
+                int gn = gcand ? graft_candidates(gcand, gcap) : 0;
+                if (gn > 0 && gcand) {
+                    /* the graph's proposal FIRST, then everything else */
+                    uint32_t *gf2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
+                    unsigned char *gs = (unsigned char *)calloc((size_t)nent, 1);
+                    if (gf2 && gs) {
+                        int w = 0;
+                        for (int i = 0; i < gn; i++) {
+                            int ei = (int)gcand[i];
+                            if (ei < 0 || ei >= nent || gs[ei]) continue;
+                            gs[ei] = 1; gf2[w++] = (uint32_t)ei;
+                        }
+                        for (int i = 0; i < nent && w < nent; i++) {
+                            if (gs[i]) continue;
+                            gs[i] = 1; gf2[w++] = (uint32_t)i;
+                        }
+                        if (w > 0) {
+                            if (pmem) { free(pmem); pmem = NULL; }
+                            if (pseen) { free(pseen); pseen = NULL; }
+                            pmem = gf2; pseen = gs;
+                            gf2 = NULL; gs = NULL;
+                            walk = pmem; nwalk = w;
+                            /* THE SAME RECALL CONTRACT AS THE DOOR (2026-10-21):
+                             * this branch REPLACES the below-floor fallback,
+                             * and that fallback scans EVERY row (cap = nent).
+                             * Keeping the pruned cap here scored fewer rows
+                             * than the path it replaced — measured against
+                             * a numpy oracle: recall@5 0.2833 (graft, cap
+                             * 24k) vs 0.4167 (plain fallback, 62k), 5 of 12
+                             * queries worse. So the graft walk covers EVERY
+                             * row too, in graft-first ORDER: the proposal
+                             * is scored first (the graph's structural
+                             * preference), and the remainder follows, so
+                             * recall cannot drop below the fallback.
+                             * The order is then the only difference — and
+                             * the order matters because the graft bias
+                             * (which rewards entries carrying the query's
+                             * file keys) now applies to the entries that
+                             * are scored FIRST. */
+                            cap = nent;
+                            scored = 0; breads = 0; truncated = 0;
+                            for (int ti = 0; ti < ANN_MAXK; ti++) {
+                                top_sc[ti] = -2;
+                                if (top_sid) top_sid[ti][0] = '\0';
+                                if (top_file) top_file[ti][0] = '\0';
+                                if (top_np) top_np[ti] = 0;
+                            }
+                            in_run = 0;
+                            snprintf(rm, sizeof(rm), "%s", "graft+full");
+                            full2 = 1; fallback = 1;
+                            free(gcand);
+                            continue;
+                        }
+                    }
+                    free(gf2); free(gs);
+                }
+                if (gcand) free(gcand);
+            }
             full2 = 1; fallback = 1;
             walk = ord; nwalk = nent; cap = nent; truncated = 0;
             scored = 0; breads = 0;
