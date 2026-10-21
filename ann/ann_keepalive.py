@@ -58,8 +58,7 @@ EMBED_MODEL = r"I:\model\multilingual-e5-small-q8_0-fixed.gguf"
 CHECK = 60
 BACKOFF_MIN = 60
 BACKOFF_MAX = 900
-FAST_DEATH = 20
-# The index load is the long pole: 62,477 rows x 384 dims parsed from a
+# The index load is the long pole: 62,510 rows x 384 dims parsed from a
 # 257 MB jsonl took 31 s on this box (measured 2026-10-21, the regrow
 # telemetry's ms_per_phase.load), and the keepalive's own health wait
 # measured 57 s end-to-end. A 60 s budget therefore failed at the margin
@@ -68,7 +67,7 @@ FAST_DEATH = 20
 # load. Give it room plus a margin, and treat "still starting" as not-dead.
 WAIT_HEALTHY = 180
 # A server that is still loading answers nothing; that is not a crash. The
-# fast-death backoff must not fire on a slow start.
+# backoff must not fire on a slow start.
 STARTUP_GRACE = 150
 
 
