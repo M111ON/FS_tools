@@ -35,7 +35,7 @@ Expected values come from the contract (independent of the code under test):
 the prefix stamps must be the ones the FULL path computed in S1, and the
 search must score more than the handful of post-rebuild rows.
 """
-import json, os, shutil, subprocess, sys, time, urllib.request
+import json, os, shutil, socket, subprocess, sys, time, urllib.request
 from urllib.request import Request
 
 REPO = r"I:\tools\ann"
@@ -126,6 +126,11 @@ def start_extra(env_extra):
     """The tree's files (anchors + order + the regrow state derived from
     ANN_ANCH_PATH) must live TOGETHER — splitting them across dirs leaves
     the server anchorless (no route -> brute -> the door never fires).
+
+    The health probe is tied to THIS process: a leftover instance still
+    holding the port would answer /health while our own server had already
+    exited on "bind failed" — the test would then measure the wrong
+    instance and still report green.
     """
     env = {**os.environ,
            "ANN_INDEX_PATH": INDEX,
@@ -141,6 +146,11 @@ def start_extra(env_extra):
     p._errlog = errlog
     for _ in range(80):
         time.sleep(0.3)
+        if p.poll() is not None:
+            # our server died (bind failed?) — do NOT accept another
+            # instance's answer as ours
+            raise RuntimeError("scratch server exited on start (rc=%s)"
+                               % p.returncode)
         try:
             if http("/health", to=4).get("status") == "ok":
                 return p
@@ -148,6 +158,30 @@ def start_extra(env_extra):
             pass
     p.kill()
     raise RuntimeError("scratch server failed to start on port %d" % PORT)
+
+
+def stop(p):
+    """Stop a scratch server AND wait until it released the port.
+
+    p.kill() only asks the OS to terminate it; the listening socket can
+    outlive it for a moment. The next start_extra() would then hit
+    "bind 8097 failed" and — worse — talk to the dying instance.
+    """
+    if p.poll() is None:
+        p.kill()
+    try:
+        p.wait(timeout=10)
+    except Exception:
+        pass
+    for _ in range(60):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", PORT))
+            return
+        except OSError:
+            time.sleep(0.25)
+    raise RuntimeError("port %d still held after stopping the server" % PORT)
 
 
 def main():
@@ -176,7 +210,7 @@ def main():
            f"live={live1}/{len(side1)}")
         full_stamps = list(js)
     finally:
-        p.poll() or p.kill()
+        stop(p)
 
     # ── S2: REBUILD without stamps (build_index.py shape) + append ────────
     write_rows(INDEX, [row(i) for i in range(N_ROWS)])          # rebuild: no stamps
@@ -350,18 +384,25 @@ def main():
         # The append contract must catch it: the boundary sid no longer
         # matches -> NOT incremental -> the full path re-places every row
         # from its own vector. The fruit is still never rewritten.
-        p = start_extra({"ANN_WALK_FLOOR": "0.5"})
+        #
+        # S9 needs its OWN server: the one started for S2 still holds the
+        # port (it serves S3..S8), so it must be stopped first — and its
+        # handle must NOT be rebound, or the outer finally would stop the
+        # wrong process and leave the port held.
+        stop(p)
+        p = None
+        p9 = start_extra({"ANN_WALK_FLOOR": "0.5"})
         try:
             g = http("/v1/state/regrow", {"force": 1})
             ok(g["regrow"]["mode"] == "full", "S9 the reorder base regrow ran",
                g["regrow"]["mode"])
         finally:
-            p.poll() or p.kill()
+            stop(p9)
         with open(INDEX, encoding="utf-8") as f:
             rows9 = f.readlines()
         write_rows(INDEX, list(reversed(rows9)))     # same rows, new positions
         md9_before = md5(INDEX)
-        p = start_extra({"ANN_WALK_FLOOR": "0.5"})
+        p9 = start_extra({"ANN_WALK_FLOOR": "0.5"})
         try:
             g = http("/v1/state/regrow", {})
             mode9 = g["regrow"]["mode"]
@@ -379,9 +420,10 @@ def main():
                "S9 the route survives the reorder",
                f"route_dead={h9.get('route_dead')}")
         finally:
-            p.poll() or p.kill()
+            stop(p9)
     finally:
-        p.poll() or p.kill()
+        if p is not None:
+            stop(p)
         try:
             p._errlog.close()
         except Exception:
