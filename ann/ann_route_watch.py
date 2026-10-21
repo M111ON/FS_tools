@@ -111,6 +111,24 @@ def post_regrow():
         return json.loads(r.read().decode("utf-8"))
 
 
+RESTAMP_URL = ANN_BASE + "/v1/state/restamp"
+
+
+def post_restamp():
+    """Repair the ROUTING TABLE without rewriting the vectors.
+
+    The full regrow rewrites the 233 MB jsonl and re-serializes every
+    vector with "%.6g" (6 SIGNIFICANT digits) — lossy against the
+    round(x, 6) (6 DECIMALS) build_index.py wrote. The restamp path
+    re-routes the rows against the existing centroids and writes the
+    stamps into the sidecar only, so the vectors are untouched.
+    """
+    req = urllib.request.Request(RESTAMP_URL, data=b"{}",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def store_sig():
     """Same monotone signature as ann_sync.py (daemon only INSERTs)."""
     try:
@@ -152,6 +170,59 @@ def sync_locked():
         return False
 
 
+def _heal_dead_route(h, st, sync_st, sig, readonly):
+    """H2 (2026-10-20): the route is DEAD — the table is valid but the rows
+    carry no routing stamps (the index was rebuilt). Heal with the
+    RESTAMP (routing table only, vectors untouched). If there is no
+    usable anchor table, the restamp refuses and the full regrow is the
+    only way (it rewrites the jsonl — the lossy path — so it is used
+    only as a last resort)."""
+    entries = int(h.get("entries") or 0)
+    stamps_live = int(h.get("stamps_live") or 0)
+    if readonly:
+        log("route_watch[CHECK]: H2 FIRING — entries=%d stamps_live=%d "
+            "route_dead=1 (no action, --check)" % (entries, stamps_live))
+        return 1
+    now = time.time()
+    if now - float(st.get("last_heal", 0)) < COOLDOWN_S:
+        log("route_watch: H2 firing (entries=%d) but last heal %ds ago — "
+            "cooling down" % (entries, now - float(st.get("last_heal", 0))))
+        return 0
+    log("route_watch: H2 FIRING — entries=%d stamps_live=%d route_dead=1 — "
+        "POSTing restamp" % (entries, stamps_live))
+    st["last_heal"] = now
+    st["heals"] = int(st.get("heals", 0)) + 1
+    save_state(st)
+    try:
+        r = post_restamp()
+    except Exception as e:
+        log("route_watch: HEAL FAILED — restamp POST failed: %s" % e)
+        return 1
+    if r.get("status") != "ok":
+        # no usable anchor table -> the full regrow is the only repair
+        log("route_watch: restamp refused (%s) — falling back to a full regrow"
+            % r)
+        try:
+            r = post_regrow()
+        except Exception as e:
+            log("route_watch: HEAL FAILED — regrow POST failed: %s" % e)
+            return 1
+        if r.get("status") != "ok":
+            log("route_watch: HEAL FAILED — regrow returned %s" % r)
+            return 1
+    h2 = get_health(retries=5)
+    if h2 is None:
+        log("route_watch: HEAL UNCERTAIN — repair ok but /health unreachable")
+        return 1
+    if int(h2.get("route_dead") or 0) == 0:
+        log("route_watch: HEALED — entries=%d stamps_live=%d (was %d)"
+            % (entries, int(h2.get("stamps_live") or 0), stamps_live))
+        return 0
+    log("route_watch: HEAL FAILED — still route_dead (stamps_live=%s of %s)"
+        % (h2.get("stamps_live"), h2.get("entries")))
+    return 1
+
+
 def main():
     readonly = "--check" in sys.argv
 
@@ -162,11 +233,23 @@ def main():
         return 2
     entries = int(h.get("entries") or 0)
     routed = int(h.get("routed") or 0)
+    # DEAD ROUTE (2026-10-20): the anchor table and the order file are
+    # valid (routed=1) but the ROWS carry no routing stamps, because the
+    # index was rebuilt by scripts/build_index.py (rows written without
+    # the anchor fields). The server then scores a handful of rows out of
+    # 62k and serves them as the top-k — while /health said routed=1 and
+    # the keepalive was happy. The server now reports route_dead=1 and
+    # stamps_live; the watcher heals it with the restamp (no vector
+    # rewrite). Measured 2026-10-20 on live :8096.
+    route_dead = int(h.get("route_dead") or 0)
+    stamps_live = int(h.get("stamps_live") or 0)
 
     if entries == 0:
         log("route_watch: DEGRADED — server up but index empty (status=%s)"
             % h.get("status"))
         return 0
+    if route_dead:
+        return _heal_dead_route(h, st, sync_st, sig, readonly)
     if routed == 1:
         return 0  # healthy route: silent no-op
 

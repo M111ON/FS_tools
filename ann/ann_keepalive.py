@@ -186,7 +186,19 @@ def _start_ann():
                 # near the flat knee. Env overrides.
                 LZ_SEARCH_BUDGET=os.environ.get("LZ_SEARCH_BUDGET", "24000"),
                 ANN_WALK_PRUNE=os.environ.get("ANN_WALK_PRUNE", "1"),
-                ANN_WALK_FLOOR=os.environ.get("ANN_WALK_FLOOR", "0.5"))
+                ANN_WALK_FLOOR=os.environ.get("ANN_WALK_FLOOR", "0.5"),
+                # TOMBSTONE DOOR (env ANN_DOOR, default OFF = the pre-door
+                # behaviour, byte-identical). Measured live on 2026-10-20
+                # (300 real queries vs a numpy oracle, forced below-floor):
+                # recall@5 1.0000 both arms, 300/300 paired equal — so it is
+                # safe — but the door's walk is NOT faster than the plain
+                # full scan it replaces (p50 43 vs 39 ms), and at the
+                # production floor (0.5) a real query scores ~0.86, so the
+                # door is almost never reached. Left OFF until someone
+                # wants the ANN_DOOR_EXIT latency trade (that one gives up
+                # recall: the exit floor is a heuristic).
+                ANN_DOOR=os.environ.get("ANN_DOOR", "0"),
+                ANN_DOOR_EXIT=os.environ.get("ANN_DOOR_EXIT", "0"))
     out = open(os.path.join(DIR, ".server.log"), "ab")
     err = open(os.path.join(DIR, ".server.err"), "ab")
     flags = 0

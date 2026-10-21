@@ -482,6 +482,31 @@ static const char *lz_json_val(const char *line, const char *key) {
     while (*pp == ' ') pp++;
     return pp;
 }
+/* rows carrying a live routing stamp (set by lz_index_load; 0 = none).
+ * Declared before lz_index_load (which writes it) and before handle_health
+ * (which reads it). */
+static int g_stamp_live = 0;
+
+/* DEAD ROUTE (2026-10-20): the anchor table and the order file are valid
+ * (so the route layer says "routed") but the ROWS carry almost no routing
+ * stamps. The pruned walk then scores only the handful of stamped rows and
+ * serves them as the top-k — measured on live :8096: items_scored 4 of
+ * 62,204 while /health said routed=1. The stamps die when the index is
+ * rebuilt by scripts/build_index.py (rows written without the anchor
+ * fields) and the incremental regrow copies that dead state into the
+ * sidecar.
+ * The threshold is a FRACTION, not "== 0": the live incident left 23 live
+ * rows of 62,227, so an exact-zero test would have missed it. Half the
+ * corpus is the fail-loud line; a healthy index has (almost) every row
+ * stamped. Rows can legitimately be unstamped (a dim mismatch), so the
+ * bar is deliberately low. */
+#define STAMP_LIVE_MIN_FRAC 0.5
+static inline int stamps_route_dead(int nent) {
+    if (nent <= 0) return 0;
+    if (g_stamp_live <= 0) return 1;
+    return ((double)g_stamp_live < (double)nent * STAMP_LIVE_MIN_FRAC);
+}
+
 static int lz_entry_parse(const char *line, LZEntry *e) {
     memset(e, 0, sizeof(*e));
     e->anchor = -1; e->anchor2 = -1;
@@ -537,10 +562,29 @@ static int lz_index_load(LZEntry **out, int *n_out) {
         char sp[600];
         snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
         struct stat ss;
-        if (stat(sp, &ss) == 0 && ss.st_size == (long)n * 8) {
+        /* TREE-SIDE OVERLAY (2026-10-20): the sidecar is the TREE's
+         * channel and it is authoritative for EVERY ROW IT COVERS — not
+         * only when its size happens to equal n*8. The old rule ("overlay
+         * only on an exact size match, else ignore") belonged to the era
+         * when the fruit ALSO carried the labels; with the labels living
+         * only in the tree, ignoring a short sidecar throws away the whole
+         * routing table (measured 2026-10-20: the append window between
+         * ann-sync's append and its regrow left stamps_live 0 of 62,323 —
+         * the tree's labels were on disk but unread).
+         * Contract now:
+         *   - the sidecar covers rows [0, sidecar_rows)
+         *   - rows beyond that are NOT PLACED yet (they arrive before the
+         *     regrow places them) -> they keep the fruit's own label (-1)
+         *   - a sidecar LONGER than the index is truncated to n rows
+         * The fruit's own anchor fields remain the fallback for rows the
+         * sidecar does not cover (legacy indexes written before the
+         * sidecar existed). */
+        if (stat(sp, &ss) == 0 && ss.st_size >= 8) {
+            long side_rows = (long)ss.st_size / 8;
+            if (side_rows > (long)n) side_rows = (long)n;
             FILE *sf = fopen(sp, "rb");
             if (sf) {
-                for (int i = 0; i < n; i++) {
+                for (int i = 0; i < (int)side_rows; i++) {
                     int32_t rec[2];
                     if (fread(rec, sizeof(rec), 1, sf) != 1) break;
                     a[i].anchor = (int)rec[0];
@@ -550,6 +594,17 @@ static int lz_index_load(LZEntry **out, int *n_out) {
             }
         }
     }
+    /* STAMP LIVENESS (2026-10-20): how many rows actually carry a routing
+     * stamp. A rebuilt index (scripts/build_index.py) has NONE, and the
+     * incremental regrow used to write that dead state into the sidecar —
+     * the routing table of 62k rows was gone while /health still reported
+     * routed=1 and every search scored 4 rows instead of 24000. The count
+     * lets /health tell the truth and lets the walk refuse a dead route
+     * (fail loud, fall back to the full scan) instead of serving 4 rows
+     * as if they were the top-k. */
+    g_stamp_live = 0;
+    for (int i = 0; i < n; i++)
+        if (a[i].anchor >= 0) g_stamp_live++;
     *out = a; *n_out = n;
     return 0;
 }
@@ -765,6 +820,30 @@ static int lz_mem_search(const float *qv, int qd,
       if (wp && atoi(wp) > 0) walk_prune = 1; }
     { const char *wf = getenv("ANN_WALK_FLOOR");
       if (wf) walk_floor = atof(wf); }
+    /* ANN_DOOR_EXIT (2026-10-20): the door's optional EARLY EXIT. The
+     * door walks every row in door order (recall == the fallback it
+     * replaces). With this on, the walk STOPS as soon as the top score
+     * clears the EXIT threshold — the door found a good enough answer in
+     * the shut bucket, so the rest of the corpus is not needed.
+     * ANN_DOOR_EXIT_FLOOR is the exit threshold and is SEPARATE from the
+     * trigger floor (ANN_WALK_FLOOR): the trigger says "this query is bad
+     * enough to need the door", the exit says "this answer is good enough
+     * to stop". Using the same number for both makes the exit nearly
+     * dead — measured 2026-10-20: with exit floor == trigger floor the
+     * EXIT arm scored exactly as many rows as the plain door (33,574 =
+     * 33,574), because the corpus clears the trigger floor only at the end
+     * of the walk. Default: the exit threshold equals the trigger floor
+     * (so the exit stays OFF in effect unless it is given its own value). */
+    int door_early_exit = 0;
+    { const char *de = getenv("ANN_DOOR_EXIT");
+      if (de && atoi(de) > 0) door_early_exit = 1; }
+    double door_exit_floor = walk_floor;
+    { const char *ef = getenv("ANN_DOOR_EXIT_FLOOR");
+      if (ef && atof(ef) > 0.0) door_exit_floor = atof(ef); }
+    /* set only while the DOOR walk is the active walk — the early exit
+     * must not silently change the plain fallback path (that path is the
+     * exact-answer baseline the door is measured against). */
+    int door_walk_active = 0;
     uint32_t *pmem = NULL;          /* member-only walk sequence (owned) */
     unsigned char *pseen = NULL;    /* dedupe across buckets (owned) */
     uint32_t *pmem2 = NULL;         /* door walk sequence (owned; ANN_DOOR) */
@@ -776,7 +855,26 @@ static int lz_mem_search(const float *qv, int qd,
         uint32_t *ord_own = NULL;
         const float *C = NULL;
         int routed = 0, K = 0;
-        if (lz_route_cached(nent) && g_anch_dim == qd) {
+        int dead_route = 0;
+        int route_ok = (lz_route_cached(nent) && g_anch_dim == qd);
+        /* DEAD ROUTE (2026-10-20): the routing table exists (anchors+order
+         * are valid, so lz_route_cached says routed) but the rows carry no
+         * stamps — the index was rebuilt by scripts/build_index.py and the
+         * incremental regrow wrote that dead state into the sidecar. The
+         * pruned walk would then score only the handful of rows that happen
+         * to be stamped and serve them as the top-k (measured 2026-10-20 on
+         * live :8096: items_scored 4 of 62,204, health still green).
+         * Fail LOUD instead: refuse the pruned route and walk every row
+         * (the old, exact behaviour) until a regrow restores the stamps.
+         * A FRESH index (no anchors yet, so no route) is NOT dead — it
+         * simply has not been regrowed. */
+        if (route_ok) dead_route = stamps_route_dead(nent);
+        if (dead_route) {
+            rm[0] = 'd'; rm[1] = 'e'; rm[2] = 'a'; rm[3] = 'd';
+            rm[4] = '-'; rm[5] = 'r'; rm[6] = 'o'; rm[7] = 'u';
+            rm[8] = 't'; rm[9] = 'e'; rm[10] = '\0';
+        }
+        if (route_ok && !dead_route) {
             C = g_anch_cache; ord = g_ord_cache; K = g_anch_k;
             int topb;
             { const char *beke = getenv("LZ_ROUTE_BUCKETS");
@@ -921,7 +1019,9 @@ static int lz_mem_search(const float *qv, int qd,
                 routed = 1;
                 rnb = 0;
                 budget = gn;
-                snprintf(rm, sizeof(rm), "%s", "graph");
+                /* a dead route stays labelled dead-route: the graph is a
+                 * soft proposal, but the STAMP wipe is the loud fact */
+                if (!dead_route) snprintf(rm, sizeof(rm), "%s", "graph");
             } else {
                 if (gcand) free(gcand);
                 ord_own = (uint32_t *)malloc((nent ? (size_t)nent : 1) * sizeof(uint32_t));
@@ -1017,6 +1117,18 @@ static int lz_mem_search(const float *qv, int qd,
                 }
             }
             if (scored >= cap) { truncated = 1; break; }
+            /* DOOR EARLY EXIT (env ANN_DOOR_EXIT=1, default OFF): the door
+             * walk is exhaustive by default (so recall matches the fallback
+             * it replaces). With the exit on, the walk stops as soon as the
+             * top score clears the floor again — the shut bucket already
+             * held a good enough answer. This is the door's latency win,
+             * and it is a HEURISTIC: the floor decides when to stop, so
+             * recall can drop below the exhaustive path. */
+            if (door_early_exit && door_walk_active && door_exit_floor > 0.0 &&
+                top_sc[0] >= door_exit_floor) {
+                truncated = 1;
+                break;
+            }
         }
         /* confidence fallback: pruned top below floor -> full scan once */
         if (walk_prune && !full2 && walk_floor > 0.0 && top_sc[0] < walk_floor) {
@@ -1076,8 +1188,8 @@ static int lz_mem_search(const float *qv, int qd,
                                 }
                             }
                         }
-                        /* ... then everything else (kept: recall cannot drop;
-                         * graft still biases scores, door only reorders). */
+                        /* ... then everything else (kept: the door only
+                         * REORDERS the walk). */
                         for (int i = 0; i < nent; i++) {
                             int ei = (int)ord[i];
                             if (ei < 0 || ei >= nent || pseen2[ei]) continue;
@@ -1104,6 +1216,30 @@ static int lz_mem_search(const float *qv, int qd,
                                              * a repeat below floor must fall
                                              * through to the FULL2 scan, not
                                              * re-enter the door forever. */
+                            /* RECALL CONTRACT (2026-10-20): the door
+                             * REPLACES the below-floor fallback, and the
+                             * fallback scans EVERY row (cap = nent). If the
+                             * door kept the pruned cap (budget), it would
+                             * score fewer rows than the path it replaces —
+                             * measured live on 300 queries against a numpy
+                             * oracle: recall@5 0.9307 (door) vs 1.0000
+                             * (fallback), 56/300 queries worse. The handoff
+                             * claimed "recall cannot drop"; it could, and
+                             * did. So the door now scans EVERY row in
+                             * DOOR ORDER: same recall, different order.
+                             * The door's WIN is the ORDER (the shut bucket's
+                             * members are scored first), and the optional
+                             * early exit below (ANN_DOOR_EXIT, default
+                             * OFF) is where a latency win can be taken
+                             * without giving up recall. */
+                            cap = nent;
+                            /* the env flag SURVIVES here: the door walk is
+                             * the one that may exit early. (It used to be
+                             * cleared here, which silently disabled
+                             * ANN_DOOR_EXIT — measured 2026-10-20: the EXIT
+                             * arm scored all 62,266 rows, exactly like the
+                             * plain door.) */
+                            door_walk_active = 1;
                             continue;                      /* rewalk with door order */
                         }
                     }
@@ -1682,6 +1818,144 @@ static int regrow_check_append(const RegrowState *st, const LZEntry *a, int n) {
     return strcmp(sid, st->last_sid) == 0;
 }
 
+/* ── RESTAMP REPAIR (2026-10-20) ─────────────────────────────────────────
+ * A rebuild of the index (scripts/build_index.py) writes rows WITHOUT the
+ * anchor fields, so the routing table of every row is gone while the anchor
+ * table and the order file stay valid — the server then serves a handful of
+ * stamped rows as if they were the top-k (measured on live :8096:
+ * items_scored 4 of 62,204).
+ *
+ * The FULL regrow path would repair it by rewriting the 233 MB jsonl — but
+ * that path re-serializes every vector with "%.6g", which is a LOSSY
+ * re-encoding of the values build_index.py wrote (round(x, 6) keeps 6
+ * decimals; %.6g keeps 6 SIGNIFICANT digits). The vectors must not change.
+ *
+ * RESTAMP repairs the routing table WITHOUT touching the vectors: re-route
+ * every row against the EXISTING centroids, write the fresh stamps into the
+ * sidecar (<index>.stamp — the perm-sidecar's own channel), and rewrite the
+ * order file so the bucket-major permutation matches the new stamps. The
+ * jsonl is not read for writing and not rewritten: the apples stay.
+ * Cost: one index parse + n*K distance computations, no 233 MB write.
+ * Contract: the anchor table must exist and be valid (K/dim/checksum); if
+ * it does not, there is nothing to re-route against -> the caller falls
+ * back to the full path. 0 = ok, -1 = no usable table, -2 = bad args. */
+static int lz_restamp(int *n_out, int *K_out) {
+    LZEntry *a = NULL;
+    int n = 0;
+    *n_out = 0; if (K_out) *K_out = 0;
+    lz_index_load(&a, &n);
+    if (n < LZ_ANCH_MIN || !a || a[0].dim <= 0 || a[0].dim > ANCHR_MAXD) {
+        lz_index_free(a, n);
+        return -1;
+    }
+    int dim = a[0].dim;
+    float *C = (float *)malloc((size_t)ANCHR_MAXK * ANCHR_MAXD * sizeof(float));
+    if (!C) { lz_index_free(a, n); return -2; }
+    int adim = 0, antr = 0;
+    int K = anch_load(PATH_ANCH, C, ANCHR_MAXK, ANCHR_MAXD, &adim, &antr);
+    if (K <= 0 || adim != dim) {
+        free(C); lz_index_free(a, n);
+        return -1;                      /* no usable table: full path instead */
+    }
+    int *rows  = (int *)malloc((size_t)n * sizeof(int));
+    int *rows2 = (int *)malloc((size_t)n * sizeof(int));
+    uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    if (!rows || !rows2 || !perm) {
+        free(C); free(rows); free(rows2); free(perm);
+        lz_index_free(a, n);
+        return -2;
+    }
+    for (int i = 0; i < n; i++) {
+        if (a[i].dim != dim) { rows[i] = -1; rows2[i] = -1; continue; }
+        int t2[LZ_ANCH_MAXK];
+        int nb = anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2);
+        rows[i]  = nb > 0 ? t2[0] : -1;
+        rows2[i] = nb > 1 ? t2[1] : -1;
+    }
+    int rc = -1;
+    if (anch_perm(rows, n, K, perm) == 0) {
+        /* the sidecar carries the fresh stamps (the jsonl keeps its own
+         * stamps; the overlay prefers the sidecar when it covers n rows) */
+        char sp[600];
+        snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+        FILE *sf = fopen(sp, "wb");
+        if (sf) {
+            int good = 1;
+            for (int i = 0; i < n; i++) {
+                int32_t rec[2] = { (int32_t)rows[i], (int32_t)rows2[i] };
+                if (fwrite(rec, sizeof(rec), 1, sf) != 1) { good = 0; break; }
+            }
+            fclose(sf);
+            /* the order file must carry the SAME permutation (bucket-major
+             * over the fresh stamps) and stay bound to the table */
+            if (good && ord_save(PATH_ORDER, perm, n, K, n,
+                                 anch_cksum(C, K, dim)) == 0) {
+                /* the anchors' ntr must equal the row count, else the route
+                 * layer refuses the pair (antr != nent -> routed:0) */
+                if (anch_save_atomic(PATH_ANCH, C, K, dim, n) == 0) {
+                    RegrowState ns;
+                    regrow_state_load(&ns);
+                    ns.n_prev = n;
+                    strncpy(ns.last_sid, a[n - 1].sid, sizeof(ns.last_sid) - 1);
+                    ns.last_sid[sizeof(ns.last_sid) - 1] = 0;
+                    struct stat sns;
+                    if (stat(PATH_INDEX, &sns) == 0) {
+                        ns.index_mtime = (long)sns.st_mtime;
+                        ns.index_size  = (long)sns.st_size;
+                    }
+                    ns.K = K;
+                    ns.anchors_cksum = anch_cksum(C, K, dim);
+                    regrow_state_save(&ns, 0.0);
+                    rc = 0;
+                    *n_out = n;
+                    if (K_out) *K_out = K;
+                }
+            }
+        }
+    }
+    free(C); free(rows); free(rows2); free(perm);
+    lz_index_free(a, n);
+    return rc;
+}
+
+/* ── TREE-SIDE LABEL READ (2026-10-20) ────────────────────────────────────
+ * The routing labels live in the TREE's channel: <index>.stamp (8 bytes per
+ * row: anchor, anchor2). Reading them is a TREE operation — it never touches
+ * a vector. This is the separation the owner's architecture requires
+ * (HANDOFF-2026-10-10-session.md §5): the fruit (the vector rows) carries
+ * no tree state, the tree carries the labels, and a regrow moves the tree
+ * without rewriting the fruit.
+ *
+ * Returns the number of label pairs loaded (0 if the sidecar is missing or
+ * shorter than n_prefix); out_a/out_a2 are the caller's buffers.
+ */
+static int lz_stamp_prefix_load(int n_prefix, int **out_a, int **out_a2) {
+    *out_a = NULL; *out_a2 = NULL;
+    if (n_prefix <= 0) return 0;
+    char sp[600];
+    snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+    struct stat ss;
+    if (stat(sp, &ss) != 0) return 0;
+    if ((long)ss.st_size < (long)n_prefix * 8) return 0;
+    FILE *sf = fopen(sp, "rb");
+    if (!sf) return 0;
+    int *pa = (int *)calloc((size_t)n_prefix, sizeof(int));
+    int *pa2 = (int *)calloc((size_t)n_prefix, sizeof(int));
+    if (!pa || !pa2) { free(pa); free(pa2); fclose(sf); return 0; }
+    int got = 0;
+    for (int i = 0; i < n_prefix; i++) {
+        int32_t rec[2];
+        if (fread(rec, sizeof(rec), 1, sf) != 1) break;
+        pa[i] = (int)rec[0];
+        pa2[i] = (int)rec[1];
+        got++;
+    }
+    fclose(sf);
+    if (got < n_prefix) { free(pa); free(pa2); return 0; }
+    *out_a = pa; *out_a2 = pa2;
+    return got;
+}
+
 typedef struct {
     long n_prev;        /* entries present BEFORE this regrow (state-file contract) */
     long n_new;         /* n - n_prev */
@@ -1749,15 +2023,52 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                 }
             }
             if (unchanged) {
-                QueryPerformanceCounter(&tld1);
-                tel->ms_load = (double)(tld1.QuadPart - tld0.QuadPart) * 1000.0 / (double)qf0.QuadPart;
-                tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
-                tel->skipped = 1;
-                tel->n_prev = st0.n_prev; tel->n_new = 0;
-                snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "unchanged");
-                if (nout) *nout = st0.n_prev;
-                if (Kout) *Kout = st0.K;
-                return 2;
+                /* THE TREE'S CHANNEL MUST EXIST TOO (2026-10-20): the
+                 * "unchanged" fast path proves the FRUIT is unchanged (stat)
+                 * and the TABLE is unchanged (checksum). It must also prove
+                 * the TREE'S LABELS are there — the routing labels live in
+                 * the sidecar, and a rebuild that lost it leaves the fruit
+                 * and the table intact while the routing table is GONE.
+                 * Without this check the server reports "unchanged" (and
+                 * /health says routed=1) while every query scores a handful
+                 * of rows (measured 2026-10-20, live :8096). */
+                int labels_ok = 0;
+                { char sp[600];
+                  snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+                  struct stat ss;
+                  if (stat(sp, &ss) == 0 &&
+                      (long)ss.st_size >= (long)st0.n_prev * 8) {
+                      /* the sidecar must carry LIVE labels, not a field of
+                       * -1 (the degenerate state the bug produced) */
+                      FILE *sf = fopen(sp, "rb");
+                      if (sf) {
+                          labels_ok = 1;
+                          int32_t rec[2];
+                          int checked = 0;
+                          for (int i = 0; i < st0.n_prev; i++) {
+                              if (fread(rec, sizeof(rec), 1, sf) != 1) { labels_ok = 0; break; }
+                              if (rec[0] < 0) { labels_ok = 0; break; }
+                              checked++;
+                          }
+                          if (checked != st0.n_prev) labels_ok = 0;
+                          fclose(sf);
+                      }
+                  } }
+                if (labels_ok) {
+                    QueryPerformanceCounter(&tld1);
+                    tel->ms_load = (double)(tld1.QuadPart - tld0.QuadPart) * 1000.0 / (double)qf0.QuadPart;
+                    tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
+                    tel->skipped = 1;
+                    tel->n_prev = st0.n_prev; tel->n_new = 0;
+                    snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "unchanged");
+                    if (nout) *nout = st0.n_prev;
+                    if (Kout) *Kout = st0.K;
+                    return 2;
+                }
+                /* the fruit and the table are unchanged but the tree's
+                 * labels are gone -> fall THROUGH to the repair path
+                 * (no_tree / full), never report "unchanged" over a dead
+                 * routing table. */
             }
         }
     }
@@ -1846,11 +2157,84 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                 int *rows = (int *)malloc((size_t)n * sizeof(int));
                 int *rows2 = (int *)malloc((size_t)n * sizeof(int));
                 uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+                /* TREE-SIDE LABELS (2026-10-20) ─────────────────────────────
+                 * The routing labels (which branch a row hangs on) belong to
+                 * the TREE, not to the FRUIT. The fruit is the vector row;
+                 * the tree's label for it lives in the sidecar
+                 * (<index>.stamp) and in the order perm. build_index.py
+                 * rebuilds the fruit WITHOUT the anchor fields — that is
+                 * CORRECT (the fruit carries no tree state).
+                 *
+                 * The bug this fixes: the incremental regrow read those
+                 * (absent) fields and wrote them back as dead labels,
+                 * overwriting the tree's own labels for 62k rows — measured
+                 * 2026-10-20 on live :8096: items_scored 4 of 62,204 while
+                 * /health still said routed:1. Under the owner's
+                 * architecture (HANDOFF-2026-10-10-session.md §5) the fruit
+                 * is a CLOSED cluster: old rows keep their label and are
+                 * searched under it, and a broken branch fails box-by-box —
+                 * never all at once.
+                 *
+                 * So the prefix labels are READ, never re-derived:
+                 *   1. the sidecar (the tree's own channel) — authoritative
+                 *   2. the fruit's embedded fields — a copy, no vector read
+                 *   3. otherwise the tree is gone -> FAIL LOUD (no_tree) and
+                 *      the caller repairs with POST /v1/state/restamp, which
+                 *      re-places the fruit on the tree WITHOUT rewriting it
+                 *      (the jsonl is not touched at all).
+                 * Only genuinely NEW rows are routed onto the tree — that
+                 * is the one place a vector is read for placement. */
+                int *pa = NULL, *pa2 = NULL;
+                int pl = lz_stamp_prefix_load(st.n_prev, &pa, &pa2);
+                int prefix_from_fruit = 0;
+                int tree_intact = 0;
+                if (pl == st.n_prev) {
+                    int live = 0;
+                    for (int i = 0; i < pl; i++) if (pa[i] >= 0) live++;
+                    tree_intact = (live == pl);
+                }
+                if (!tree_intact) {
+                    /* the tree's sidecar is missing or degenerate: fall back
+                     * to the fruit's own labels — a COPY, no vector is read
+                     * (the labels are already there). */
+                    int live = 0;
+                    for (int i = 0; i < st.n_prev && i < n; i++)
+                        if (a[i].anchor >= 0) live++;
+                    if (live == st.n_prev && st.n_prev <= n) {
+                        free(pa); free(pa2);
+                        pa = (int *)calloc((size_t)st.n_prev, sizeof(int));
+                        pa2 = (int *)calloc((size_t)st.n_prev, sizeof(int));
+                        if (pa && pa2) {
+                            for (int i = 0; i < st.n_prev; i++) {
+                                pa[i] = a[i].anchor;
+                                pa2[i] = a[i].anchor2;
+                            }
+                            tree_intact = 1;
+                            prefix_from_fruit = 1;
+                        }
+                    }
+                }
+                if (!tree_intact) {
+                    /* FAIL LOUD: the tree's labels are gone and the fruit
+                     * carries none either. Re-deriving them here would mean
+                     * reading 62k vectors inside the regrow — the coupling
+                     * the owner's architecture forbids. The repair is
+                     * explicit: POST /v1/state/restamp (re-place the fruit
+                     * on the tree; the jsonl stays byte-identical). */
+                    free(pa); free(pa2); pa = pa2 = NULL;
+                    free(C); free(rows); free(rows2); free(perm);
+                    rows = rows2 = NULL; perm = NULL; C = NULL;
+                    tel->n_prev = st.n_prev;
+                    tel->n_new = -1;
+                    snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "no_tree");
+                    rc = -3;
+                    goto regrow_done;
+                }
                 if (rows && rows2 && perm) {
                     for (int i = 0; i < n; i++) {
                         if (i < st.n_prev) {
-                            rows[i] = a[i].anchor;
-                            rows2[i] = a[i].anchor2;
+                            rows[i] = pa[i];
+                            rows2[i] = pa2[i];
                         } else {
                             int t2[LZ_ANCH_MAXK];
                             int nb = (a[i].dim == dim)
@@ -1860,6 +2244,7 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                         }
                     }
                 }
+                free(pa); free(pa2); pa = pa2 = NULL;
                 QueryPerformanceCounter(&t_route1);
                 tel->ms_route = (double)(t_route1.QuadPart - t_route0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                 if (rows && rows2 && perm && anch_perm(rows, n, K, perm) == 0) {
@@ -1893,6 +2278,18 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                                     ? st.n_prev * 8
                                     : -1;
                         }
+                        /* TREE-SIDE LABELS (2026-10-20): the prefix labels
+                         * are READ, never re-derived. So:
+                         *  - if the prefix came from the tree's own sidecar,
+                         *    the sidecar's prefix records are still the tree's
+                         *    labels -> append only the new tail.
+                         *  - if the prefix came from the fruit's copy (the
+                         *    sidecar was missing/degenerate), the sidecar has
+                         *    no valid prefix -> rewrite it whole so the tree
+                         *    owns the labels again.
+                         * Either way the jsonl is untouched: the fruit stays
+                         * in place, only the tree's channel is written. */
+                        if (prefix_from_fruit) base_ofs = -1;
                         if (base_ofs < 0) {
                             /* bootstrap full stamp set for all n rows */
                             FILE *b = fopen(sp, "wb");
@@ -1994,45 +2391,64 @@ full_pipeline:
                                      anch_cksum(C, K, dim));
                             LARGE_INTEGER t_rw0, t_rw1, t_sv0, t_sv1;
                             QueryPerformanceCounter(&t_rw0);
-                            char tmp[512];
-                            snprintf(tmp, sizeof(tmp), "%s.tmp", PATH_INDEX);
-                            FILE *ix = fopen(tmp, "w");
-                            if (ix) {
-                                for (int i = 0; i < n; i++) {
-                                    char esid[256], efile[1024];
-                                    lz_json_escape(esid, sizeof(esid), a[i].sid);
-                                    lz_json_escape(efile, sizeof(efile), a[i].file);
-                                    fprintf(ix, "{\"sid\":\"%s\",\"file\":\"%s\",\"npast\":%d,\"anchor\":%d,\"anchor2\":%d,\"dim\":%d,\"vec\":[",
-                                            esid, efile, a[i].npast, rows[i], rows2[i], a[i].dim);
-                                    for (int vi = 0; vi < a[i].dim; vi++)
-                                        fprintf(ix, "%s%.6g", vi ? "," : "", (double)a[i].vec[vi]);
-                                    fprintf(ix, "]}\n");
-                                }
-                                fclose(ix);
-                                remove(PATH_INDEX);
-                                rename(tmp, PATH_INDEX);
-                                QueryPerformanceCounter(&t_rw1);
-                                tel->ms_rewrite = (double)(t_rw1.QuadPart - t_rw0.QuadPart) * 1000.0 / (double)qf.QuadPart;
-                                if (Kout) *Kout = K;
-                                rc = 0;
-                                /* full path proven; save fresh state.
-                                 * AFTER index rename so this mtime/size IS the new file. */
-                                struct stat sns;
-                                QueryPerformanceCounter(&t_sv0);
-                                if (stat(PATH_INDEX, &sns) == 0) {
-                                    RegrowState ns;
-                                    ns.n_prev = n;
-                                    strncpy(ns.last_sid, a[n - 1].sid, sizeof(ns.last_sid) - 1);
-                                    ns.last_sid[sizeof(ns.last_sid) - 1] = 0;
-                                    ns.index_mtime = (long)sns.st_mtime;
-                                    ns.index_size = (long)sns.st_size;
-                                    ns.K = K;
-                                    ns.anchors_cksum = anch_cksum(C, K, dim);
-                                    regrow_state_save(&ns, 0.0);
-                                }
-                                QueryPerformanceCounter(&t_sv1);
-                                tel->ms_save = (double)(t_sv1.QuadPart - t_sv0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                            /* TREE-SIDE LABELS, FRUIT UNTOUCHED (2026-10-20)
+                             * The full regrow RETRAINS the tree: it reads the
+                             * fruit's vectors to place every row (that is
+                             * what training IS). But it must NOT REWRITE the
+                             * fruit:
+                             *   - the owner's architecture (HANDOFF-2026-10-10
+                             *     -session.md §5): the fruit is a closed
+                             *     cluster — "the tree may break, the fruit
+                             *     stays the same, and can be put somewhere
+                             *     else"; a regrow moves the tree only.
+                             *   - the old jsonl rewrite re-serialized every
+                             *     vector with "%.6g" (6 SIGNIFICANT digits)
+                             *     while build_index.py wrote round(x, 6) (6
+                             *     DECIMALS) — a LOSSY re-encoding of the
+                             *     fruit. The bytes must not change.
+                             * So the labels go to the TREE's channel
+                             * (<index>.stamp, the same sidecar the
+                             * incremental path uses) and the jsonl is left
+                             * byte-identical. The read path overlays the
+                             * sidecar when it covers n rows, so the served
+                             * labels are the fresh ones either way. */
+                            { char sp[600];
+                              snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+                              FILE *sf = fopen(sp, "wb");
+                              int good = 0;
+                              if (sf) {
+                                  good = 1;
+                                  for (int i = 0; i < n; i++) {
+                                      int32_t rec[2] = { (int32_t)rows[i], (int32_t)rows2[i] };
+                                      if (fwrite(rec, sizeof(rec), 1, sf) != 1) { good = 0; break; }
+                                  }
+                                  fclose(sf);
+                              }
+                              QueryPerformanceCounter(&t_rw1);
+                              tel->ms_rewrite = (double)(t_rw1.QuadPart - t_rw0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                              if (!good) { free(perm); rc = -1; goto regrow_done; }
                             }
+                            if (Kout) *Kout = K;
+                            rc = 0;
+                            /* full path proven; save fresh state.
+                             * The index file itself was NOT rewritten (the
+                             * fruit is untouched) — its stat is unchanged,
+                             * so the state records the same mtime/size. */
+                            struct stat sns;
+                            QueryPerformanceCounter(&t_sv0);
+                            if (stat(PATH_INDEX, &sns) == 0) {
+                                RegrowState ns;
+                                ns.n_prev = n;
+                                strncpy(ns.last_sid, a[n - 1].sid, sizeof(ns.last_sid) - 1);
+                                ns.last_sid[sizeof(ns.last_sid) - 1] = 0;
+                                ns.index_mtime = (long)sns.st_mtime;
+                                ns.index_size = (long)sns.st_size;
+                                ns.K = K;
+                                ns.anchors_cksum = anch_cksum(C, K, dim);
+                                regrow_state_save(&ns, 0.0);
+                            }
+                            QueryPerformanceCounter(&t_sv1);
+                            tel->ms_save = (double)(t_sv1.QuadPart - t_sv0.QuadPart) * 1000.0 / (double)qf.QuadPart;
                             free(perm);
                         }
                     } else rc = -1;
@@ -2073,17 +2489,28 @@ static int handle_health(sock_t cli) {
      * not probe it hides a 100%-broken search path from the supervisor. Ping it
      * (short timeout) and report honestly; the index still reports its state. */
     int embed_ok = (lz_embed("ping", (float[4]){0}, 1) >= 0) ? 1 : 0;
+    /* TRUTHFUL ROUTE (2026-10-20): `routed` only means the anchor table and
+     * the order file are valid and bound. It says NOTHING about whether the
+     * ROWS carry routing stamps. A rebuilt index (scripts/build_index.py
+     * writes rows without the anchor fields) leaves the table valid but the
+     * routing table of every row empty — the server then scored 4 rows of
+     * 62,204 and /health still said routed:1 (measured 2026-10-20, live
+     * :8096). Report the stamp liveness separately and mark the service
+     * degraded when the route is dead, so the watcher/operator can see it. */
+    int stamps_live = g_stamp_live;
+    int route_dead = (routed == 1) && stamps_route_dead(nent);
     /* the index path is a Windows path — escape it or the JSON is invalid
      * (\t, \a, \k are not legal escapes). */
     char esc[512];
     lz_json_escape(esc, sizeof(esc), PATH_INDEX);
-    char b[768];
+    char b[900];
     int bl = snprintf(b, sizeof(b),
         "{\"status\":\"%s\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
-        "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"maxk\":%d,\"embed\":\"%s\","
+        "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"stamps_live\":%d,"
+        "\"route_dead\":%d,\"maxk\":%d,\"embed\":\"%s\","
         "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
-        esc, nent, routed, ANN_MAXK, embed_ok ? "ok" : "down",
+        esc, nent, routed, stamps_live, route_dead, ANN_MAXK, embed_ok ? "ok" : "down",
         g_fog_replayed, sh, (unsigned)WL_FREE);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
@@ -2430,6 +2857,37 @@ static void dispatch(sock_t cli, char *rq) {
     sscanf(rq, "%15s %255s", method, path);
     if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
         handle_health(cli);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/restamp") == 0) {
+        /* RESTAMP (2026-10-20): repair the ROUTING TABLE without touching
+         * the vectors. The full regrow path rewrites the 233 MB jsonl and
+         * re-serializes every vector with "%.6g" — a lossy re-encoding of
+         * the values build_index.py wrote (round(x, 6) = 6 DECIMALS vs
+         * %.6g = 6 SIGNIFICANT digits). The vectors must not change, so the
+         * repair re-routes the rows against the existing centroids and
+         * writes the stamps into the sidecar only.
+         * 0 = repaired, -1 = no usable anchor table (caller: full regrow),
+         * -2 = allocation failure. */
+        LARGE_INTEGER rqf2, rq02, rq12;
+        QueryPerformanceFrequency(&rqf2);
+        QueryPerformanceCounter(&rq02);
+        int rN2 = 0, rK2 = 0;
+        int rrc2 = lz_restamp(&rN2, &rK2);
+        QueryPerformanceCounter(&rq12);
+        double rms2 = (double)(rq12.QuadPart - rq02.QuadPart) * 1000.0 / (double)rqf2.QuadPart;
+        if (rrc2 == 0) {
+            lz_index_cache_invalidate();
+            lz_route_cache_invalidate();
+        }
+        char rresp2[512];
+        int rrlen2 = snprintf(rresp2, sizeof(rresp2),
+            "{\"status\":\"%s\",\"mode\":\"restamp\",\"nent\":%d,\"K\":%d,"
+            "\"ms\":%.1f,\"restamp\":{\"mode\":\"%s\",\"rc\":%d}}",
+            (rrc2 == 0) ? "ok" : "error", rN2, rK2, rms2,
+            (rrc2 == 0) ? "restamp" : (rrc2 == -1) ? "no_table" : "error",
+            rrc2);
+        lz_http_send(cli, (rrc2 == 0) ? "200 OK" : "409 Conflict",
+                     "application/json", rresp2, rrlen2);
+        sock_close(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/regrow") == 0) {
         /* REGROW MODES: unchanged (<0.5s) / incremental (append) / full.
          * body "force":1 -> full path regardless of state. Telemetry keys are
