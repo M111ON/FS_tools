@@ -573,6 +573,11 @@ const bye = () => { try { if (WS) WS.close(); } catch (x) {} };
       label: ((el.querySelector('span') || {}).textContent || '').trim(),
       text: ((el.querySelector('.cennum') || {}).textContent || '').trim(),
       dim: el.dataset.cmpDim || null,
+      // the machine key, next to the reader's word. The strip renames every
+      // kind for the reader, so the label cannot identify a row — only
+      // data-cmp-key can, and comparing the two is what proves one word table
+      // is being read by both views.
+      key: el.dataset.cmpKey || null,
       clickable: el.style.cursor === 'pointer',
     }));
     R.strip = {};
@@ -685,7 +690,14 @@ const bye = () => { try { if (WS) WS.close(); } catch (x) {} };
       () => /สี = ชนิดของบรรทัด/.test(document.querySelector('#pv-legend').textContent), 20000);
     await new Promise(r => setTimeout(r, 400));
     R.legend = [...document.querySelectorAll('#pv-legend span[title]')]
-      .map(s => {const m = /^([^·]+)·\\s*(\\d+)\\s*ช่อง/.exec(s.getAttribute('title') || ''); return m ? {label: m[1].trim(), n: +m[2]} : null;})
+      .map(s => {
+        const m = /^([^·]+)·\\s*(\\d+)\\s*ช่อง/.exec(s.getAttribute('title') || '');
+        // 'kind' is the wire name off data-kind, the legend's own machine key,
+        // and it plays the part data-cmp-key plays in the composition strip. The
+        // WORD is in the title and in the label, and both are Thai: two views of
+        // one set of kinds have to name them the same way.
+        return m ? {kind: s.dataset.kind || null, label: m[1].trim(), n: +m[2]} : null;
+      })
       .filter(Boolean);
     R.legendText = document.querySelector('#pv-legend').textContent.slice(0, 300);
     PH('done'); return R;
@@ -752,8 +764,9 @@ def _upto(pairs, tick):
 
 
 def check(report, truth):
-    # the legend's title carries the WIRE kind ("CHAT · 28 ช่อง"), not the Thai
-    # label, so both maps key the same way and each is graded against its own
+    # The legend counts the LAYER map and the strip counts the census; neither
+    # keys on the word. `data-kind` / `data-cmp-key` carry the wire name for the
+    # machine, so both maps key the same way and each is graded against its own.
     page_truth_layer = truth["layer"]
     """Compare what the page RENDERED against what the corpus says. Returns a
     list of (label, ok, detail) — the shape run_all already knows how to print."""
@@ -908,7 +921,8 @@ def check(report, truth):
     # The legend quotes the LAYER map; the dropdown quotes the FILTER map. Both
     # are numbers about the same picture and they are not the same number, so
     # each is graded against its own truth.
-    leg = {e["label"]: e["n"] for e in (page.get("legend") or [])}
+    legend = page.get("legend") or []
+    leg = {e["kind"]: e["n"] for e in legend if e.get("kind")}
     zeroed = sorted(l for l, n in leg.items() if not n)
     # The legend boxes live INSIDE #plane-detail and opening a cell replaces that
     # container's innerHTML, so the first click of a session used to destroy
@@ -930,6 +944,41 @@ def check(report, truth):
         "; ".join("%s legend=%s corpus=%s" % (l, leg[l], page_truth_layer.get(l))
                   for l in layer_ok)[:400]
         or "%d swatches agree with the corpus" % len(leg))
+
+    # ── one name for one kind, in both views ───────────────────────────────
+    # The legend's swatch and the composition strip's row are the same fact
+    # about the same kind, and they are drawn from DIFFERENT maps (last-writer
+    # vs holds), so nothing structural stops them drifting apart — the tooltip
+    # used to print the corpus's own spelling ("CHAT · 28 ช่อง") while the row
+    # beside it said "แชท", so the reader had to learn two names for one colour
+    # and only one of them appeared anywhere else in the page. Three clauses:
+    # every swatch keeps a machine key, no swatch prints its own key back, and
+    # the word matches the strip's word for that same key.
+    unkeyed = [e.get("label") for e in legend if not e.get("kind")]
+    add("every legend swatch keeps the wire kind as a key",
+        not unkeyed,
+        "swatches with no data-kind: %s" % unkeyed
+        if unkeyed else "%d swatches carry data-kind" % len(legend))
+    spoken = ["%s → %r" % (e["kind"], e["label"]) for e in legend
+              if e.get("kind") and str(e["label"]).strip().lower() == str(e["kind"]).lower()]
+    add("no legend swatch says the corpus's own spelling",
+        not spoken,
+        "; ".join(spoken)[:300]
+        or "swatches read: %s" % ", ".join(
+            "%s=%s" % (e.get("kind"), e["label"]) for e in legend)[:240])
+    strip_words = {r["key"]: r["label"] for r in (page.get("strip") or {}).get("kind")
+                   or [] if r.get("key")}
+    differ = ["%s: legend %r vs strip %r" % (e["kind"], e["label"],
+                                              strip_words.get(e["kind"]))
+              for e in legend
+              if e.get("kind") and e["kind"] in strip_words
+              and e["label"] != strip_words[e["kind"]]]
+    add("the legend and the composition strip name each kind alike",
+        bool(legend) and bool(strip_words) and not differ,
+        "; ".join(differ)[:400]
+        or "legend %s · strip %s" % (
+            ", ".join(sorted("%s=%s" % (e.get("kind"), e["label"]) for e in legend))[:180],
+            ", ".join(sorted("%s=%s" % (k, v) for k, v in strip_words.items()))[:180]))
 
     cl = page.get("cleared") or {}
     add("clearing the filter returns the whole plane",

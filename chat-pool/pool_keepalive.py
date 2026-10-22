@@ -103,6 +103,8 @@ def _start_server():
     flags = 0
     if hasattr(subprocess, "DETACHED_PROCESS"):
         flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags |= subprocess.CREATE_NO_WINDOW
     return subprocess.Popen([PY, SERVER], cwd=DIR,
                             stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                             creationflags=flags, close_fds=True)

@@ -2171,3 +2171,256 @@ made the guard load-bearing and the mutation real. And the "preset picks the
 wrong shape" mutation was not a defect at all — changing a design decision is an
 edit, not a bug — so it was replaced with the failure that is: a preset that
 promises a 24-cell frame and opens the whole plane.
+
+---
+
+## 25. One word per kind — the legend and the strip say the same thing
+
+Added 2026-10-03. §23 gave the plane a composition strip and §19 gave the plane
+a colour legend, and each names a kind in words. They did not always use the
+*same* words, and for one part of the screen the word was not even a word.
+
+### 25.1 What the reader saw
+
+Colour the plane by kind and the legend reads:
+
+> แชท `26` · เส้นเชื่อม `23` · ข้อสรุป `16`
+
+and hovering a swatch read `CHAT · 26 ช่อง`. The composition strip, thirty
+pixels to the left, says `แชท` for the same kind. So the page taught two names
+for one colour, one of them the corpus's own spelling, and the only place a
+reader could see both at once was the tooltip — which is also the only place a
+reader would go looking for "which kind is this".
+
+The label was already `kindLabel(k)`; only the `title` still printed `k`. That
+is the shape of the defect worth naming: **a translation is one call site deep,
+and nothing counts call sites.** The badge (§19), the dropdown (§20), the strip
+(§23) and the legend label were all correct, which is exactly why the one that
+was not looked fine.
+
+### 25.2 The fix, and the key it left behind
+
+`pvLegend` now writes `esc(kindLabel(k))` into the tooltip, and the swatch grew
+`data-kind="<k>"`. The `data-` attribute is deliberate: it is the machine's key,
+and it is the same trick `data-cmp-key` already plays in the strip. A key nobody
+reads is not a leak; a word a reader reads is. Nothing filters on `data-kind`
+yet — it exists so a check can compare two views without asking either of them
+to print the wire name, which is what §24's `presetLayer` does for the writer
+layer.
+
+### 25.3 A check that reads the page as it is RENDERED
+
+Every vocabulary check in `ui_check` reads the served markup. The legend is not
+in the markup: `<div id="pv-legend">` is empty in the file and filled by
+`pvLegend` at runtime, and the strip's rows do not exist until `pvComposition`
+runs. So the class of bug this section is about is structurally invisible to
+them — a check that reads source can only see that `title="'+esc(k)+' · '`
+appears, and that is a correct-looking line of code.
+
+`legend_words()` runs instead. It slices the real closure of both painters —
+`KIND_TH`, `kindIsChat`, `kindLabel`, `pvTopKinds`, `pvTopApps`, `pvFilt`,
+`appLabel`, `PV_CMP`, `pvLegend`, `pvComposition` — hands them a fake DOM, and
+reads the HTML they emit. The translator is **not** stubbed: a probe that
+replaced `kindLabel` could not tell a legend that calls it from one that prints
+`k`, which is the whole question. The DOM stubs go the other way, because the
+painters have to reach the DOM to run and the reader never sees it.
+
+Four clauses, and they answer four different questions:
+
+1. a kind with a plain word is not printed raw anywhere a reader looks — text
+   nodes and `title` attributes, with `data-` attributes excluded on purpose;
+2. both views print the word the one table holds;
+3. both views print the **same set** of words, so the reader learns one name;
+4. one swatch per kind, because a legend that drops a colour is a stain with no
+   label and the picture still looks finished.
+
+The counts are deliberately not compared. The legend counts last-writers
+(`PV.cellKind`) and the strip counts the census; those are different numbers
+about one picture and §20 already paid for confusing them.
+
+An untranslated kind *is* fed to the probe, and clause 1 skips it: `kindLabel`'s
+fallback quotes the wire name on screen precisely so a reader can see that there
+is a name nobody translated. `kind_words()` is what polices that table being
+complete; the fallback is the honest failure, not a leak.
+
+### 25.4 The browser says it too
+
+`ui_browser_check` reads the same two panels in a real Chrome. It now keys the
+legend off `data-kind`, so the counts are still graded against `cell_kind_clean`
+(§21), and grades the *names* separately: every swatch keeps a key, none prints
+its own key back, and each swatch's word equals the strip row's word for that
+key. All three read off the rendered DOM, so they fail together if the legend
+and the strip ever drift again.
+
+```
+ui_check  44/44 · ui_browser_check 46/46 · pool.py demo 327/327 · run_all 12/12
+
+mutations 8 attempted · 8 CAUGHT
+  the tooltip prints the wire name again ·
+  the visible label prints the wire name ·
+  the tooltip is dropped entirely ·
+  the strip stops translating (lab:k=>k) ·
+  the strip invents a word of its own ·
+  a kind loses its swatch ·
+  a COMMENT claims the fix while the code does not ·
+  KIND_TH itself is neutered (caught by kind_words)
+```
+
+The seventh is the §13.5 mutation and the reason this check is a probe: the
+comment `/* was esc(kindLabel(k)) */` sits on the broken line, and a regex over
+the source reads it as the fix. A painter that must produce the words cannot be
+satisfied by a sentence about them.
+
+One detour is worth recording because it cost more than the bug. Six regexes in
+the driver look double-escaped — `/^([^·]+)·\s*(\d+)\s*ช่อง/` — and running
+that line as top-level JavaScript returns nothing at all. It is not broken: the
+driver is a **raw** Python string whose body is evaluated inside a JavaScript
+template literal, where `\s` is an escape *for the string* and arrives at the
+regex as `\s`. Every probe that ran it in the wrong context said the legend was
+empty, and the real browser said otherwise. The lesson is the §13.5 one turned
+around: **a check extracted from a file must be extracted the way the file uses
+it, or it will report a failure that is really a misreading.**
+
+## 26. The task board — two boards that may both write
+
+The inbox board (`.inbox_state.json`, `todo|in_progress|done|blocked|cancelled`)
+and the pool's task blocks (`pending|in_progress|done|blocked|cancelled`) are the
+same list seen from two places. Phase 1 made that true in one direction. Two
+directions is a different problem, and the problem is not transport — it is that
+two writers who both think they are right will either stomp or oscillate.
+
+### 26.1 The hold — first come first served, on a 15-minute lease
+
+An `in_progress` task is **held by its owner**. Reading is never blocked.
+Writing is: a second platform gets `409` and a sentence naming the holder and
+how much longer the hold has. A hold is **derived, never stored** — it is the
+owner plus the timestamp of the latest revision — so it lapses by itself after
+`HOLD_IDLE_SEC` (900). Nobody has to remember to release, and the chain stays
+the audit trail: who took it, when, and what they did next.
+
+A hold is a lease and not a lock because a lock with no expiry is a deadlock
+waiting for a laptop to close. Fifteen minutes is short enough that a stale
+claim does not strand the work and long enough that a human thinking is not
+interrupted.
+
+The one deliberate exemption is `apply()`, the inbox→pool direction, which
+passes `guard=False`. A hold exists to stop *platforms* stomping on each other;
+the inbox is where the card lives, not a peer of it, and refusing there would
+mean a card could never record what the card already says.
+
+### 26.2 The tie — the side that is not behind wins
+
+`pull()` writes a card back only when the task is genuinely ahead of it: the
+card's `updated_at` must be older than the task's last revision by more than
+`TIE_SEC` (2). A card touched within that window of a pool revision is a
+**tie**, and the inbox takes ties — guessing wrong the other way destroys
+somebody's edit, guessing this way costs one more sync.
+
+Comparing timestamps rather than a stored baseline is deliberate: it is the same
+question on a first pull as on the hundredth, and a lost baseline costs one
+extra pull instead of one wrong write. The baseline (`.inbox_pull_state.json`)
+exists only for `FRESH` — skip a task that has not moved since we last looked,
+which is what stops the two directions from feeding each other in a loop.
+
+### 26.3 The write — atomic, locked, and compared
+
+The inbox MCP server writes that file with a bare `write_text` and no lock, and
+three of its processes may hold it open. `pull()` therefore:
+
+- takes an `O_CREAT|O_EXCL` lock file (`<state>.lock`, stale-broken after 30s)
+  so two bridges cannot each read the same board and write different answers;
+- re-reads the board **inside** the lock;
+- compares the target card's `updated_at` against the value the plan was built
+  on, and writes **nothing at all** if it moved;
+- writes `<state>.tmp-<pid>`, `fsync`, then `os.replace` — so a reader never
+  sees half a board, which is strictly more than the MCP's own write gives.
+
+The lock does not lock out the MCP process, and cannot: that half is the
+compare-and-swap. The residual window is the millisecond between our read and
+our replace, which shrinks to nothing when nobody is typing, and is reported as
+a conflict when it is not.
+
+```
+taskboard demo 26/26 · taskboard_check 35/35 · run_all 12/12 (55.5s)
+
+live: apply → 54 cards, import 0 update 0   pull → pull 0 conflict 0
+```
+
+## 27. The open board — an editable board, an open vocabulary, and a fold
+
+§26 made the task board two-way. Three more things turned it from a mirror into
+the thing people actually work in.
+
+### 27.1 The status vocabulary is derived, not declared
+
+`TASK_STATUS` is a floor, not a ceiling. The title header `[<status>]` accepts any
+bareword matching `[a-z0-9][a-z0-9_-]{0,23}`, and `statuses()` reports the five
+built-ins plus every status the log already contains. A task written as
+`[notice]` by one platform is a notice task for every other reader — no registry
+to update, no second opinion to reconcile, and no deployment to make an
+operator think about before they can file something under a word they invented.
+
+The width is still bounded, and the bound is the point: a status the next
+reader cannot parse back is a typo with a life, so `task_create`/`task_update`
+raise rather than write it.
+
+In the page the status field is a **text input with a `<datalist>`, not a
+`<select>`**. A select makes "a status I have not thought of yet" impossible to
+reach, which is precisely the thing being asked for; the datalist only ever
+*suggests*, and suggestions come from the log.
+
+### 27.2 Editing is a rev, like everything else
+
+`task_update` grew `title`, `add_tags` and `remove_tags` beside `status`,
+`owner`, `desc` and `note`. It still appends: editing is a new rev of the same
+block, and the previous shape stays readable in `block_revs()`. There is no
+edit-in-place anywhere in this system, because there is no in-place anywhere.
+
+One tag is not the user's to remove. `src:` is the bridge's dedup key — the way
+a card knows which task it became. Drop it and the next `apply()` imports a
+second copy of a card that is already on the board. `_clean_tags` keeps `src:`
+whether or not removal was asked for, and the page renders those tags as static.
+
+### 27.3 Kept is not the same as shown
+
+`task_open()` is the fold: pending / in_progress / blocked, minus anything
+tagged `crumb`. Everything else — done, cancelled, a custom status, a crumb —
+stays on the board, stays editable, and stays one click away in a drawer.
+
+A board that shows all 54 cards is a list nobody reads. A board that hides them
+is a lie. The drawer is the only honest answer to "เก็บไว้ให้ดูได้", and the
+fold is exposed as `?view=open|folded|all` so the API and the screen are drawing
+from the same rule instead of two rules that drift.
+
+The page's `isOpen()` is a mirror of `task_open()` and that duplication is the
+one honest cost in this section: a rule that has to be written twice will be
+written twice wrong. It is listed in STRUCTURE.md as a place where the two must
+be changed together.
+
+```
+taskboard demo 47/47 · taskboard_check 45/45 · run_all 12/12 (53.6s)
+
+live: 54 cards → กำลังทำ 0, drawer "เสร็จแล้ว / ยกเลิก" 54
+```
+
+### 27.4 The vocabulary is open — and the bridge is where it stops
+
+An open vocabulary on the pool and a five-column board in the inbox are only
+compatible if something refuses to translate. That something is
+`inbox_bridge.POOL_KNOWN`.
+
+A plain status comparison would have been actively destructive: a card sitting
+at `todo`, whose task somebody had parked under `[notice]`, reads as "the pool
+disagrees with the board", so `apply()` would have reset the task to `pending` —
+silently deleting a state a person had put there on purpose, on the very sync
+that is supposed to be conservative.
+
+So both directions now ask first. `apply()` skips a card whose task is under a
+status the board has no column for; `pull()` already skipped it because there is
+no inbox status to write. Both *report* it. "The board has no opinion about
+this" is a fact the report has to be able to say out loud, and neither direction
+is allowed to guess on its behalf.
+
+```
+taskboard demo 47/47 · taskboard_check 49/49 · run_all 12/12 (51.4s)
+```

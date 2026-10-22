@@ -772,6 +772,9 @@ INVARIANTS = [
     ("the kind filter may show less, never more",
      lambda js, html: kind_filter(js) == "",
      lambda js, html: kind_filter(js)),
+    ("the legend and the strip name a kind the same way, at runtime",
+     lambda js, html: legend_words(js) == "",
+     lambda js, html: legend_words(js)),
     ("a filter on the time scrub is the same filter as on the live plane",
      lambda js, html: re.search(r"if\s*\(\s*ki\s*&&\s*row\[3\]\s*!==\s*ki\s*\)\s*continue;", js),
      "pvCellsUpTo counts the log's own order, so without the kind check it "
@@ -1301,6 +1304,170 @@ def kind_list(js):
     if n != 0:
         return ("the filter's list does not open (%s). Each clause names what "
                 "disagreed:" % n + chr(10) + "    " + bad[:600])
+    return ""
+
+
+# ── the words the page BUILDS, as opposed to the ones it ships ──────────────
+# Everything above reads the markup. The markup is not where the legend's words
+# live: <div id="pv-legend"> is empty in the file and filled by pvLegend at
+# runtime, and the composition strip's rows do not exist until pvComposition
+# runs either. So a vocabulary check that only reads the page as SERVED cannot
+# see the two places a kind is actually NAMED — which is exactly where the wire
+# spelling used to survive, in the swatch tooltip, with nothing in the source
+# to find it by.
+LEGEND_PROBE_HEAD = r"""
+// Two painters, one fake DOM, and whatever they emit is what a reader sees.
+// kindIsChat/kindLabel/KIND_TH are the REAL ones on purpose: a probe that
+// stubs the translator cannot tell a legend that calls it from a legend that
+// prints k, and stubbing it is what made this check possible to satisfy by
+// nothing at all. The DOM stubs are the other way round: the painters must
+// reach the DOM to run, and the reader never sees it.
+const PV={colour:'kind',metaOn:true,filt:null,cells:{1:9,2:4},cellSeqMax:12,
+          cellKind:{},cellApp:{},kinds:{},apps:{},cmp:0,census:null};
+const box={innerHTML:''};
+const _pvCompBox={innerHTML:'',_cmpHtml:null};
+let _legendKey=null;
+const $=id=>id==='#pv-legend'?box:null;
+const esc=s=>String(s==null?'':s);
+const _idOf=o=>String(Object.keys(o||{}).length);
+const HEAT=[[126,231,135]];
+const pvRampCSS=()=>['rgb(1,2,3)'];
+const pvAppInk=()=>'rgb(9,9,9)';
+const pvKindInk=()=>'rgb(8,8,8)';
+"""
+
+LEGEND_PROBE_TAIL = r"""
+const bad=[];
+// every kind the dashboard has a word for, plus one it has NOT. The untranslated
+// one is in the map on purpose: both painters must still agree about it, and
+// the raw-spelling rule below skips it — kindLabel's fallback quotes the wire
+// name ON SCREEN precisely so a reader can see there is a name nobody
+// translated, and kind_words() is what polices that table being complete.
+const known=Object.keys(KIND_TH),names=known.concat(['brandnewkind']);
+const counts={};names.forEach((k,n)=>{counts[k]=10+n});
+PV.cellKind={};names.forEach((k,n)=>{PV.cellKind['cell'+n]=k});
+PV.census={kinds:counts,by_app:{},rels:{},shapes:{},shape_meta:{}};
+let threw=null;
+try{pvLegend();pvComposition();}catch(e){threw=String(e&&e.stack||e);}
+if(threw)bad.push('painting the legend threw: '+threw.slice(0,200));
+const legHtml=box.innerHTML,cmpHtml=_pvCompBox.innerHTML;
+// What a PERSON reads: the text nodes, plus every tooltip. Attributes are not
+// stripped wholesale — a title IS read — but a data- attribute is a key for the
+// machine and nobody looks at it, which is why data-kind may hold the wire
+// name (the composition strip's data-cmp-key has always).
+const read=h=>{
+  const t=(h.match(/title="[^"]*"/g)||[]).map(x=>/title="([^"]*)"/.exec(x)[1]).join(' ');
+  return t+' '+h.replace(/<[^>]*>/g,' ');
+};
+const legText=read(legHtml),cmpText=read(cmpHtml);
+// the word each view printed, per kind
+const legendWords=(legHtml.match(/title="[^"]*"/g)||[])
+  .map(t=>/title="([^"]*)"/.exec(t)[1].replace(/ · [0-9,]+ [^"]*$/,''));
+const rows={};
+for(const m of cmpHtml.matchAll(/data-cmp-key="([^"]*)"[^>]*><span[^>]*>([^<]*)</g))
+  rows[m[1]]=m[2];
+// 1 a kind with a plain word must not be printed raw, anywhere a reader looks
+for(const k of known){
+  const raw=new RegExp('(^|[^\\w-])'+k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'($|[^\\w-])','i');
+  if(raw.test(legText))bad.push('the legend still prints the wire name '+k);
+  if(raw.test(cmpText))bad.push('the composition strip still prints the wire name '+k);
+}
+// 2 and both views must print the word the ONE table holds
+for(const k of known){
+  const w=KIND_TH[k];
+  if(rows[k]!==w)bad.push('the strip calls '+k+' '+JSON.stringify(rows[k])+', the table says '+JSON.stringify(w));
+  if(legendWords.indexOf(w)<0)bad.push('the legend never prints '+JSON.stringify(w)+' for '+k);
+}
+// 3 and they must print the SAME set of words, so the reader learns one name
+const stripWords=Object.keys(rows).map(k=>rows[k]);
+const uniq=[...new Set(legendWords)];
+if(!uniq.length)bad.push('the legend painted no swatch it could name');
+if(uniq.length!==stripWords.length||!uniq.every(w=>stripWords.indexOf(w)>=0))
+  bad.push('the legend and the strip do not use one set of words: legend ['+uniq+'] vs strip ['+stripWords+']');
+// 4 one swatch per kind: a legend that quietly drops a colour is a stain with
+//   no label, and the picture still looks finished
+if(legendWords.length!==names.length)
+  bad.push('the legend drew '+legendWords.length+' swatches for '+names.length+' kinds');
+console.log(bad.join(' | ')+' :: '+bad.length);
+"""
+
+
+def _js_literal(js, name):
+    """A top-level `const NAME=[...]` written out in full, closing bracket and all.
+
+    `preset_values` found the end of PV_PRESETS by hand; this is the same
+    problem with a second array, and the two must not drift apart on how they
+    decide where an array stops.
+    """
+    i = js.find("const %s=[" % name)
+    if i < 0:
+        return ""
+    j = js.find(chr(10) + "];", i)
+    return js[i:j + 2] if j > i else ""
+
+
+def legend_words(js):
+    """Render the legend and the strip for real and compare the WORDS they print.
+
+    Both are painted at runtime from maps nothing else is made of — the colour
+    layer's last-writer set and the census — so no reading of the served markup
+    can see what they say. The tooltip is the part that matters: it is the only
+    place both the colour and the name of a swatch appear together, and it is
+    what printed `CHAT · 13,746 ช่อง` beside a strip row that said แชท, which
+    taught a reader two names for one colour and made one of them searchable
+    only by typing the corpus's spelling.
+
+    Rendered here rather than pattern-matched, because the whole defect lives in
+    a string concatenation: `title="'+esc(k)+' · '` is a correct-looking line of
+    code that puts the wire name on the screen, and no regex over the source
+    distinguishes it from `esc(kindLabel(k))`. The probe also cannot be satisfied
+    by a comment — it runs the real painters, so the words have to actually be
+    produced.
+
+    Two different maps feed the two views and they are not the same map, so the
+    counts are deliberately NOT compared. Only the names are.
+    """
+    node = shutil.which("node")
+    if not node:
+        return ""
+    # the closure of two painters, in the order they need it. Sliced, never
+    # copied: a probe that carries its own KIND_TH would be graded against a
+    # table nobody ships.
+    mth = re.search(r"const KIND_TH\s*=\s*\{.*?\};", js, re.S)
+    bits = [
+        ("KIND_TH", mth.group(0) if mth else ""),
+        ("kindIsChat", _js_arrow(js, "kindIsChat")),
+        ("kindLabel", _js_arrow(js, "kindLabel")),
+        ("pvTopApps", _js_arrow(js, "pvTopApps")),
+        ("pvTopKinds", _js_arrow(js, "pvTopKinds")),
+        ("pvFilt", _js_function(js, "pvFilt")),
+        ("appLabel", _js_function(js, "appLabel")),
+        ("PV_CMP", _js_literal(js, "PV_CMP")),
+        ("pvLegend", _js_function(js, "pvLegend")),
+        ("pvComposition", _js_function(js, "pvComposition")),
+    ]
+    gone = [n for n, s in bits if not s]
+    if gone:
+        return ("%s must still be in the script: the legend and the composition "
+                "strip are the only two places on screen where a kind is NAMED, "
+                "and this probe renders both of them" % ", ".join(gone))
+    d = tempfile.mkdtemp(prefix="ui-legend-")
+    tmp = os.path.join(d, "legend.js")
+    # newline-joined, because the slicers hand back a declaration with its
+    # trailing semicolon stripped off
+    src = chr(10).join([LEGEND_PROBE_HEAD] + [s for _, s in bits] + [LEGEND_PROBE_TAIL])
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(src)
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0:
+        return "the legend-word probe would not run: " + (r.stdout + r.stderr).strip()[:400]
+    bad, n = _probe_count(r.stdout)
+    if n != 0:
+        return ("the two views of a kind do not agree on its name (%s). Each "
+                "clause names what disagreed:" % n + chr(10) + "    " + bad[:600])
     return ""
 
 

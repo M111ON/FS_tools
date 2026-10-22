@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chat-pool · task board</title>
+<style>
+  :root { --bg:#0d1117; --surface:#161b22; --surface2:#1c2230; --border:#30363d;
+          --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --green:#3fb950;
+          --yellow:#d29922; --red:#f85149; --grey:#6e7681; --purple:#bc8cff; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'SF Mono','Cascadia Code',monospace; background:var(--bg);
+         color:var(--text); padding:18px 20px 60px; font-size:13px; }
+  a { color:var(--accent); text-decoration:none; }
+  .header { display:flex; justify-content:space-between; align-items:baseline;
+            margin-bottom:14px; gap:12px; flex-wrap:wrap; }
+  .header h1 { font-size:16px; }
+  .muted { color:var(--muted); }
+
+  /* ── the composer: new work goes in here ───────────────────────────── */
+  .new { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+         padding:12px 14px; margin-bottom:14px; }
+  .new .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  input, select, textarea, button {
+    font-family:inherit; font-size:12px; color:var(--text);
+    background:var(--surface2); border:1px solid var(--border); border-radius:6px;
+    padding:6px 8px; }
+  input:focus, select:focus, textarea:focus { outline:1px solid var(--accent); }
+  #f-title { flex:1 1 320px; }
+  #f-desc { width:100%; resize:vertical; min-height:44px; }
+  button { cursor:pointer; }
+  button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; font-weight:600; }
+  button.primary:hover { background:#2f81f7; }
+  button.ghost { background:transparent; }
+  button.danger { color:var(--red); }
+  .hint { font-size:10px; color:var(--muted); margin-top:6px; }
+
+  /* ── filters ───────────────────────────────────────────────────────── */
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .chip { padding:3px 10px; border-radius:11px; font-size:11px; cursor:pointer;
+          background:var(--surface); border:1px solid var(--border); color:var(--muted);
+          user-select:none; }
+  .chip:hover { border-color:var(--muted); }
+  .chip.on { color:var(--text); border-color:var(--accent); background:#12233f; }
+  .chip .n { opacity:.6; margin-left:4px; }
+  #f-search { flex:1 1 160px; min-width:140px; }
+
+  .sec { margin-bottom:20px; }
+  .sec > h2 { font-size:11px; color:var(--muted); text-transform:uppercase;
+              letter-spacing:.6px; margin-bottom:8px; }
+  details.drawer { border:1px solid var(--border); border-radius:8px;
+                   background:var(--surface); margin-bottom:8px; }
+  details.drawer > summary { cursor:pointer; padding:9px 12px; color:var(--muted);
+                             font-size:11px; list-style:none; user-select:none; }
+  details.drawer > summary::-webkit-details-marker { display:none; }
+  details.drawer > summary:hover { color:var(--text); }
+  details.drawer[open] > summary { border-bottom:1px solid var(--border); }
+  .drawer .body { padding:8px 10px 10px; }
+
+  /* ── cards ─────────────────────────────────────────────────────────── */
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+          padding:10px 12px; margin-bottom:6px; }
+  .card.held { border-left:3px solid var(--yellow); }
+  .card.folded { opacity:.72; }
+  .card .t { font-size:13px; font-weight:600; margin-bottom:3px; word-break:break-word; }
+  .card .d { color:var(--muted); font-size:11px; line-height:1.55; margin-bottom:6px;
+             white-space:pre-wrap; word-break:break-word; }
+  .meta { display:flex; gap:7px; flex-wrap:wrap; align-items:center;
+          font-size:10px; color:var(--muted); }
+  .pill { padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;
+          text-transform:uppercase; background:#1f2937; color:var(--muted); }
+  .pill-pending{color:var(--accent)} .pill-in_progress{color:var(--yellow);background:#2d1f00}
+  .pill-done{color:var(--green);background:#0d2818} .pill-blocked{color:var(--red);background:#2d1214}
+  .pill-cancelled{color:var(--grey)}
+  .owner { color:var(--text); }
+  .lock { color:var(--yellow); font-weight:700; }
+  .tag { background:#1b2434; color:#9ecbff; border-radius:4px; padding:1px 6px;
+         cursor:pointer; }
+  .tag:hover { background:#24314a; }
+  .tag.static { cursor:default; color:var(--muted); background:#161b22;
+                border:1px dashed var(--border); }
+  .sub { border-left:2px solid var(--border); margin-left:12px; padding-left:10px; }
+
+  /* ── the editor ────────────────────────────────────────────────────── */
+  .edit { display:none; margin-top:8px; padding-top:8px; border-top:1px dashed var(--border); }
+  .card.editing .edit { display:block; }
+  .card.editing .edit input, .card.editing .edit textarea,
+  .card.editing .edit select { width:100%; margin-bottom:6px; }
+  .edit .row { display:flex; gap:6px; flex-wrap:wrap; }
+  .edit .row > * { flex:0 0 auto; }
+  .edit .row input.taginput { flex:1 1 120px; }
+  .err { color:var(--red); font-size:11px; margin-top:6px; min-height:14px; }
+  .empty { color:var(--muted); padding:10px 2px; }
+  #toast { position:fixed; right:18px; bottom:18px; background:var(--surface2);
+           border:1px solid var(--border); border-radius:8px; padding:9px 14px;
+           font-size:12px; opacity:0; transition:opacity .18s; pointer-events:none;
+           max-width:420px; }
+  #toast.on { opacity:1; }
+  #toast.bad { border-color:var(--red); color:#ffb3ad; }
+</style></head><body>
+
+<div class="header">
+  <h1>chat-pool · task board</h1>
+  <div class="muted">
+    <label>เขียนในชื่อ <input id="f-app" size="10" style="width:110px"></label>
+    &nbsp;·&nbsp; <a href="/">← pool dashboard</a>
+  </div>
+</div>
+
+<div class="new">
+  <input id="f-title" placeholder="งานใหม่ — พิมพ์แล้วกด เพิ่ม">
+  <textarea id="f-desc" placeholder="รายละเอียด (ไม่บังคับ)"></textarea>
+  <div class="row">
+    <input id="f-status" list="dl-status" value="pending" size="12" title="สถานะ">
+    <input id="f-owner" placeholder="owner (เช่น hermes)">
+    <input id="f-tags" placeholder="tag1, tag2">
+    <button class="primary" id="b-new">เพิ่ม</button>
+    <button class="ghost" id="b-clear">ล้าง</button>
+  </div>
+  <datalist id="dl-status"></datalist>
+  <div class="hint">
+    พิมพ์สถานะเองได้ — ไม่ใช่แค่ done/todo: พิมพ์อะไรก็ได้ในช่องสถานะ (เช่น notice, icebox, wontfix)
+    ช่องนี้จะเดาให้จากสถานะที่มีอยู่ใน log · tag <b>crumb</b> = ของเล็กๆ เก็บไว้แต่พับออกจากหน้าหลัก
+  </div>
+</div>
+
+<div class="bar">
+<div id="chips" class="bar" style="margin:0"></div>
+<input id="f-search" placeholder="ค้นหา title / desc">
+<button class="ghost" id="b-all">แสดงทั้งหมด</button>
+<button class="ghost" id="b-sync" title="inbox → pool: เอาการ์ดฝั่ง inbox มาเป็น task (รวมถึง rename/re-tag ที่แก้ไว้)">⇥ sync inbox</button>
+<button class="ghost" id="b-pull" title="pool → inbox: เอาสิ่งที่แก้ฝั่งนี้กลับไปเขียนบนการ์ด">⇤ pull กลับ</button>
+<span class="muted" id="sync-msg"></span>
+</div>
+
+<div id="open"></div>
+<div id="fold"></div>
+<div class="err" id="err"></div>
+<div id="toast"></div>
+
+<script>
+const LABELS = {pending:'todo', in_progress:'ทำกำลัง', done:'done', blocked:'ติดขัด',
+                cancelled:'ยกเลิก'};
+const CORE = ['pending','in_progress','blocked','done','cancelled'];
+const WORK = ['pending','in_progress','blocked'];
+const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let ALL = [], SUM = null, FILTER = {status:'', tag:'', q:'', showAll:false};
+
+const appEl = document.getElementById('f-app');
+appEl.value = localStorage.getItem('pool.app') || 'board-ui';
+appEl.onchange = () => localStorage.setItem('pool.app', appEl.value.trim());
+const myApp = () => (appEl.value.trim() || 'board-ui');
+
+function toast(msg, bad){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'on' + (bad ? ' bad' : '');
+  clearTimeout(toast._t); toast._t = setTimeout(()=>t.className='', 3200);
+}
+async function api(path, body){
+  const r = await fetch(path, body ? {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body: JSON.stringify(body)} : {});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error || (r.status + ' ' + r.statusText));
+  return j;
+}
+
+// ── status vocabulary: derived from the log, suggested but never enforced.
+//    The field stays a text input on purpose — a <select> would make "a status I
+//    have not thought of yet" impossible to reach, and that is the whole request.
+const STATUS_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
+function cleanStatus(v){
+  const s = (v||'').trim().toLowerCase();
+  return STATUS_RE.test(s) ? s : '';
+}
+function fillStatuses(){
+  const known = [...new Set([...CORE, ...((SUM && SUM.statuses) || [])])];
+  document.getElementById('dl-status').innerHTML =
+    known.map(s => `<option value="${esc(s)}">${esc(LABELS[s]||s)}</option>`).join('');
+  const f = document.getElementById('f-status');
+  f.value = (!f.dataset.touched || !cleanStatus(f.value)) ? 'pending' : cleanStatus(f.value);
+}
+document.getElementById('f-status').addEventListener('input', e => e.target.dataset.touched = '1');
+
+// ── filters ─────────────────────────────────────────────────────────────
+function match(t){
+  if(FILTER.status && t.status !== FILTER.status) return false;
+  if(FILTER.tag && !(t.tags||[]).includes(FILTER.tag)) return false;
+  if(FILTER.q){
+    const q = FILTER.q.toLowerCase();
+    if(!((t.title||'')+' '+(t.desc||'')).toLowerCase().includes(q)) return false;
+  }
+  return true;
+}
+// mirrors taskboard.task_open() exactly — a status the page has never seen is
+// NOT work by default, it is something somebody parked and will look at later
+const isOpen = t => WORK.includes(t.status) && !(t.tags||[]).includes('crumb');
+
+function chips(){
+  const counts = {}; ALL.forEach(t => counts[t.status] = (counts[t.status]||0)+1);
+  const tags = {};
+  ALL.forEach(t => (t.tags||[]).forEach(x => { if(!x.startsWith('src:')) tags[x]=(tags[x]||0)+1; }));
+  let h = `<span class="chip ${FILTER.status?'':'on'}" data-s="">ทั้งหมด<span class="n">${ALL.length}</span></span>`;
+  Object.keys(counts).sort((a,b)=>counts[b]-counts[a]).forEach(s => {
+    h += `<span class="chip ${FILTER.status===s?'on':''}" data-s="${esc(s)}">`+
+         `${esc(LABELS[s]||s)}<span class="n">${counts[s]}</span></span>`;
+  });
+  Object.keys(tags).sort((a,b)=>tags[b]-tags[a]).slice(0,14).forEach(t => {
+    h += `<span class="chip ${FILTER.tag===t?'on':''}" data-g="${esc(t)}">#${esc(t)}`+
+         `<span class="n">${tags[t]}</span></span>`;
+  });
+  const el = document.getElementById('chips');
+  el.innerHTML = h;
+  el.querySelectorAll('[data-s]').forEach(c => c.onclick = () => {
+    FILTER.status = c.dataset.s || ''; render();
+  });
+  el.querySelectorAll('[data-g]').forEach(c => c.onclick = () => {
+    FILTER.tag = (FILTER.tag === c.dataset.g) ? '' : c.dataset.g; render();
+  });
+}
+
+// ── one card ────────────────────────────────────────────────────────────
+function cardHTML(t, sub){
+  const h = t.hold || {};
+  const lock = h.held
+    ? `<span class="lock" title="ถูก @${esc(h.holder)} ถือไว้ — คนอื่นอ่านได้อย่างเดียว">🔒 ${h.free_in}s</span>` : '';
+  const who = t.owner ? `<span class="owner">@${esc(t.owner)}</span>` : '';
+  const tg = (t.tags||[]).map(x =>
+    `<span class="tag ${x.startsWith('src:')?'static':''}" data-tag="${esc(x)}"`+
+    (x.startsWith('src:') ? ` title="ผูกกับการ์ด inbox #${esc(x.slice(9))} — ลบไม่ได้"` : '')
+    +`>#${esc(x)}</span>`).join(' ');
+  return `<div class="card ${h.held?'held':''} ${sub?'folded':''}" data-id="${esc(t.id)}">`+
+    `<div class="t">${esc(t.title)}</div>`+
+    (t.desc ? `<div class="d">${esc(t.desc)}</div>` : '')+
+    `<div class="meta"><span class="pill pill-${esc(t.status)}">${esc(LABELS[t.status]||t.status)}</span>`+
+    `${who}${lock}<span>${esc(t.id)}</span>${tg}`+
+    (t.revs>1?`<span>rev ${t.revs}</span>`:'')+
+    `<span class="muted" style="cursor:pointer" data-edit="1">แก้ไข</span></div>`+
+    `<div class="edit">`+
+      `<input class="e-title" value="${esc(t.title)}" placeholder="ชื่อการ์ด">`+
+      `<textarea class="e-desc" placeholder="รายละเอียด">${esc(t.desc||'')}</textarea>`+
+      `<div class="row"><input class="e-status" list="dl-status" value="${esc(t.status)}" size="12" title="สถานะ">`+
+      `<input class="e-owner" placeholder="owner" value="${esc(t.owner||'')}" size="10">`+
+      `<input class="e-tags" placeholder="tag1, tag2" value="${esc((t.tags||[]).join(', '))}" size="22">`+
+      `<button class="primary e-save">บันทึก</button>`+
+      `<button class="ghost e-close">ยกเลิก</button></div>`+
+      `<div class="err e-err"></div></div></div>`;
+}
+
+
+function render(){
+  chips();
+  const kept = ALL.filter(match);
+  const ids = new Set(kept.map(t => t.id));
+  const kids = {};
+  kept.forEach(t => (kids[t.parent||''] = kids[t.parent||'']||[]).push(t));
+  function draw(t){
+    const below = (kids[t.id]||[]).map(draw).join('');
+    return cardHTML(t, !!t.parent) + (below ? `<div class="sub">${below}</div>` : '');
+  }
+
+  const openT = kept.filter(isOpen);
+  const foldT = kept.filter(t => !isOpen(t));
+  // a root renders its whole subtree; a child whose parent is folded away is
+  // still work, so it gets promoted rather than disappearing with its parent
+  const tops = openT.filter(t => !t.parent || !ids.has(t.parent));
+  const openEl = document.getElementById('open');
+  const foldEl = document.getElementById('fold');
+
+  openEl.innerHTML = `<div class="sec"><h2>กำลังทำ · ${openT.length}</h2>`+
+    (tops.length ? tops.map(draw).join('')
+                 : `<div class="empty">ไม่มีงานค้าง — เพิ่มงานใหม่ด้านบน</div>`)+
+    `</div>`;
+
+  // the kept-and-parked half: real, readable, one click — never the whole page.
+  // crumb wins over status so a crumb that also says done is not listed twice.
+  const has = (t,x) => (t.tags||[]).includes(x);
+  const buckets = [
+    ['ของเล็กๆ · crumb',        foldT.filter(t => has(t,'crumb'))],
+    ['เสร็จแล้ว / ยกเลิก',     foldT.filter(t => !has(t,'crumb') && (t.status==='done'||t.status==='cancelled'))],
+    ['สถานะอื่น · notice และเพื่อนบ้าน',
+                                foldT.filter(t => !has(t,'crumb') && t.status!=='done' && t.status!=='cancelled')],
+  ].filter(([,l]) => l.length);
+
+  foldEl.innerHTML = `<div class="sec"><h2>เก็บไว้ · ${foldT.length}</h2>`+
+    (buckets.length ? buckets.map(([name,list]) =>
+      `<details class="drawer"><summary>▸ ${esc(name)} — ${list.length} รายการ</summary>`+
+      `<div class="body">${list.map(draw).join('')}</div></details>`).join('')
+     : `<div class="empty">ยังไม่มีอะไรในคลัง</div>`)+
+    `</div>`;
+  bind();
+}
+
+// ── writing ─────────────────────────────────────────────────────────────
+function bind(){
+  document.querySelectorAll('.card').forEach(el => {
+    const id = el.dataset.id;
+    el.querySelectorAll('[data-tag]').forEach(tg => tg.onclick = e => {
+      if(tg.classList.contains('static')) return;
+      FILTER.tag = tg.dataset.tag; render();
+    });
+    const edit = el.querySelector('[data-edit]');
+    if(edit) edit.onclick = () => el.classList.toggle('editing');
+    el.querySelector('.e-close').onclick = () => el.classList.remove('editing');
+    el.querySelector('.e-save').onclick = async () => {
+      const err = el.querySelector('.e-err');
+      err.textContent = '';
+      const raw = el.querySelector('.e-tags').value;
+      const st = cleanStatus(el.querySelector('.e-status').value);
+      if(!st){ err.textContent = 'สถานะต้องเป็น a-z 0-9 _ - ไม่เกิน 24 ตัว'; return; }
+      const now = ALL.find(t => t.id === id) || {tags:[]};
+      const have = new Set(now.tags || []);
+      const want = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      try {
+        await api('/task/update', {
+          app: myApp(), id,
+          title: el.querySelector('.e-title').value,
+          desc: el.querySelector('.e-desc').value,
+          status: st,
+          owner: el.querySelector('.e-owner').value,
+          add_tags: want.filter(x => !have.has(x)),
+          remove_tags: [...have].filter(x => !want.includes(x)),
+        });
+        toast('บันทึกแล้ว · ' + id);
+        await load();
+      } catch(ex){ err.textContent = ex.message; toast(ex.message, true); }
+    };
+  });
+}
+
+document.getElementById('b-new').onclick = async () => {
+  const title = document.getElementById('f-title').value.trim();
+  if(!title){ document.getElementById('f-title').focus(); return; }
+  const errEl = document.getElementById('err');
+  const st = cleanStatus(document.getElementById('f-status').value);
+  if(!st){
+    errEl.textContent = 'สถานะต้องเป็น a-z 0-9 _ - ไม่เกิน 24 ตัว (เช่น notice)';
+    document.getElementById('f-status').focus(); return;
+  }
+  errEl.textContent = '';
+  try {
+    await api('/task', {app: myApp(), title,
+      desc: document.getElementById('f-desc').value.trim(),
+      status: st,
+      owner: document.getElementById('f-owner').value.trim(),
+      tags: document.getElementById('f-tags').value});
+    ['f-title','f-desc','f-owner','f-tags'].forEach(i => document.getElementById(i).value='');
+    toast('เพิ่มแล้ว'); await load();
+  } catch(ex){ toast(ex.message, true); errEl.textContent = ex.message; }
+};
+document.getElementById('b-clear').onclick = () =>
+  ['f-title','f-desc','f-owner','f-tags'].forEach(i => document.getElementById(i).value='');
+document.getElementById('b-all').onclick = () => { FILTER.showAll = !FILTER.showAll; render(); };
+// ── inbox bridge: same rules as the CLI (inbox_bridge.py plan/apply/pull),
+// dry-run first is pointless behind a button — one click carries the edits
+// (status + rename + re-tag + body) and reports what moved.
+async function bridge(path, verb){
+const el = document.getElementById('sync-msg');
+el.textContent = verb + '…';
+try {
+const r = await api(path, {apply: true});
+const bits = [];
+if(r.imported) bits.push('ใหม่ ' + r.imported);
+if(r.updated) bits.push('อัพเดท ' + r.updated);
+if(r.pulled) bits.push('ดึงกลับ ' + r.pulled);
+if(r.skipped) bits.push('ข้าม ' + r.skipped);
+if(r.conflicts) bits.push('ชน ' + r.conflicts);
+el.textContent = bits.length ? bits.join(' · ') : 'ตรงกันแล้ว — ไม่มีอะไรขยับ';
+toast(el.textContent);
+await load();
+} catch(ex){ el.textContent = ex.msg; toast(ex.msg, true); }
+}
+document.getElementById('b-sync').onclick = () => bridge('/tasks/sync', 'sync inbox → pool');
+document.getElementById('b-pull').onclick = () => bridge('/tasks/pull', 'pull pool → inbox');
+document.getElementById('f-search').oninput = e => {
+  FILTER.q = e.target.value.trim(); render();
+};
+document.getElementById('f-title').onkeydown = e => { if(e.key === 'Enter') b_new.click(); };
+
+// typing a status that does not exist yet is the whole point of an open vocabulary
+document.getElementById('f-title').onkeydown = e => { if(e.key === 'Enter') b_new.click(); };
+
+async function load(){
+  const j = await api('/tasks');
+  ALL = j.tasks || []; SUM = j.summary || null; fillStatuses(); render();
+}
+load().catch(e => toast('โหลดไม่สำเร็จ: ' + e.message, true));
+</script></body></html>

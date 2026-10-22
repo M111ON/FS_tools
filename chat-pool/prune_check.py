@@ -36,7 +36,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # which is exactly how these two suites died when `ws_bridge` was wired in and
 # this tuple was not updated with it.
 COPIES = ("pool.py", "pool_server.py", "ctx_plane.py", "taskboard.py",
-          "ws_bridge.py", "pool_cloud.py")
+          "ws_bridge.py", "pool_cloud.py", "inbox_bridge.py", "tasks_ui.html")
 
 
 def local_imports(start="pool_server.py"):
