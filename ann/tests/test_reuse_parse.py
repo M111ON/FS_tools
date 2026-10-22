@@ -113,11 +113,18 @@ def srv_start():
 
 
 def wait_loader_settled(prev_text):
-    """Wait until the loader has parsed+swapped whatever the file now is."""
-    for _ in range(80):
+    """Wait until the loader has parsed AND swapped in whatever the file now is.
+
+    The three loader markers fire in order: loader_parse_start (parse began,
+    ~0.8 s on 400 rows), loader_swap_lock (about to take the lock), reload
+    (swap done, stamps re-applied). Only "reload" proves the new buffer is
+    live — returning on the earlier markers races the swap and the borrow
+    would (by design) miss.
+    """
+    for _ in range(100):
         time.sleep(0.25)
         t = diag()
-        if t.count("loader_parse_start") > prev_text.count("loader_parse_start"):
+        if t.count("reload ") > prev_text.count("reload "):
             time.sleep(0.5)
             return diag()
     return diag()

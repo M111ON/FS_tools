@@ -3127,17 +3127,21 @@ regrow_done:
      *
      * INVALIDATE ONLY WHAT ACTUALLY CHANGED (2026-10-22). A successful regrow
      * rewrites the anchors table and the order file but never the jsonl — the
-     * fruit stays put — so the loader's index buffer is still valid:
-     * invalidating it freed the loader's buffer under it AND forced a third
-     * parse of the same unchanged 258 MB file. Only the route caches (which
-     * key on the anchors/order mtime) go. The fresh stamps reach the buffer
-     * through the loader's own sidecar watcher within its next tick.
-     * A self-parsed run (borrow missed because the file's mtime/size moved)
-     * keeps the old behaviour: its cache snapshot is stale, so drop it. */
-    if (rc == 0) {
-        lz_route_cache_invalidate();
-        if (!borrowed) lz_index_cache_invalidate();
-    }
+     * fruit stays put — so the loader's index buffer is still valid: only the
+     * route caches (which key on the anchors/order mtime) go. The fresh
+     * stamps reach the buffer through the loader's own sidecar watcher.
+     *
+     * NEVER call lz_index_cache_invalidate() here. The loader's thread checks
+     * mtime+size against the file on its own tick (loader_thread 853): a
+     * stale or NULL cache is rebuilt without being told, and a self-parsed
+     * run's rows are freed by this function, never by the cache path.
+     * Invalidating was a THIRD parse of the same file: regrow_done fired it
+     * right after regrow's own parse (both of the identical mtime/size), so
+     * the loader re-parsed the exact bytes it already had. Live evidence:
+     * ann_index.jsonl.loader.log regrow_done ts=...2623 followed by
+     * loader_parse_start ts=...2624 with reload entries/mtime/size equal to
+     * the previous reload's. */
+    if (rc == 0) lz_route_cache_invalidate();
     if (a && !borrowed) lz_index_free(a, n);
     return rc;
 }
