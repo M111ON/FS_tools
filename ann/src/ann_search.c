@@ -471,6 +471,10 @@ static int g_amp_applied = 0;              /* entries whose bias was boosted (te
 static int g_backward = 0;                 /* ANN_GRAFT_BACKWARD: expand candidates via in-edges */
 static int g_graft_buckets = 0;            /* ANN_GRAFT_BUCKETS: add graph-endorsed buckets to the anchor route */
 
+static unsigned _fnv(const char *s);
+static void lz_tags_ensure(LZEntry *ents, int nent);
+static void lz_tags_free(void);
+
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -605,6 +609,9 @@ static int lz_index_load(LZEntry **out, int *n_out) {
     g_stamp_live = 0;
     for (int i = 0; i < n; i++)
         if (a[i].anchor >= 0) g_stamp_live++;
+    /* the tag sidecar labels THESE rows (sid-keyed, so a stale sidecar
+     * cannot silently mislabel a row) */
+    lz_tags_ensure(a, n);
     *out = a; *n_out = n;
     return 0;
 }
@@ -628,6 +635,7 @@ static void lz_index_free(LZEntry *a, int n) {
     free(g_inv);
     g_inv = NULL;
     g_inv_n = 0;
+    lz_tags_free();
 }
 /* index cache: load-once, reload on mtime/size change (single-threaded). */
 static LZEntry *g_idx_cache = NULL;
@@ -643,6 +651,9 @@ static int lz_index_cached(LZEntry **out, int *n_out) {
     if (stat(PATH_INDEX, &st) == 0) {
         long mt = (long)st.st_mtime, sz = (long)st.st_size;
         if (g_idx_cache && mt == g_idx_mtime && sz == g_idx_size) {
+            /* the tag sidecar can be re-baked without the index changing, so
+             * it is checked on EVERY use, not only on an index reload */
+            lz_tags_ensure(g_idx_cache, g_idx_n);
             *out = g_idx_cache; *n_out = g_idx_n; return 1;
         }
         lz_index_cache_invalidate();
@@ -731,10 +742,236 @@ static inline double lz_dot(const float *a, const float *b, int d) {
     return s;
 }
 
+/* ── tag scope ──────────────────────────────────────────────────────────
+ * A row's KIND is its file tag up to the first '/' ("exchange/xyz" ->
+ * "exchange"). The scope is the request's "scope" field: either a kind
+ * ("exchange") or a file ("chatlog/20261021_110617_2d9008"). */
+static int lz_is_kind(const char *file, const char *kind) {
+    size_t kl = strlen(kind);
+    if (strncmp(file, kind, kl) != 0) return 0;
+    return file[kl] == '/' || file[kl] == '\0';
+}
+
+/* ── TAG SIDECAR (2026-10-21) ────────────────────────────────────────────
+ * scripts/tag_lut.py bakes a FROZEN tag->zone LUT over the index and writes
+ * a SID-KEYED sidecar "<sid>\t<tag>\t<zone>". Sid-keyed, never positional:
+ * a positional sidecar cannot be verified against the index it labels and
+ * drifts silently (the S9 lesson from 2026-10-20).
+ *
+ * The tag is the semantic zone (memcore's `pattern`: chatpool, hermes,
+ * architecture, project_rules, constraints, ...) which SPANS sessions — the
+ * `file` tag (kind/term_hint) cannot express it, because one session writes
+ * into many files and one file collects many sessions.
+ *
+ * A scoped query can therefore ask for a ZONE:
+ *   scope="tag:architecture"  -> the rows whose tag is architecture
+ *   scope="zone:3"            -> the rows of zone 3 (the frozen coordinate)
+ * Both bypass the route layer exactly like the file scope does: the group is
+ * derived from the rows themselves, so it cannot drift from the index. */
+#define LZ_MAX_TAGS 64
+static char g_tag_name[LZ_MAX_TAGS][64];
+static int  g_tag_n = 0;
+static int *g_ent_tag = NULL;      /* [nent] tag id per row, -1 = unlabeled */
+static int *g_ent_zone = NULL;     /* [nent] zone id per row, -1 = none */
+static int  g_ent_tag_n = 0;
+static int  g_tag_unlabeled = 0;
+static int *g_tag_sid_hash = NULL; /* sid -> row index (open addressing) */
+static int  g_tag_sid_cap = 0;
+static LZEntry *g_tag_ents_ref = NULL;
+static char g_tag_path[600] = "";
+static long g_tag_mtime = 0;
+static long g_tag_size = 0;
+
+static int lz_tag_intern(const char *name) {
+    for (int i = 0; i < g_tag_n; i++)
+        if (strcmp(g_tag_name[i], name) == 0) return i;
+    if (g_tag_n >= LZ_MAX_TAGS) return -1;
+    snprintf(g_tag_name[g_tag_n], sizeof(g_tag_name[0]), "%s", name);
+    return g_tag_n++;
+}
+
+static void lz_tag_build_sid_hash(LZEntry *ents, int nent) {
+    free(g_tag_sid_hash); g_tag_sid_hash = NULL; g_tag_sid_cap = 0;
+    g_tag_ents_ref = ents;
+    int cap = 1; while (cap < (nent ? nent : 1) * 2) cap <<= 1;
+    g_tag_sid_cap = cap;
+    g_tag_sid_hash = (int *)malloc((size_t)cap * sizeof(int));
+    for (int i = 0; i < cap; i++) g_tag_sid_hash[i] = -1;
+    for (int e = 0; e < nent; e++) {
+        unsigned m = (unsigned)cap - 1, i = _fnv(ents[e].sid) & m;
+        for (unsigned k = 0; k < (unsigned)cap; k++) {
+            unsigned s = (i + k) & m;
+            if (g_tag_sid_hash[s] < 0) { g_tag_sid_hash[s] = e; break; }
+        }
+    }
+}
+
+static int lz_tag_sid_pos(const char *sid) {
+    if (!g_tag_sid_hash || !g_tag_ents_ref) return -1;
+    unsigned m = (unsigned)g_tag_sid_cap - 1, i = _fnv(sid) & m;
+    for (unsigned k = 0; k < (unsigned)g_tag_sid_cap; k++) {
+        unsigned s = (i + k) & m;
+        if (g_tag_sid_hash[s] < 0) return -1;
+        if (strcmp(g_tag_ents_ref[g_tag_sid_hash[s]].sid, sid) == 0)
+            return g_tag_sid_hash[s];
+    }
+    return -1;
+}
+
+static void lz_tags_free(void) {
+    free(g_ent_tag); g_ent_tag = NULL;
+    free(g_ent_zone); g_ent_zone = NULL;
+    g_ent_tag_n = 0;
+    free(g_tag_sid_hash); g_tag_sid_hash = NULL; g_tag_sid_cap = 0;
+    g_tag_ents_ref = NULL;
+    g_tag_unlabeled = 0;
+}
+
+/* the sidecar path: env ANN_TAGS_PATH, else next to the index it labels */
+static void lz_tag_path(char *out, size_t cap) {
+    const char *tp = getenv("ANN_TAGS_PATH");
+    if (tp && tp[0]) { snprintf(out, cap, "%s", tp); return; }
+    const char *slash = strrchr(PATH_INDEX, '/');
+    const char *bslash = strrchr(PATH_INDEX, '\\');
+    const char *cut = (slash && (!bslash || slash > bslash)) ? slash : bslash;
+    if (cut) snprintf(out, cap, "%.*sann_tags.tsv", (int)(cut - PATH_INDEX + 1), PATH_INDEX);
+    else snprintf(out, cap, "ann_tags.tsv");
+}
+
+static void lz_tags_load(LZEntry *ents, int nent) {
+    lz_tags_free();
+    g_ent_tag_n = nent;
+    g_ent_tag = (int *)malloc((size_t)(nent ? nent : 1) * sizeof(int));
+    g_ent_zone = (int *)malloc((size_t)(nent ? nent : 1) * sizeof(int));
+    for (int i = 0; i < nent; i++) { g_ent_tag[i] = -1; g_ent_zone[i] = -1; }
+    char path[600];
+    lz_tag_path(path, sizeof(path));
+    snprintf(g_tag_path, sizeof(g_tag_path), "%s", path);
+    struct stat ss;
+    g_tag_mtime = (stat(path, &ss) == 0) ? (long)ss.st_mtime : 0;
+    g_tag_size = (stat(path, &ss) == 0) ? (long)ss.st_size : 0;
+    FILE *f = fopen(path, "r");
+    if (!f) { g_tag_unlabeled = nent; return; }
+    lz_tag_build_sid_hash(ents, nent);
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        char *tag = tab + 1;
+        char *tab2 = strchr(tag, '\t');
+        int zone = -1;
+        if (tab2) { *tab2 = '\0'; zone = atoi(tab2 + 1); }
+        size_t tl = strlen(tag);
+        while (tl && (tag[tl - 1] == '\n' || tag[tl - 1] == '\r')) tag[--tl] = '\0';
+        if (!tag[0]) continue;
+        int pos = lz_tag_sid_pos(line);
+        if (pos < 0) continue;
+        int tid = lz_tag_intern(tag);
+        if (tid < 0) continue;
+        g_ent_tag[pos] = tid;
+        g_ent_zone[pos] = zone;
+    }
+    fclose(f);
+    g_tag_unlabeled = 0;
+    for (int i = 0; i < nent; i++) if (g_ent_tag[i] < 0) g_tag_unlabeled++;
+}
+
+/* reload only when the sidecar or the index actually moved */
+static void lz_tags_ensure(LZEntry *ents, int nent) {
+    if (g_ent_tag && g_ent_tag_n == nent && g_tag_ents_ref == ents) {
+        char path[600];
+        lz_tag_path(path, sizeof(path));
+        struct stat ss;
+        if (stat(path, &ss) == 0 &&
+            (long)ss.st_mtime == g_tag_mtime && (long)ss.st_size == g_tag_size &&
+            strcmp(path, g_tag_path) == 0)
+            return;
+    }
+    lz_tags_load(ents, nent);
+}
+
+/* Resolve a scope against the loaded rows into the pattern the walk will
+ * match: 1 = exact file, 2 = kind. Falls from file to kind when the file
+ * group cannot hold topk rows (the chain measured in bench_tag_filter.py).
+ * Returns 0 when the scope matches nothing (handler answers 400
+ * scope_not_found) and -1 when it matches fewer than topk rows in either
+ * grouping (400 scope_too_narrow) — a narrow scope is never silently
+ * widened past kind. */
+static int lz_scope_resolve(const LZEntry *ents, int nent, const char *scope,
+                            int topk, char *pat, size_t pcap,
+                            int *fine_out, int *kind_out,
+                            int *tag_out, int *zone_out) {
+    if (tag_out) *tag_out = -1;
+    if (zone_out) *zone_out = -1;
+    /* kbuf/spat must hold the WHOLE tag in BYTES: a Thai file tag of 57
+     * chars is ~127 bytes, and a 64-byte pattern truncated mid-codepoint
+     * matched no row at all — the walk then got an empty array with the
+     * index length as its bound (measured: mode "anchor", items_scored 1,
+     * budget 0, one out-of-scope hit). Scope strings are <= 255 bytes. */
+    char kbuf[256];
+    int fine = 0, nk = 0;
+    /* ZONE scope: "tag:<name>" (the semantic tag) or "zone:<id>" (the frozen
+     * coordinate from the same bake). A zone is NEVER widened: it is a
+     * closed group, so a zone that cannot hold topk rows is a 400, not a
+     * silently broader answer. */
+    if (strncmp(scope, "tag:", 4) == 0) {
+        const char *nm = scope + 4;
+        int tid = -1;
+        for (int i = 0; i < g_tag_n; i++)
+            if (strcmp(g_tag_name[i], nm) == 0) { tid = i; break; }
+        int cnt = 0;
+        for (int i = 0; i < nent; i++) if (g_ent_tag[i] == tid) cnt++;
+        if (fine_out) *fine_out = cnt;
+        if (kind_out) *kind_out = 0;
+        if (tid < 0 || cnt == 0) { if (pcap) pat[0] = '\0'; return 0; }
+        if (cnt < topk) return -1;
+        if (tag_out) *tag_out = tid;
+        if (zone_out) *zone_out = -1;
+        if (pcap) snprintf(pat, pcap, "%s", nm);
+        return 3;
+    }
+    if (strncmp(scope, "zone:", 5) == 0 && scope[5] >= '0' && scope[5] <= '9') {
+        int z = atoi(scope + 5);
+        int cnt = 0;
+        for (int i = 0; i < nent; i++) if (g_ent_zone[i] == z) cnt++;
+        if (fine_out) *fine_out = cnt;
+        if (kind_out) *kind_out = 0;
+        if (cnt == 0) { if (pcap) pat[0] = '\0'; return 0; }
+        if (cnt < topk) return -1;
+        if (tag_out) *tag_out = -1;
+        if (zone_out) *zone_out = z;
+        if (pcap) snprintf(pat, pcap, "%d", z);
+        return 4;
+    }
+    const char *slash = strchr(scope, '/');
+    int kl = slash ? (int)(slash - scope) : (int)strlen(scope);
+    if (kl < 0) kl = 0;
+    if (kl > (int)sizeof(kbuf) - 1) kl = (int)sizeof(kbuf) - 1;
+    memcpy(kbuf, scope, (size_t)kl);
+    kbuf[kl] = '\0';
+    for (int i = 0; i < nent; i++) {
+        if (strcmp(ents[i].file, scope) == 0) fine++;
+        if (lz_is_kind(ents[i].file, kbuf)) nk++;
+    }
+    if (fine_out) *fine_out = fine;
+    if (kind_out) *kind_out = nk;
+    if (fine == 0 && nk == 0) { if (pcap) pat[0] = '\0'; return 0; }
+    if (!slash) {                       /* bare scope = a kind request */
+        snprintf(pat, pcap, "%s", kbuf);
+        return nk >= topk ? 2 : (fine >= topk ? 1 : -1);
+    }
+    if (fine >= topk) { snprintf(pat, pcap, "%s", scope); return 1; }
+    if (nk >= topk)   { snprintf(pat, pcap, "%s", kbuf); return 2; }
+    return -1;
+}
+
 /* ── lz-mem-search core (from L435-586, topk bound -> ANN_MAXK) ──
- * Returns hit count 0..topk, or -1 when the query is unusable. */
+ * Returns hit count 0..topk, or -1 when the query is unusable.
+ * `scope` (may be NULL) hard-restricts the walk to the rows sharing one tag
+ * — see lz_scope_resolve; an empty walk is served as mode "scope-miss". */
 static int lz_mem_search(const float *qv, int qd,
-                         const char *sid_filter, int topk,
+                         const char *sid_filter, const char *scope, int topk,
                          char top_sid[][64], char top_file[][256],
                          int top_np[], double top_sc[],
                          char route_mode[16], int route_bk[], int *route_nb_out,
@@ -773,6 +1010,8 @@ static int lz_mem_search(const float *qv, int qd,
     int rnb = 0, breads = 1, scored = 0;
     int truncated = 0;
     int fallback = 0;
+    int scope_n = 0;      /* rows in the scoped walk; 0 = no scope (param "scope") */
+    int scope_bad = 0;    /* scope given but unresolvable now -> scope-miss */
     int budget = LZ_SEARCH_BUDGET_DEF;
     int cap = 0;
     /* Budget resolution, in order:
@@ -857,6 +1096,64 @@ static int lz_mem_search(const float *qv, int qd,
         int routed = 0, K = 0;
         int dead_route = 0;
         int route_ok = (lz_route_cached(nent) && g_anch_dim == qd);
+        /* ── TAG SCOPE (2026-10-21, request field "scope") ────────────────
+         * The walk becomes the rows of one tag instead of a routed subset.
+         * Measured (bench_tag_filter.py, 300 self-excluded queries vs a
+         * numpy oracle): scoped candidates p50 254 rows against the 24000
+         * budget — 94x less work at the median — while the in-group best
+         * trails the global best by 0.0110 mean / 0.0000 median cosine. So
+         * the scope answers a NARROWER question on purpose (recall@5 vs the
+         * global oracle is 0.44 fine / 0.70 kind against the route's 0.91):
+         * this is a scope selector, never a substitute for global search.
+         * It never touches the route: no buckets, no tombstone latch, no
+         * order sidecar — the group is derived from the rows themselves, so
+         * it cannot drift from the index (the positional-sidecar hazard the
+         * 2026-10-20 fixes had to chase). A scope that resolves to nothing
+         * fails LOUD as "scope-miss" (empty hits) instead of serving an
+         * unscoped answer under a scoped request. */
+        if (scope && scope[0] && ents && nent > 0) {
+            char spat[256];
+            int scope_tag = -1, scope_zone = -1;
+            int r = lz_scope_resolve(ents, nent, scope, topk, spat, sizeof(spat),
+                                     NULL, NULL, &scope_tag, &scope_zone);
+            if (r > 0) {
+                int cnt = 0;
+                for (int i = 0; i < nent; i++)
+                    if ((r == 1 && strcmp(ents[i].file, spat) == 0) ||
+                        (r == 2 && lz_is_kind(ents[i].file, spat)) ||
+                        (r == 3 && g_ent_tag[i] == scope_tag) ||
+                        (r == 4 && g_ent_zone[i] == scope_zone)) cnt++;
+                uint32_t *arr = (uint32_t *)malloc((size_t)(cnt ? cnt : 1) * sizeof(uint32_t));
+                if (arr) {
+                    int w = 0;
+                    for (int i = 0; i < nent && w < cnt; i++)
+                        if ((r == 1 && strcmp(ents[i].file, spat) == 0) ||
+                            (r == 2 && lz_is_kind(ents[i].file, spat)) ||
+                            (r == 3 && g_ent_tag[i] == scope_tag) ||
+                            (r == 4 && g_ent_zone[i] == scope_zone))
+                            arr[w++] = (uint32_t)i;
+                    if (w > 0) {            /* never hand out an empty walk */
+                        ord_own = arr; ord = arr; scope_n = w;
+                        budget = w;
+                        /* a file scope that fell through to its kind is
+                         * labelled so; a bare kind request was scoped on
+                         * purpose; a zone keeps its own label */
+                        int widened = (r == 2 && strchr(scope, '/') != NULL);
+                        snprintf(rm, sizeof(rm), "%s",
+                                 r == 3 ? "scope+tag" :
+                                 (r == 4 ? "scope+zone" :
+                                  (r == 1 ? "scope" : (widened ? "scope+kind" : "scope"))));
+                    } else {
+                        free(arr);
+                        scope_bad = 1;
+                    }
+                } else {
+                    scope_bad = 1;
+                }
+            } else {
+                scope_bad = 1;
+            }
+        }
         /* DEAD ROUTE (2026-10-20): the routing table exists (anchors+order
          * are valid, so lz_route_cached says routed) but the rows carry no
          * stamps — the index was rebuilt by scripts/build_index.py and the
@@ -869,12 +1166,16 @@ static int lz_mem_search(const float *qv, int qd,
          * A FRESH index (no anchors yet, so no route) is NOT dead — it
          * simply has not been regrowed. */
         if (route_ok) dead_route = stamps_route_dead(nent);
-        if (dead_route) {
+        if (dead_route && !scope_n && !scope_bad) {
             rm[0] = 'd'; rm[1] = 'e'; rm[2] = 'a'; rm[3] = 'd';
             rm[4] = '-'; rm[5] = 'r'; rm[6] = 'o'; rm[7] = 'u';
             rm[8] = 't'; rm[9] = 'e'; rm[10] = '\0';
         }
-        if (route_ok && !dead_route) {
+        if (scope_n > 0 || scope_bad) {
+            /* the scoped walk (or the fail-loud empty walk) is final: the
+             * route layer is skipped entirely, so no bucket is routed, no
+             * tombstone latch is shut and the order sidecar is not read. */
+        } else if (route_ok && !dead_route) {
             C = g_anch_cache; ord = g_ord_cache; K = g_anch_k;
             int topb;
             { const char *beke = getenv("LZ_ROUTE_BUCKETS");
@@ -1033,6 +1334,7 @@ static int lz_mem_search(const float *qv, int qd,
          * entries — this is what makes the table steer the scored set.
          * (Ord order inside a bucket keeps block locality.) */
         walk = ord; nwalk = nent;
+        if (scope_n > 0) nwalk = scope_n;   /* the walk is the group, not the index */
         if (walk_prune && routed && rnb > 0 && ord && nent > 0) {
             pmem = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
             pseen = (unsigned char *)calloc((size_t)(nent ? nent : 1), 1);
@@ -1064,6 +1366,11 @@ static int lz_mem_search(const float *qv, int qd,
         breads = 0;
         int full2 = 0;      /* fallback pass: unrestricted full walk */
         cap = budget;
+        /* scope walks every row of the group by construction: one past the
+         * count so reaching the end is "done", not "cut by budget", and the
+         * reported budget stays the group size (not cap). */
+        if (scope_n > 0) cap = budget + 1;
+        if (scope_bad) { budget = 0; cap = 0; }
         for (;;) {
         for (int oi = 0; walk && oi < nwalk; oi++) {
             int ei = (int)walk[oi];
@@ -1131,7 +1438,8 @@ static int lz_mem_search(const float *qv, int qd,
             }
         }
         /* confidence fallback: pruned top below floor -> full scan once */
-        if (walk_prune && !full2 && walk_floor > 0.0 && top_sc[0] < walk_floor) {
+        if (walk_prune && !full2 && !scope_n && !scope_bad &&
+            walk_floor > 0.0 && top_sc[0] < walk_floor) {
             /* ── TOMBSTONE DOOR (env ANN_DOOR=1, 2026-10-20) ─────────────
              * The user's architecture: a tombstone that is SHUT is a pinned
              * door to its bucket's members ("apple fruit mini db"). When the
@@ -1364,7 +1672,7 @@ static int lz_mem_search(const float *qv, int qd,
     if (block_reads_out) *block_reads_out = breads;
     if (items_scored_out) *items_scored_out = scored;
     if (nent_out) *nent_out = nent;
-    if (budget_out) *budget_out = cap;
+    if (budget_out) *budget_out = (scope_n > 0) ? budget : cap;
     if (truncated_out) *truncated_out = truncated;
     if (fallback_out) *fallback_out = fallback;
     if (us_per_item_out) *us_per_item_out = us_per_item;
@@ -2589,14 +2897,22 @@ static int handle_health(sock_t cli) {
      * (\t, \a, \k are not legal escapes). */
     char esc[512];
     lz_json_escape(esc, sizeof(esc), PATH_INDEX);
-    char b[900];
+    char b[1100];
+    /* TAG SIDECAR truth (2026-10-21): a stale sidecar would silently narrow a
+     * tag scope, so the health must say how many rows carry a tag and how
+     * many are unlabeled (a sidecar older than the index). */
+    char tescp[600];
+    lz_json_escape(tescp, sizeof(tescp), g_tag_path[0] ? g_tag_path : "(none)");
+    int tagged_rows = (nent > g_tag_unlabeled) ? (nent - g_tag_unlabeled) : 0;
     int bl = snprintf(b, sizeof(b),
         "{\"status\":\"%s\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
         "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"stamps_live\":%d,"
         "\"route_dead\":%d,\"maxk\":%d,\"embed\":\"%s\","
+        "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
         "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, embed_ok ? "ok" : "down",
+        tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
         g_fog_replayed, sh, (unsigned)WL_FREE);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
@@ -2635,6 +2951,7 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
     char sq[2048] = "";
     int stopk = 3;
     char sid_filter[64] = "";
+    char scope_buf[256] = "";
     const char *qp = strstr(bd3, "\"query\"");
     if (qp) {
         qp = strchr(qp + 7, ':');
@@ -2674,6 +2991,18 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             }
         }
     }
+    {
+        const char *scp = lz_json_val(bd3, "scope");
+        if (scp && *scp == '"') {
+            /* unescape like the query text does: a file tag is free text and
+             * arrives as \uXXXX (Python) or with escapes (any JSON writer).
+             * Reading it raw silently matched NOTHING — the scope then fell
+             * through to its kind (measured: 718-row group reported as
+             * 29153 kind rows for a Thai tag). */
+            scp++;
+            lz_json_unescape(scope_buf, (int)sizeof(scope_buf), scp);
+        }
+    }
     if (stopk < 1) stopk = 1;
     if (stopk > ANN_MAXK) {
         char eb[160];
@@ -2683,6 +3012,35 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         lz_http_send(cli, "400 Bad Request", "application/json", eb, el);
         sock_close(cli);
         return 0;
+    }
+    /* a scope is validated BEFORE searching: unknown tag -> 400
+     * scope_not_found, a tag too thin to hold topk -> 400 scope_too_narrow.
+     * Never fall through to an unscoped answer under a scoped request. */
+    if (scope_buf[0]) {
+        LZEntry *sve = NULL;
+        int svn = 0, fine_n = 0, kind_n = 0;
+        char spat[256], esc[600];
+        if (!lz_index_cached(&sve, &svn)) {
+            const char *eb = "{\"status\":\"error\",\"error\":\"index_unavailable\","
+                             "\"detail\":\"the index could not be loaded\"}";
+            lz_http_send(cli, "503 Service Unavailable", "application/json", eb, (int)strlen(eb));
+            sock_close(cli);
+            return 0;
+        }
+        int sr = lz_scope_resolve(sve, svn, scope_buf, stopk, spat, sizeof(spat),
+                                  &fine_n, &kind_n, NULL, NULL);
+        if (sr <= 0) {
+            char eb[512];
+            lz_json_escape(esc, sizeof(esc), scope_buf);
+            int el = snprintf(eb, sizeof(eb),
+                "{\"status\":\"error\",\"error\":\"%s\","
+                "\"scope\":\"%s\",\"fine\":%d,\"kind\":%d,\"topk\":%d}",
+                sr == 0 ? "scope_not_found" : "scope_too_narrow",
+                esc, fine_n, kind_n, stopk);
+            lz_http_send(cli, "400 Bad Request", "application/json", eb, el);
+            sock_close(cli);
+            return 0;
+        }
     }
     static char sresp[16384];
     int srlen = 0;
@@ -2702,7 +3060,7 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         int items_scored = 0, nent = 0, budget = 0, truncated = 0, fallback = 0;
         double us_per_item = 0;
         LZFog fog = { (int)WL_FREE, 0, 0, 0 };
-        lz_mem_search(qv, qd, sid_filter, stopk,
+        lz_mem_search(qv, qd, sid_filter, scope_buf, stopk,
             top_sid, top_file, top_np, top_sc,
             route_mode, route_bk, &route_nb,
             &block_reads, &items_scored, &nent,

@@ -33,7 +33,8 @@ CFLAGS = ["-O2", "-std=c11", "-Wall", "-Wno-unused-parameter", "-Wno-sign-compar
 # C tests: (name, extra libs)
 C_TESTS = ["test_anchor_route", "test_anchor_routed", "test_wang_latch"]
 # python tests (need numpy unless noted)
-PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py"]
+PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py",
+            "tests/test_scope.py", "tests/test_tag_lut.py"]
 
 
 def run(name, cmd, cwd=HERE):
