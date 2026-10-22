@@ -2809,6 +2809,7 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
     LZEntry *a = NULL;
     int n = 0;
     int borrowed = 0;   /* 1 = a/n point at the loader's buffer (do NOT free) */
+    int published = 0;  /* 1 = this regrow's own parse became the served buffer */
     LARGE_INTEGER qf;
     LARGE_INTEGER t_load0, t_load_end, t_train0, t_train1;
     QueryPerformanceFrequency(&qf);
@@ -3228,7 +3229,50 @@ regrow_done:
      * loader_parse_start ts=...2624 with reload entries/mtime/size equal to
      * the previous reload's. */
     if (rc == 0) lz_route_cache_invalidate();
-    if (a && !borrowed) lz_index_free(a, n);
+    /* PUBLISH THE FRESH PARSE (2026-10-22). When the borrow missed, the
+     * regrow had to parse the jsonl ITSELF — that parse IS the current
+     * index (same bytes the loader would parse next tick). Throwing it
+     * away cost two things:
+     *   1. a SECOND parse of the same file (the loader's tick re-parses
+     *      the 258 MB index — ~50 s on this box) for bytes already parsed;
+     *   2. a STALE SERVED BUFFER in between: the server kept answering
+     *      with the old row count while the freshly trained route table
+     *      carried the new one (antr != nent -> "routed=0" -> brute
+     *      fallback, and the new rows were not served at all).
+     * So the regrow's parse BECOMES the served buffer. The loader's tick
+     * then sees the same mtime+size and does nothing — one parse, no
+     * stale window. (The loader cannot swap concurrently: g_regrow_busy
+     * is held for the whole regrow.) */
+    if (rc == 0 && a && !borrowed) {
+        struct stat sti;
+        long mt = 0, sz = 0;
+        if (stat(PATH_INDEX, &sti) == 0) { mt = (long)sti.st_mtime; sz = (long)sti.st_size; }
+        EnterCriticalSection(&g_lock);
+        LZEntry *old = g_idx_cache;
+        int oldn = g_idx_n;
+        g_idx_cache = a; g_idx_n = n;
+        g_idx_mtime = mt; g_idx_size = sz;
+        lz_tags_load(a, n);
+        published = 1;
+        if (old) lz_index_free(old, oldn);
+        LeaveCriticalSection(&g_lock);
+    }
+    /* FRESH LABELS, FRESH COUNTER (2026-10-22). The regrow just wrote the
+     * tree's labels (the sidecar) for all n rows, so the served labels and
+     * the live-stamp counter must be true NOW — not on the loader's next
+     * 1.5 s tick. Otherwise every query in that window reads a stale
+     * (often empty) stamp set and the route is declared "dead-route"
+     * (measured 2026-10-22 on a fresh full regrow: mode=dead-route while
+     * the sidecar on disk carried all n live labels — the route fell back
+     * to a full scan it did not need). The overlay is applied to the SAME
+     * buffer the loader owns; the loader's own watcher would do the same
+     * thing one tick later. */
+    if (rc == 0) {
+        EnterCriticalSection(&g_lock);
+        if (g_idx_cache) g_stamp_live = lz_stamp_overlay(g_idx_cache, g_idx_n);
+        LeaveCriticalSection(&g_lock);
+    }
+    if (a && !borrowed && !published) lz_index_free(a, n);
     return rc;
 }
 
@@ -3876,3 +3920,4 @@ int main(int argc, char **argv) {
     WSACleanup();
     return 0;
 }
+
