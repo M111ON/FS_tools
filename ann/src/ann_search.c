@@ -792,6 +792,48 @@ static double lz_now_ms(void) {
     return (double)qt.QuadPart * 1000.0 / (double)qf.QuadPart;
 }
 
+/* ── regrow-side cache borrow (2026-10-22: regrow ไม่ parse เอง) ───────────
+ * The incremental/full regrow used to call lz_index_load() itself — ~50 s on
+ * a 258 MB jsonl, a pure duplicate of the parse the background loader had
+ * already done into g_idx_cache. This borrows that buffer when it is still
+ * in sync with the file on disk.
+ *
+ * Ownership: the buffer stays owned by the loader. The regrow READS it only
+ * (lz_anchor_refresh never writes a[i].anchor/.anchor2 — verified 2026-10-22;
+ * since 9c532e8 the fresh stamps go to the sidecar, not into the rows) and
+ * must NOT free it.
+ *
+ * What holds the pointer steady for the whole regrow:
+ *   - the caller runs with g_regrow_busy set, and the loader thread refuses
+ *     to parse/swap while it is set, so it cannot free the buffer underneath
+ *     us, and
+ *   - the request lock is released for the duration of the regrow, so this
+ *     short critical section is the only g_lock taker on the regrow side.
+ *
+ * Returns 1 when borrowed (*out / *n_out set); 0 when the caller must parse
+ * on its own (no cache yet, or the file's mtime/size moved under it).
+ */
+static int lz_index_borrow(LZEntry **out, int *n_out) {
+    *out = NULL; *n_out = 0;
+    struct stat sti;
+    if (stat(PATH_INDEX, &sti) != 0) {
+        lz_diag("idx_borrow miss stat-fail ts=%lld\n", (long long)time(NULL));
+        return 0;
+    }
+    long mt = (long)sti.st_mtime, sz = (long)sti.st_size;
+    int ok = 0;
+    EnterCriticalSection(&g_lock);
+    if (g_idx_cache && g_idx_n > 0 && mt == g_idx_mtime && sz == g_idx_size) {
+        *out = g_idx_cache;
+        *n_out = g_idx_n;
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_lock);
+    lz_diag("idx_borrow %s ts=%lld n=%d\n", ok ? "hit" : "miss",
+            (long long)time(NULL), *n_out);
+    return ok;
+}
+
 static DWORD WINAPI index_loader_thread(LPVOID arg) {
     (void)arg;
     /* LOW PRIORITY (2026-10-22): the box has 2 cores and the loader's parse
@@ -2562,6 +2604,9 @@ typedef struct {
     long n_new;         /* n - n_prev */
     int skipped;        /* 1 = untouched fast path */
     char regrow_mode[16]; /* "unchanged"|"incremental"|"full"|"brute"|"error" */
+    char load_src[16];    /* "borrowed" = reused the loader's buffer;
+                           * "parse"    = the regrow parsed the jsonl itself;
+                           * "none"     = the unchanged fast path never loaded */
     double ms_load, ms_train, ms_route, ms_rewrite, ms_save;
 } RegrowTelemetry;
 
@@ -2662,6 +2707,7 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                     tel->skipped = 1;
                     tel->n_prev = st0.n_prev; tel->n_new = 0;
                     snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "unchanged");
+                    snprintf(tel->load_src, sizeof(tel->load_src), "none");
                     if (nout) *nout = st0.n_prev;
                     if (Kout) *Kout = st0.K;
                     return 2;
@@ -2673,18 +2719,26 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
             }
         }
     }
-    /* NOT unchanged: parse rows and proceed (incremental or full). */
+    /* NOT unchanged: get the rows and proceed (incremental or full). */
     LZEntry *a = NULL;
     int n = 0;
+    int borrowed = 0;   /* 1 = a/n point at the loader's buffer (do NOT free) */
     LARGE_INTEGER qf;
     LARGE_INTEGER t_load0, t_load_end, t_train0, t_train1;
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&t_load0);
-    lz_index_load(&a, &n, NULL);
+    /* Prefer the loader's already-parsed buffer: re-parsing the same 258 MB
+     * jsonl here cost ~50 s and produced the same rows. The borrow only
+     * succeeds when the loader's snapshot matches the file on disk. */
+    borrowed = lz_index_borrow(&a, &n);
+    if (!borrowed) lz_index_load(&a, &n, NULL);
     QueryPerformanceCounter(&t_load_end);
     double load_ms = (double)(t_load_end.QuadPart - t_load0.QuadPart) * 1000.0 / (double)qf.QuadPart;
     if (nout) *nout = n;
     tel->ms_load = load_ms;
+    snprintf(tel->load_src, sizeof(tel->load_src), borrowed ? "borrowed" : "parse");
+    lz_diag("regrow_load src=%s n=%d ms=%.1f ts=%lld\n",
+            borrowed ? "borrowed" : "parse", n, load_ms, (long long)time(NULL));
     tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
     tel->skipped = 0; tel->n_prev = 0; tel->n_new = 0;
     snprintf(tel->regrow_mode, sizeof(tel->regrow_mode), "brute");
@@ -3069,9 +3123,22 @@ full_pipeline:
     }
 regrow_done:
     /* rc==0 covers full AND incremental; rc==2 is the unchanged fast path and
-     * never invalidates (it wrote nothing). */
-    if (rc == 0) { lz_index_cache_invalidate(); lz_route_cache_invalidate(); }
-    lz_index_free(a, n);
+     * never invalidates (it wrote nothing).
+     *
+     * INVALIDATE ONLY WHAT ACTUALLY CHANGED (2026-10-22). A successful regrow
+     * rewrites the anchors table and the order file but never the jsonl — the
+     * fruit stays put — so the loader's index buffer is still valid:
+     * invalidating it freed the loader's buffer under it AND forced a third
+     * parse of the same unchanged 258 MB file. Only the route caches (which
+     * key on the anchors/order mtime) go. The fresh stamps reach the buffer
+     * through the loader's own sidecar watcher within its next tick.
+     * A self-parsed run (borrow missed because the file's mtime/size moved)
+     * keeps the old behaviour: its cache snapshot is stale, so drop it. */
+    if (rc == 0) {
+        lz_route_cache_invalidate();
+        if (!borrowed) lz_index_cache_invalidate();
+    }
+    if (a && !borrowed) lz_index_free(a, n);
     return rc;
 }
 
@@ -3563,6 +3630,7 @@ static void dispatch(sock_t cli, char *rq) {
         }
         int rK = 0, rN = 0;
         RegrowTelemetry rt;
+        memset(&rt, 0, sizeof(rt));   /* load_src is read in the response */
         LARGE_INTEGER rqf, rq0, rq1;
         QueryPerformanceFrequency(&rqf);
         QueryPerformanceCounter(&rq0);
@@ -3602,11 +3670,13 @@ static void dispatch(sock_t cli, char *rq) {
             "{\"status\":\"%s\",\"mode\":\"%s\",\"nent\":%d,\"K\":%d,"
             "\"regrow\":{\"mode\":\"%s\",\"ms\":%.1f,\"skipped\":%d,"
             "\"n_prev\":%d,\"n_new\":%d,\"internal_mode\":\"%d\","
+            "\"load_src\":\"%s\","
             "\"ms_per_phase\":{\"load\":%.1f,\"train\":%.1f,\"route\":%.1f,"
             "\"rewrite\":%.1f,\"save\":%.1f}}}",
             rrc < 0 ? "error" : "ok", rmode, rN, rK,
             rt.regrow_mode, rms, rt.skipped,
             (int)rt.n_prev, (int)rt.n_new, rrc,
+            rt.load_src[0] ? rt.load_src : "none",
             rt.ms_load, rt.ms_train, rt.ms_route, rt.ms_rewrite, rt.ms_save);
         lz_http_send(cli, "200 OK", "application/json", rresp, rrlen);
         sock_close(cli);
