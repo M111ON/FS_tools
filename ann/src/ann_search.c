@@ -319,6 +319,38 @@ static void lz_utf8_put(char *dst, int *di, int cap, unsigned cp) {
         if (*di < cap - 4) { dst[(*di)++] = (char)(0xF0 | (cp >> 18)); dst[(*di)++] = (char)(0x80 | ((cp >> 12) & 0x3F)); dst[(*di)++] = (char)(0x80 | ((cp >> 6) & 0x3F)); dst[(*di)++] = (char)(0x80 | (cp & 0x3F)); }
     }
 }
+/* math alphanumeric U+1D400..U+1D7FF — series are base+26 upper, +52 lower,
+ * +78 digit; fold by structural offset (approximation of exact NFKC — the
+ * corpus build runs real NFKC on these, this keeps the query in the same
+ * space).  Runs a folding loop and must be called with the EXPAND helper. */
+static int lz_math_series(unsigned cp, char *dst, int cap, int *di) {
+    struct { unsigned base; unsigned hi; int n; char c0; } s[] = {
+        {0x1D400, 0x1D433, 52, 'A'},  /* bold */
+        {0x1D434, 0x1D467, 52, 'A'},  /* italic */
+        {0x1D468, 0x1D49B, 52, 'A'},  /* bold italic */
+        {0x1D49C, 0x1D4CF, 78, 'A'},  /* script + boldscript + fraktur + ... */
+        {0x1D538, 0x1D56B, 78, 'A'},  /* double-struck + fraktur */
+        {0x1D56C, 0x1D59F, 52, 'A'},  /* bold fraktur */
+        {0x1D5A0, 0x1D5D3, 78, 'A'},  /* sans + bold sans */
+        {0x1D5D4, 0x1D607, 52, 'A'},  /* sans bold */
+        {0x1D608, 0x1D63B, 78, 'A'},  /* sans italic + bold italic */
+        {0x1D63C, 0x1D66F, 52, 'A'},  /* sans bold italic */
+        {0x1D670, 0x1D6A3, 52, 'A'},  /* monospace */
+        {0x1D7CE, 0x1D7FF, 30, '0'},  /* digits: bold/dbl/sans/bsans/mono */
+    };
+    for (unsigned si = 0; si < sizeof(s) / sizeof(s[0]); si++) {
+        if (cp >= s[si].base && cp <= s[si].hi) {
+            int k = (int)(cp - s[si].base);
+            char c = (s[si].c0 == '0')
+                ? (char)('0' + (char)((k % 10)))
+                : (char)((k < 26) ? ('A' + k) : (s[si].c0 + (char)(k - 26)));
+            if (*di < cap - 1) dst[(*di)++] = c;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int lz_sanitize(char *dst, int cap, const char *src) {
     int di = 0;
     for (const char *p = src; *p && di < cap - 8; ) {
@@ -330,6 +362,28 @@ static int lz_sanitize(char *dst, int cap, const char *src) {
         }
         const char *rep = lz_ascii_map(cp);
         if (rep) { for (const char *r = rep; *r && di < cap - 1; r++) dst[di++] = *r; continue; }
+        /* math alphanumeric series: fold by structure */
+        if (cp >= 0x1D400 && cp <= 0x1D7FF) { if (lz_math_series(cp, dst, cap, &di)) continue; }
+        /* fullwidth forms FF01..FF5E: NFKC shifts to ASCII (exact) */
+        if (cp >= 0xFF01 && cp <= 0xFF5E) { lz_utf8_put(dst, &di, cap, cp - 0xFEE0); continue; }
+        /* halfwidth katakana FF61..FF9F: NFKC expands to fullwidth katakana
+         * (in the corpus build), we approximate by a hole — measured 500 raw */
+        if (cp >= 0xFF61 && cp <= 0xFF9F) { if (di < cap - 1) dst[di++] = ' '; continue; }
+        /* ideographic space */
+        if (cp == 0x3000) { if (di < cap - 1) dst[di++] = ' '; continue; }
+        /* vulgar fractions + Roman numerals 2150..217F: NFKC expands — map
+         * each to its ASCII form (measured all 500 raw) */
+        if (cp >= 0x2150 && cp <= 0x217F) {
+            static const char *vu[] = {
+                "1/7","1/9","1/10","1/3","2/3","1/5","2/5","3/5","4/5","1/6","5/6",
+                "1/8","3/8","5/8","7/8","1/",
+                "I","II","III","IV","V","VI","VII","VIII","IX","X","XI","XII","L","C","D","M",
+                "i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","l","c","d","m",
+            };
+            const char *r2 = vu[cp - 0x2150];
+            for (const char *r = r2; *r && di < cap - 1; r++) dst[di++] = *r;
+            continue;
+        }
         if (lz_is_thai_hole(cp)) continue;  /* drop: unrepresentable in this tokenizer */
         /* control/whitespace the tokenizer also 500s on (measured): \n \t \r and
          * other C0 controls -> a single space (keeps word separation, no hole). */
@@ -363,8 +417,28 @@ static int lz_embed(const char *text, float *vec, int maxdim) {
         fprintf(stderr, "[ann_search] embed transport fail (nr=%d) sidecar=%s:%d\n", nr, host, port);
         return -1;
     }
-    const char *p = strstr(resp, "\"embedding\"");
-    if (!p) {
+    if (!strstr(resp, "\"embedding\"")) {
+        /* last resort (measured: Unicode-unassigned astral like U+2BFFB also
+         * 500s and carries no foldable meaning): retry once with every code
+         * point above the BMP dropped from the RAW text.  Losing one dead cp
+         * beats returning 503 to the whole query. */
+        static char noastr[4096];
+        int di = 0;
+        for (const char *p2 = text; *p2 && di < (int)sizeof(noastr) - 8; ) {
+            unsigned cp2; int a2 = lz_utf8_next(p2, &cp2); p2 += a2;
+            if (cp2 > 0xFFFF) continue;
+            lz_utf8_put(noastr, &di, (int)sizeof(noastr), cp2);
+        }
+        noastr[di] = '\0';
+        lz_sanitize(sane, (int)sizeof(sane), noastr);
+        lz_json_escape(esc, sizeof(esc), sane);
+        snprintf(body, sizeof(body), "{\"content\":\"%s\"}", esc);
+        nr = lz_http_post(host, port, "/embedding", body, resp, sizeof(resp));
+        if (nr > 0 && strstr(resp, "\"embedding\"")) {
+            fprintf(stderr, "[ann_search] embed retried after dropping astral (raw cp lost ok)\n");
+        }
+    }
+    if (!strstr(resp, "\"embedding\"")) {
         /* the sidecar answered but not with an embedding — usually a 500 from
          * the tokenizer. Log the status line + a slice so the cause is visible
          * instead of a bare 503 "embed_unavailable". */
@@ -374,6 +448,12 @@ static int lz_embed(const char *text, float *vec, int maxdim) {
         fprintf(stderr, "[ann_search] embed rejected by sidecar: %.200s\n", line);
         return -1;
     }
+    /* anchor on the "embedding" key, NOT the first '[': the sidecar's batch
+     * shape is [{"index":0,"embedding":[[...]]}] — a first-'[' parse lands on
+     * the OUTER array and counts the '{' as dim 0 (measured: qd=385, route_ok
+     * 384!=385 -> brute, plus a one-slot shift in the query vector). */
+    const char *p = strstr(resp, "\"embedding\"");
+    if (!p) return -1;
     p = strchr(p, '[');
     if (!p) return -1;
     p++;
