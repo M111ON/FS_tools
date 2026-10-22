@@ -146,6 +146,8 @@ def _detached(args, cwd):
     flags = 0
     if hasattr(subprocess, "DETACHED_PROCESS"):
         flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags |= subprocess.CREATE_NO_WINDOW
     return subprocess.Popen(args, cwd=cwd, stdout=out, stderr=err,
                             stdin=subprocess.DEVNULL, creationflags=flags,
                             close_fds=True)
@@ -214,6 +216,8 @@ def _start_ann():
     flags = 0
     if hasattr(subprocess, "DETACHED_PROCESS"):
         flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags |= subprocess.CREATE_NO_WINDOW
     return subprocess.Popen([EXE, "--serve", str(PORT)], cwd=DIR, env=env,
                             stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                             creationflags=flags, close_fds=True)
