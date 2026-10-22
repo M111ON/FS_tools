@@ -38,6 +38,12 @@
  *   env ANN_INDEX_PATH / ANN_ANCH_PATH / ANN_ORDER_PATH / ANN_ROUTE_LOG
  */
 #include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+
+/* the embed call's wait ceiling in ms (0 = wait forever). The health probe
+ * lowers it: /health must answer even when the sidecar is starved. */
+static int g_http_timeout_ms = 15000;
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -199,12 +205,49 @@ static int lz_http_post(const char *host, int port, const char *path,
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = inet_addr(host);
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { sock_close(fd); return -2; }
+    /* A BOUNDED CONNECT (2026-10-22): the embed sidecar runs ONE slot, so
+     * while it is busy its accept backlog is full and a blocking connect()
+     * waits for the SYN to be retried — measured 53 s, and it happened while
+     * the request lock was HELD, so every other request queued behind a
+     * health probe. A non-blocking connect + select() bounds the wait to
+     * the timeout, and the failure is honest ("embed":"down"). */
+    int tmo = g_http_timeout_ms;
+    if (tmo <= 0) tmo = 15000;
+    u_long nb = 1;
+    ioctlsocket(fd, FIONBIO, &nb);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        int werr = WSAGetLastError();
+        if (werr != WSAEWOULDBLOCK) { sock_close(fd); return -2; }
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv;
+        tv.tv_sec = tmo / 1000;
+        tv.tv_usec = (tmo % 1000) * 1000;
+        int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (sel <= 0) { sock_close(fd); return -3; }     /* connect timed out */
+        int soerr = 0, slen = sizeof(soerr);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &slen);
+        if (soerr != 0) { sock_close(fd); return -2; }
+    }
+    nb = 0;
+    ioctlsocket(fd, FIONBIO, &nb);
     char hdr[512];
     int hlen = snprintf(hdr, sizeof(hdr),
         "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
         "Content-Length: %d\r\nConnection: close\r\n\r\n",
         path, host, (int)strlen(body));
+    /* A BOUNDED WAIT (2026-10-22): the call had no socket timeout, so a
+     * starved sidecar (the box is busy with a regrow) held the request
+     * lock for as long as the client cared to wait — /health did not answer
+     * within 30 s during a scheduled regrow. The timeout turns "waited
+     * forever" into an honest failure. */
+    { int rtmo = g_http_timeout_ms;
+      if (rtmo > 0) {
+          setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rtmo, sizeof(rtmo));
+          setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&rtmo, sizeof(rtmo));
+      }
+    }
     send(fd, hdr, hlen, 0);
     send(fd, body, (int)strlen(body), 0);
     int total = 0, n;
@@ -472,8 +515,21 @@ static int g_backward = 0;                 /* ANN_GRAFT_BACKWARD: expand candida
 static int g_graft_buckets = 0;            /* ANN_GRAFT_BUCKETS: add graph-endorsed buckets to the anchor route */
 
 static unsigned _fnv(const char *s);
+static const char *regrow_state_path(void);
+static void lz_diag(const char *fmt, ...);
 static void lz_tags_ensure(LZEntry *ents, int nent);
 static void lz_tags_free(void);
+static void lz_tags_load(LZEntry *ents, int nent);
+static int  lz_stamp_overlay(LZEntry *a, int n);
+static int  lz_stamp_prefix_ok(const LZEntry *a, int n);
+static void lz_index_free(LZEntry *a, int n);
+static CRITICAL_SECTION g_lock;
+/* The request lock is RECURSIVE (a Windows critical section), so the depth
+ * has to be tracked per thread: the regrow releases it around its heavy
+ * work and takes it back afterwards. */
+static __thread int g_lock_depth = 0;
+static void lz_lock_get(void) { EnterCriticalSection(&g_lock); g_lock_depth++; }
+static void lz_lock_put(void) { if (g_lock_depth > 0) g_lock_depth--; LeaveCriticalSection(&g_lock); }
 
 static const char *lz_json_val(const char *line, const char *key) {
     char pat[32];
@@ -490,6 +546,22 @@ static const char *lz_json_val(const char *line, const char *key) {
  * Declared before lz_index_load (which writes it) and before handle_health
  * (which reads it). */
 static int g_stamp_live = 0;
+/* the stamp sidecar's identity (the background loader watches it: the
+ * incremental regrow writes ONLY the sidecar, so the index file can stay
+ * untouched while the routing table changes) */
+static long g_stamp_mtime = 0, g_stamp_size = 0;
+/* a regrow is running: the background loader waits instead of competing for
+ * the same two cores (measured 2026-10-22: the regrow + the loader together
+ * starved the sidecar and the health probe) */
+static volatile LONG g_regrow_busy = 0;
+static long g_stamp_state_mtime = 0;   /* the regrow state file's identity */
+/* the background loader: the index is reloaded OFF the request path so a
+ * rebuild never blocks a query (measured 2026-10-21: the inline reload of
+ * 258 MB / 62,634 rows held the lock for >60 s and /health timed out) */
+static volatile LONG g_loader_stop = 0;
+static int g_loader_running = 0;
+static HANDLE g_loader_thread = NULL;
+static double g_loaded_at_ms = 0;
 
 /* DEAD ROUTE (2026-10-20): the anchor table and the order file are valid
  * (so the route layer says "routed") but the ROWS carry almost no routing
@@ -538,7 +610,61 @@ static int lz_entry_parse(const char *line, LZEntry *e) {
     e->norm = sqrt(n2);
     return 0;
 }
-static int lz_index_load(LZEntry **out, int *n_out) {
+/* STAMP SIDECAR OVERLAY (2026-10-20): rows' CURRENT anchor/anchor2 live in
+ * <PATH_INDEX>.stamp (8 bytes/row: anchor,anchor2 int32 pair). The sidecar
+ * is the TREE's channel and it is authoritative for EVERY ROW IT COVERS —
+ * not only when its size happens to equal n*8. Ignoring a short sidecar
+ * throws away the whole routing table (measured 2026-10-20: the append
+ * window between ann-sync's append and its regrow left stamps_live 0 of
+ * 62,323 — the tree's labels were on disk but unread).
+ * Contract:
+ *   - the sidecar covers rows [0, sidecar_rows)
+ *   - rows beyond that are NOT PLACED yet -> they keep the fruit's label (-1)
+ *   - a sidecar LONGER than the index is truncated to n rows
+ * Returns the number of rows that carry a live stamp. */
+static int lz_stamp_overlay(LZEntry *a, int n) {
+    char sp[600];
+    snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+    struct stat ss;
+    g_stamp_mtime = 0; g_stamp_size = 0;
+    if (stat(sp, &ss) == 0) {
+        g_stamp_mtime = (long)ss.st_mtime;
+        g_stamp_size = (long)ss.st_size;
+        /* THE GATE (2026-10-22): the sidecar is POSITIONAL, so its labels are
+         * only valid for a buffer whose prefix is PROVEN to be the same rows.
+         * The proof is the regrow's own append contract: the state file
+         * records (n_prev, last_sid) = the count and the last sid of the
+         * index the sidecar was computed for, so a[st.n_prev-1].sid ==
+         * st.last_sid proves the prefix is intact. Without the gate, a
+         * sidecar from another index version would be laid over the wrong
+         * rows and the route would silently degrade (the S9 lesson). */
+        if (!lz_stamp_prefix_ok(a, n)) {
+            int live = 0;
+            for (int i = 0; i < n; i++) if (a[i].anchor >= 0) live++;
+            return live;
+        }
+        if (ss.st_size >= 8) {
+            long side_rows = (long)ss.st_size / 8;
+            if (side_rows > (long)n) side_rows = (long)n;
+            FILE *sf = fopen(sp, "rb");
+            if (sf) {
+                for (int i = 0; i < (int)side_rows; i++) {
+                    int32_t rec[2];
+                    if (fread(rec, sizeof(rec), 1, sf) != 1) break;
+                    a[i].anchor = (int)rec[0];
+                    a[i].anchor2 = (int)rec[1];
+                }
+                fclose(sf);
+            }
+        }
+    }
+    int live = 0;
+    for (int i = 0; i < n; i++)
+        if (a[i].anchor >= 0) live++;
+    return live;
+}
+
+static int lz_index_load(LZEntry **out, int *n_out, int *stamp_live_out) {
     *out = NULL; *n_out = 0;
     FILE *ix = fopen(PATH_INDEX, "r");
     if (!ix) return 0;
@@ -562,56 +688,9 @@ static int lz_index_load(LZEntry **out, int *n_out) {
      * covers exactly the loaded row count (records[i] i<n). A stale or
      * partial sidecar is IGNORED silently (jsonl stamps stay authoritative),
      * which is the same contract as before the sidecar existed. */
-    {
-        char sp[600];
-        snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
-        struct stat ss;
-        /* TREE-SIDE OVERLAY (2026-10-20): the sidecar is the TREE's
-         * channel and it is authoritative for EVERY ROW IT COVERS — not
-         * only when its size happens to equal n*8. The old rule ("overlay
-         * only on an exact size match, else ignore") belonged to the era
-         * when the fruit ALSO carried the labels; with the labels living
-         * only in the tree, ignoring a short sidecar throws away the whole
-         * routing table (measured 2026-10-20: the append window between
-         * ann-sync's append and its regrow left stamps_live 0 of 62,323 —
-         * the tree's labels were on disk but unread).
-         * Contract now:
-         *   - the sidecar covers rows [0, sidecar_rows)
-         *   - rows beyond that are NOT PLACED yet (they arrive before the
-         *     regrow places them) -> they keep the fruit's own label (-1)
-         *   - a sidecar LONGER than the index is truncated to n rows
-         * The fruit's own anchor fields remain the fallback for rows the
-         * sidecar does not cover (legacy indexes written before the
-         * sidecar existed). */
-        if (stat(sp, &ss) == 0 && ss.st_size >= 8) {
-            long side_rows = (long)ss.st_size / 8;
-            if (side_rows > (long)n) side_rows = (long)n;
-            FILE *sf = fopen(sp, "rb");
-            if (sf) {
-                for (int i = 0; i < (int)side_rows; i++) {
-                    int32_t rec[2];
-                    if (fread(rec, sizeof(rec), 1, sf) != 1) break;
-                    a[i].anchor = (int)rec[0];
-                    a[i].anchor2 = (int)rec[1];
-                }
-                fclose(sf);
-            }
-        }
-    }
-    /* STAMP LIVENESS (2026-10-20): how many rows actually carry a routing
-     * stamp. A rebuilt index (scripts/build_index.py) has NONE, and the
-     * incremental regrow used to write that dead state into the sidecar —
-     * the routing table of 62k rows was gone while /health still reported
-     * routed=1 and every search scored 4 rows instead of 24000. The count
-     * lets /health tell the truth and lets the walk refuse a dead route
-     * (fail loud, fall back to the full scan) instead of serving 4 rows
-     * as if they were the top-k. */
-    g_stamp_live = 0;
-    for (int i = 0; i < n; i++)
-        if (a[i].anchor >= 0) g_stamp_live++;
-    /* the tag sidecar labels THESE rows (sid-keyed, so a stale sidecar
-     * cannot silently mislabel a row) */
-    lz_tags_ensure(a, n);
+    /* the stamp overlay is applied by lz_stamp_overlay (it can also run on
+     * its own when only the sidecar changed) */
+    if (stamp_live_out) *stamp_live_out = lz_stamp_overlay(a, n);
     *out = a; *n_out = n;
     return 0;
 }
@@ -635,7 +714,9 @@ static void lz_index_free(LZEntry *a, int n) {
     free(g_inv);
     g_inv = NULL;
     g_inv_n = 0;
-    lz_tags_free();
+    /* the TAG state is NOT freed here: it belongs to the CURRENT buffer, and
+     * the swap reloads it explicitly (lz_tags_load). Freeing it here would
+     * drop the labels of the buffer that is already live. */
 }
 /* index cache: load-once, reload on mtime/size change (single-threaded). */
 static LZEntry *g_idx_cache = NULL;
@@ -656,13 +737,119 @@ static int lz_index_cached(LZEntry **out, int *n_out) {
             lz_tags_ensure(g_idx_cache, g_idx_n);
             *out = g_idx_cache; *n_out = g_idx_n; return 1;
         }
+        /* the file moved but the background loader has not swapped yet: serve
+         * the LOADED buffer (a stale index beats a 60 s stall) */
+        if (g_loader_running && g_idx_cache) {
+            *out = g_idx_cache; *n_out = g_idx_n; return 1;
+        }
         lz_index_cache_invalidate();
-        if (lz_index_load(&g_idx_cache, &g_idx_n) == 0 && g_idx_cache) {
+        int sl = 0;
+        if (lz_index_load(&g_idx_cache, &g_idx_n, &sl) == 0 && g_idx_cache) {
             g_idx_mtime = mt; g_idx_size = sz;
+            g_stamp_live = sl;
+            lz_tags_load(g_idx_cache, g_idx_n);
             *out = g_idx_cache; *n_out = g_idx_n; return 1;
         }
     }
     *out = NULL; *n_out = 0;
+    return 0;
+}
+
+/* ── background index loader (2026-10-21) ───────────────────────────────
+ * The index is 258 MB of JSONL: parsing it takes ~60 s on this box. Doing
+ * that inside a request (the old inline reload) held the request lock the
+ * whole time, so EVERY request — /health included — queued behind it
+ * (measured live 2026-10-21: /health did not answer within 60 s while
+ * ann_sync rebuilt the index).
+ *
+ * The loader owns the swap: it parses the new file into its OWN buffer
+ * (no lock held), then swaps the pointer under the lock and frees the old
+ * buffer. A query therefore always sees a complete index, and a rebuild
+ * costs the service nothing.
+ *
+ * It also watches the STAMP SIDECAR on its own: the incremental regrow
+ * writes only the sidecar (the fruit is never rewritten), so the routing
+ * table can change while the index file does not. Before this, such a
+ * change was invisible until the next index rebuild. */
+/* a diagnostic log that cannot be lost (the stderr of a detached server is
+ * not always captured by the supervisor) */
+static void lz_diag(const char *fmt, ...) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s.loader.log", PATH_INDEX);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
+
+static double lz_now_ms(void) {
+    LARGE_INTEGER qf, qt;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qt);
+    return (double)qt.QuadPart * 1000.0 / (double)qf.QuadPart;
+}
+
+static DWORD WINAPI index_loader_thread(LPVOID arg) {
+    (void)arg;
+    /* LOW PRIORITY (2026-10-22): the box has 2 cores and the loader's parse
+     * uses one of them for ~50 s. At NORMAL priority the request threads
+     * were starved (measured: /health waited 70 s for a lock it did not
+     * even hold — the wait was CPU starvation, not contention) while the
+     * regrow's kmeans and the embed sidecar competed for the rest. Below
+     * normal, the service keeps answering and the reload still finishes. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    lz_diag("loader_thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
+    for (;;) {
+        if (g_loader_stop) break;
+        Sleep(1500);
+        struct stat st;
+        if (stat(PATH_INDEX, &st) == 0) {
+            long mt = (long)st.st_mtime, sz = (long)st.st_size;
+            if ((!g_idx_cache || mt != g_idx_mtime || sz != g_idx_size) &&
+                !g_regrow_busy) {
+                LZEntry *na = NULL;
+                int nn = 0, nsl = 0;
+                lz_diag("loader_parse_start ts=%lld\n", (long long)time(NULL));
+                if (lz_index_load(&na, &nn, &nsl) == 0 && na) {
+                    lz_diag("loader_swap_lock ts=%lld\n", (long long)time(NULL));
+                    EnterCriticalSection(&g_lock);
+                    LZEntry *old = g_idx_cache;
+                    int oldn = g_idx_n;
+                    g_idx_cache = na; g_idx_n = nn;
+                    g_idx_mtime = mt; g_idx_size = sz;
+                    g_stamp_live = nsl;
+                    lz_tags_load(na, nn);      /* the labels follow the rows */
+                    g_loaded_at_ms = lz_now_ms();
+                    if (old) lz_index_free(old, oldn);  /* still under the lock */
+                    LeaveCriticalSection(&g_lock);
+                    lz_diag("reload ts=%lld entries=%d mtime=%ld size=%ld\n",
+                            (long long)time(NULL), nn, mt, sz);
+                    fprintf(stderr,
+                            "[ann_search] index reloaded in the background: %d entries\n",
+                            nn);
+                }
+            }
+        }
+        /* the stamp sidecar can change WITHOUT the index changing (the
+         * incremental regrow writes only the sidecar), and the regrow state
+         * file decides whether those labels apply to the loaded buffer */
+        char sp[600];
+        snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
+        struct stat ss;
+        long smt = 0, ssz = 0;
+        if (stat(sp, &ss) == 0) { smt = (long)ss.st_mtime; ssz = (long)ss.st_size; }
+        long stm = 0;
+        { struct stat ts; if (stat(regrow_state_path(), &ts) == 0) stm = (long)ts.st_mtime; }
+        if ((smt != g_stamp_mtime || ssz != g_stamp_size) || stm != g_stamp_state_mtime) {
+            EnterCriticalSection(&g_lock);
+            if (g_idx_cache) g_stamp_live = lz_stamp_overlay(g_idx_cache, g_idx_n);
+            g_stamp_state_mtime = stm;
+            LeaveCriticalSection(&g_lock);
+        }
+    }
     return 0;
 }
 /* anchors + order cache */
@@ -2173,8 +2360,11 @@ static void regrow_state_load(RegrowState *st) {
     fclose(f);
     const char *p = strstr(sb, "\"n_prev\":");
     if (p) st->n_prev = atol(p + 9);
-    p = strstr(sb, "\"last_sid\":\"");
-    if (p) { p += 12; int ii = 0;
+    p = strstr(sb, "\"last_sid\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) { p++; while (*p == ' ') p++; if (*p == '"') p++; }
+        int ii = 0;
         while (*p && *p != '"' && ii < 63) st->last_sid[ii++] = *p++;
         st->last_sid[ii] = 0; }
     p = strstr(sb, "\"index_mtime\":");
@@ -2186,6 +2376,23 @@ static void regrow_state_load(RegrowState *st) {
     p = strstr(sb, "\"anchors_cksum\":");
     if (p) st->anchors_cksum = (unsigned)strtoul(p + 16, NULL, 10);
 }
+/* THE GATE: the sidecar's labels are valid for this buffer only if the
+ * buffer's prefix is the SAME rows the sidecar was computed for. The proof
+ * is the regrow's own append contract (the state file's n_prev + last_sid).
+ * A buffer that fails it gets NO sidecar labels: the route then reads as
+ * dead and the walk fails loud (full scan) instead of routing by stamps
+ * that belong to another index version. */
+static int lz_stamp_prefix_ok(const LZEntry *a, int n) {
+    if (!a || n <= 0) return 0;
+    RegrowState st;
+    regrow_state_load(&st);
+    if (st.n_prev <= 0 || st.n_prev > n) return 0;
+    if (!st.last_sid[0]) return 0;
+    const char *sid = a[st.n_prev - 1].sid;
+    if (!sid[0]) return 0;
+    return strcmp(sid, st.last_sid) == 0;
+}
+
 static void regrow_state_save(const RegrowState *st, double full_ms) {
     char tmp[600];
     snprintf(tmp, sizeof(tmp), "%s.tmp", regrow_state_path());
@@ -2237,7 +2444,7 @@ static int lz_restamp(int *n_out, int *K_out) {
     LZEntry *a = NULL;
     int n = 0;
     *n_out = 0; if (K_out) *K_out = 0;
-    lz_index_load(&a, &n);
+    lz_index_load(&a, &n, NULL);
     if (n < LZ_ANCH_MIN || !a || a[0].dim <= 0 || a[0].dim > ANCHR_MAXD) {
         lz_index_free(a, n);
         return -1;
@@ -2473,7 +2680,7 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
     LARGE_INTEGER t_load0, t_load_end, t_train0, t_train1;
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&t_load0);
-    lz_index_load(&a, &n);
+    lz_index_load(&a, &n, NULL);
     QueryPerformanceCounter(&t_load_end);
     double load_ms = (double)(t_load_end.QuadPart - t_load0.QuadPart) * 1000.0 / (double)qf.QuadPart;
     if (nout) *nout = n;
@@ -2882,7 +3089,12 @@ static int handle_health(sock_t cli) {
     /* every search depends on the embed sidecar, so a green /health that does
      * not probe it hides a 100%-broken search path from the supervisor. Ping it
      * (short timeout) and report honestly; the index still reports its state. */
+    /* the health probe must not wait for a starved sidecar: 2 s, then the
+     * answer is honest ("embed":"down") instead of the whole probe hanging */
+    int saved_to = g_http_timeout_ms;
+    if (saved_to > 2000) g_http_timeout_ms = 2000;
     int embed_ok = (lz_embed("ping", (float[4]){0}, 1) >= 0) ? 1 : 0;
+    g_http_timeout_ms = saved_to;
     /* TRUTHFUL ROUTE (2026-10-20): `routed` only means the anchor table and
      * the order file are valid and bound. It says NOTHING about whether the
      * ROWS carry routing stamps. A rebuilt index (scripts/build_index.py
@@ -2904,14 +3116,20 @@ static int handle_health(sock_t cli) {
     char tescp[600];
     lz_json_escape(tescp, sizeof(tescp), g_tag_path[0] ? g_tag_path : "(none)");
     int tagged_rows = (nent > g_tag_unlabeled) ? (nent - g_tag_unlabeled) : 0;
+    /* the loader's truth: "entries" is what is SERVED (the loaded buffer),
+     * and "index_age_s" says how old that buffer is. A rebuild in flight
+     * shows up as a growing age, never as a stalled request. */
+    double age_s = (g_loaded_at_ms > 0.0) ? (lz_now_ms() - g_loaded_at_ms) / 1000.0 : -1.0;
     int bl = snprintf(b, sizeof(b),
         "{\"status\":\"%s\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
         "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"stamps_live\":%d,"
         "\"route_dead\":%d,\"maxk\":%d,\"embed\":\"%s\","
+        "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
         "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, embed_ok ? "ok" : "down",
+        g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
         g_fog_replayed, sh, (unsigned)WL_FREE);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
@@ -3251,7 +3469,7 @@ static int handle_search_batch(sock_t cli, const char *rq) {
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&qt0);
     double emb_ms = g_last_embed_ms;
-    EnterCriticalSection(&g_lock);
+    lz_lock_get();
     static char row_buf[16384];
     for (int qi = 0; qi < nq; qi++) {
         row_buf[0] = '\0';
@@ -3275,7 +3493,7 @@ static int handle_search_batch(sock_t cli, const char *rq) {
     }
     QueryPerformanceCounter(&qt1);
     double took_ms = (double)(qt1.QuadPart - qt0.QuadPart) * 1000.0 / (double)qf.QuadPart;
-    LeaveCriticalSection(&g_lock);
+    lz_lock_put();
     static char bresp[81920];
     int brlen = snprintf(bresp, sizeof(bresp),
         "{\"status\":\"ok\",\"telemetry\":{\"n\":%d,\"embed_ms\":%.2f,\"took_ms\":%.2f},\"results\":[",
@@ -3348,7 +3566,30 @@ static void dispatch(sock_t cli, char *rq) {
         LARGE_INTEGER rqf, rq0, rq1;
         QueryPerformanceFrequency(&rqf);
         QueryPerformanceCounter(&rq0);
+        /* THE REGROW IS HEAVY (2026-10-22): it parses the 258 MB index,
+         * trains the anchors and rewrites the tree's channel — ~90 s on this
+         * box. Under the request lock that stalls EVERY request: measured
+         * live, /health timed out (30 s) three times during a scheduled
+         * regrow while the index rebuild had already been moved off the
+         * request path.
+         * The heavy work touches only files and its own buffers, so the
+         * lock is RELEASED around it and taken again for the answer. The
+         * route stays consistent: the anchor table is checksum-bound to the
+         * row count, so a concurrent index change makes the pair refuse
+         * (fail loud), never route by labels that belong elsewhere. */
+        int lock_released = 0;
+        lz_diag("regrow_release ts=%lld depth=%d\n", (long long)time(NULL), g_lock_depth);
+        while (g_lock_depth > 0) { LeaveCriticalSection(&g_lock); g_lock_depth--; lock_released++; }
+        g_regrow_busy = 1;
+        /* the regrow is a background job on a 2-core box: run it below
+         * normal so the service stays responsive while it trains */
+        DWORD old_prio = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         int rrc = lz_anchor_refresh(force, &rK, &rN, &rt);
+        SetThreadPriority(GetCurrentThread(), old_prio);
+        g_regrow_busy = 0;
+        while (lock_released-- > 0) { EnterCriticalSection(&g_lock); g_lock_depth++; }
+        lz_diag("regrow_done ts=%lld depth=%d\n", (long long)time(NULL), g_lock_depth);
         QueryPerformanceCounter(&rq1);
         double rms = (double)(rq1.QuadPart - rq0.QuadPart) * 1000.0 / (double)rqf.QuadPart;
         /* rc 0=full/incremental regrow, 1=brute<n/null, 2=unchanged fast path,
@@ -3389,9 +3630,19 @@ static DWORD WINAPI client_thread(LPVOID arg) {
     if (!rq) { sock_close(cli); return 0; }
     int n = lz_http_recv(cli, rq, 1 << 20);
     if (n > 0) {
-        EnterCriticalSection(&g_lock);
+        LARGE_INTEGER dqf, dq0, dq1;
+        QueryPerformanceFrequency(&dqf);
+        QueryPerformanceCounter(&dq0);
+        lz_lock_get();
+        QueryPerformanceCounter(&dq1);
+        double wait_ms = (double)(dq1.QuadPart - dq0.QuadPart) * 1000.0 / (double)dqf.QuadPart;
         dispatch(cli, rq);
-        LeaveCriticalSection(&g_lock);
+        lz_lock_put();
+        if (wait_ms > 1000.0) {
+            lz_diag("lock_wait ts=%lld ms=%.0f\n", (long long)time(NULL), wait_ms);
+            fprintf(stderr, "[ann_search] lock wait %.0f ms (path held the lock)\n",
+                    wait_ms);
+        }
     } else {
         sock_close(cli);
     }
@@ -3408,13 +3659,21 @@ int main(int argc, char **argv) {
     }
     const char *pe = getenv("ANN_PORT");
     if (pe && atoi(pe) > 0) port = atoi(pe);
+    { const char *te = getenv("LZ_HTTP_TIMEOUT_MS");
+      if (te && atoi(te) > 0) g_http_timeout_ms = atoi(te); }
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "wsa fail\n"); return 1; }
     InitializeCriticalSection(&g_lock);
     lz_fog_init();
     { LZEntry *e; int n; int c = lz_index_cached(&e, &n);
-      fprintf(stderr, "[ann_search] index=%s entries=%d cache=%d maxk=%d\n",
+      g_loaded_at_ms = lz_now_ms();
+      /* the background loader owns every later reload: a rebuild of the
+       * 258 MB index must never block a request (measured 2026-10-21: the
+       * inline reload held the lock >60 s and /health timed out) */
+      g_loader_running = 1;
+      g_loader_thread = CreateThread(NULL, 0, index_loader_thread, NULL, 0, NULL);
+      fprintf(stderr, "[ann_search] index=%s entries=%d cache=%d maxk=%d loader=bg\n",
               PATH_INDEX, n, c, ANN_MAXK);
       fprintf(stderr, "[ann_search] anchors=%s order=%s foglog=%s replayed=%d\n",
               PATH_ANCH, PATH_ORDER, PATH_LOG, g_fog_replayed); }

@@ -88,7 +88,21 @@ def main():
             n += 1
             if n % 5000 == 0:
                 print(f"  {n}/{len(rows)}  ({time.time()-t0:.1f}s)")
-    os.replace(tmp, a.out)
+    # ATOMIC SWAP, WITH A RETRY (2026-10-22): on Windows the destination can
+    # be held open for a moment by a scanner (Defender walks the freshly
+    # written 258 MB file) and os.replace then fails with WinError 5
+    # "Access is denied" — measured live: the index rebuild aborted at the
+    # swap and the .tmp was left behind (258 MB of wasted disk, and the
+    # index would never refresh -> the H1 hole). A short retry turns the
+    # race into a delay.
+    for attempt in range(60):
+        try:
+            os.replace(tmp, a.out)
+            break
+        except PermissionError:
+            if attempt == 59:
+                raise
+            time.sleep(1.0)
     print(f"wrote {n} entries -> {a.out}")
     print(f"dims: {dims}")
     print(f"elapsed {time.time()-t0:.1f}s")
