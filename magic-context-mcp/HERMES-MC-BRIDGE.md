@@ -71,12 +71,33 @@ Project identity (mirrors the plugin's `resolveProjectIdentity`):
 Both this tool and the plugin use `md5(lowercase, whitespace-collapsed, trimmed)`;
 99% of pre-existing rows match it (verified against 300 live rows).
 
+## Source databases (multi-DB since the Oct-2026 profile split)
+
+Hermes moved its live session DB into `profiles/<name>/state.db`; the root
+`I:\Hermes\state.db` froze on **2026-10-09** and no longer receives turns. The
+engine therefore **auto-discovers every Hermes DB** — root `state.db` plus each
+`profiles/*/state.db` — and syncs them all. `HERMES_STATE_DB` still pins a single
+DB when set (tests / one-off runs); leave it unset for the normal multi-DB sweep.
+
+Selection keys on `last_activity_at` (falling back to `started_at`), not
+`started_at` alone, so a long-running session keeps refreshing as it gains turns.
+
+Run it on a schedule so OpenCode/Pi stay current:
+
+```bat
+REM install once; then runs hourly
+I:\tools\magic-context-mcp\install_mc_sync_task.cmd 60
+```
+
+Task name: **`hermes-mc-sync`** (`schtasks /run /tn hermes-mc-sync` to fire now).
+
 ## Files
 
 | File | Role |
 |---|---|
-| `hermes_mc_sync.py` | Hermes `state.db` → `context.db` memories. Idempotent. |
+| `hermes_mc_sync.py` | Hermes `state.db` (all DBs) → `context.db` memories. Idempotent. |
 | `hermes_mc_sync.cmd` | wrapper for Task Scheduler / manual runs |
+| `install_mc_sync_task.cmd` | creates the `hermes-mc-sync` scheduled task |
 | `magic_context_mcp_server.py` | MCP bridge; fixed `magic_remember` + `magic_sync_hermes` |
 | `backups/` | pre-change `context.db` snapshots |
 
@@ -92,7 +113,7 @@ $PY hermes_mc_sync.py --dry-run --days 30
 $PY hermes_mc_sync.py --apply --days 30
 
 # also mine durable rules/decisions (noisier — review first)
-$PY hermes_mc_sync.py --apply --days 30 --mode facts
+$PY hermes_mc_sync.py --apply --days 30 --mode both
 
 # also archive raw transcripts into message FTS (see caveat below)
 $PY hermes_mc_sync.py --apply --days 30 --mirror-transcripts
@@ -110,7 +131,7 @@ From Hermes chat the same thing is available as the MCP tool
 > hangs until the 300 s MCP timeout (the sync itself takes ~1.3 s). The engine is
 > therefore imported and called directly. Keep `run_sync()` the shared entry
 > point for both the CLI and the MCP tool — do not reintroduce a subprocess here.
-> Note the module resolves `CTX_DB`/`HERMES_DB` at **import** time, so
+> Note the module resolves `CTX_DB` at **import** time, so
 > `MAGIC_CONTEXT_DB` must be set *before* the import.
 
 ## Modes

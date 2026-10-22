@@ -49,9 +49,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-HERMES_DB = Path(os.environ.get("HERMES_STATE_DB", r"I:\Hermes\state.db"))
+# Hermes split its live session DB into per-profile databases under profiles/<name>/
+# at the Oct-2026 update; the root state.db froze on 2026-10-09. We therefore read
+# every Hermes DB we can find, not just the root one. HERMES_STATE_DB still pins a
+# single DB when set (used by the MCP tool / tests).
+HERMES_HOME = Path(os.environ.get("HERMES_HOME_ROOT", r"I:\Hermes"))
+HERMES_DB_ENV = os.environ.get("HERMES_STATE_DB", "").strip()
 CTX_DB = Path(os.environ.get("MAGIC_CONTEXT_DB", r"I:\cortexkit\magic-context\context.db"))
 STATE = HERE / "hermes_mc_sync_state.json"
+
+
+def discover_hermes_dbs() -> list[tuple[str, Path]]:
+    """Return [(label, path)] for every Hermes session DB, live profiles included.
+
+    Order: root state.db first (legacy), then profiles/*/state.db sorted by name.
+    A missing file is skipped so an empty profile dir is harmless. When
+    HERMES_STATE_DB is set the caller has pinned one DB and we return just it.
+    """
+    if HERMES_DB_ENV:
+        return [("root", Path(HERMES_DB_ENV))]
+    out: list[tuple[str, Path]] = []
+    root = HERMES_HOME / "state.db"
+    if root.exists():
+        out.append(("root", root))
+    prof_dir = HERMES_HOME / "profiles"
+    if prof_dir.is_dir():
+        for d in sorted(prof_dir.iterdir()):
+            db = d / "state.db"
+            if db.exists():
+                out.append((d.name, db))
+    return out
 
 VALID_CATEGORIES = {
     "PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING",
@@ -213,18 +240,27 @@ def reap_memory(conn, *, project, category, session_id, dry_run) -> bool:
 
 # ── Hermes reader ──────────────────────────────────────────────────────────
 
-def hermes_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True, timeout=5)
+def hermes_conn(db_path: Path | None = None) -> sqlite3.Connection:
+    path = Path(db_path) if db_path is not None else (discover_hermes_dbs() or [("root", Path(r"I:\Hermes\state.db"))])[0][1]
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def load_sessions(conn, since_s: float, min_messages: int, sources_out):
-    """started_at in Hermes state.db is Unix SECONDS (not ms)."""
+    """started_at in Hermes state.db is Unix SECONDS (not ms).
+
+    Selection keys on last_activity_at (falling back to started_at) rather than
+    started_at alone: a session that began weeks ago but is still being used has
+    new turns that must be re-digested, and started_at alone would exclude it
+    forever. Re-runs are idempotent (upsert by (project, category, session_id)),
+    so re-reading an active session is safe and only rewrites on content change.
+    """
     q = ("SELECT id, title, source, cwd, git_repo_root, message_count, started_at "
-         "FROM sessions WHERE message_count >= ? AND started_at >= ? "
+         "FROM sessions WHERE message_count >= ? "
+         "AND COALESCE(last_activity_at, started_at) >= ? "
          f"AND source NOT IN ({','.join('?' * len(sources_out))}) "
-         "ORDER BY started_at ASC")
+         "ORDER BY COALESCE(last_activity_at, started_at) ASC")
     return conn.execute(q, (min_messages, since_s, *sources_out)).fetchall()
 
 
@@ -520,77 +556,103 @@ def run_sync(*, days=30.0, since=None, min_messages=6, limit=0, project="",
     since_s = since if since else time.time() - days * 86400
     excluded = ["cron"] if include_subagents else ["cron", "subagent"]
 
-    hc = hermes_conn()
-    sessions = load_sessions(hc, since_s, min_messages, excluded)
-    if limit:
-        sessions = sessions[-limit:]
+    dbs = discover_hermes_dbs()
+    if not dbs:
+        raise SystemExit("no Hermes state.db found under %s" % HERMES_HOME)
 
     conn = connect_ctx()
     state = load_state()
     tally = {"insert": 0, "update": 0, "skip": 0}
     by_project: dict[str, int] = {}
+    by_db: dict[str, int] = {}
     processed = 0
     mirrored = 0
     reaped = 0
 
     try:
-        for sess in sessions:
-            proj = resolve_identity(sess["git_repo_root"] or sess["cwd"])
-            if proj is None:
-                continue
-            if project and project not in proj:
-                continue
-            msgs = session_messages(hc, sess["id"])
-            if not msgs:
-                continue
+        for label, db_path in dbs:
+            hc = hermes_conn(db_path)
+            try:
+                sessions = load_sessions(hc, since_s, min_messages, excluded)
+                if limit:
+                    sessions = sessions[-limit:]
+                if not sessions:
+                    continue
+                if not quiet:
+                    log(f"── {label} ({db_path}) : {len(sessions)} sessions")
+                for sess in sessions:
+                    proj = resolve_identity(sess["git_repo_root"] or sess["cwd"])
+                    if proj is None:
+                        continue
+                    if project and project not in proj:
+                        continue
+                    msgs = session_messages(hc, sess["id"])
+                    if not msgs:
+                        continue
 
-            acts = []
-            if mode in ("digest", "both"):
-                digest = build_digest(sess, msgs)
-                if digest:
-                    acts.append((digest_category, digest, digest_importance, "digest"))
-                else:
-                    # Session became all-noise (or lost its content): remove any
-                    # digest we previously wrote so it stops injecting.
-                    if reap_memory(conn, project=proj, category=digest_category,
-                                   session_id=sess["id"], dry_run=dry_run):
-                        reaped += 1
-                        if not quiet:
-                            log(f"[{proj}] {sess['id']}  reaped stale digest "
-                                f"({digest_category})")
-            if mode in ("facts", "both"):
-                for cat, text in extract_facts(sess, msgs):
-                    acts.append((cat, text, fact_importance, "fact"))
-            if not acts and not mirror_transcripts:
-                continue
+                    acts = []
+                    if mode in ("digest", "both"):
+                        digest = build_digest(sess, msgs)
+                        if digest:
+                            acts.append((digest_category, digest, digest_importance, "digest"))
+                        else:
+                            # Session became all-noise (or lost its content): remove
+                            # any digest we previously wrote so it stops injecting.
+                            if reap_memory(conn, project=proj, category=digest_category,
+                                           session_id=sess["id"], dry_run=dry_run):
+                                reaped += 1
+                                if not quiet:
+                                    log(f"[{proj}] {sess['id']}  reaped stale digest "
+                                        f"({digest_category})")
+                    if mode in ("facts", "both"):
+                        for cat, text in extract_facts(sess, msgs):
+                            acts.append((cat, text, fact_importance, "fact"))
+                    if not acts and not mirror_transcripts:
+                        continue
 
-            processed += 1
-            by_project[proj] = by_project.get(proj, 0) + 1
-            if not quiet:
-                log(f"[{proj}] {sess['id']}  {len(msgs)} turns -> {len(acts)} memories")
+                    # The storage contract is one row per (project, category,
+                    # session): find_existing() matches on those three and uses
+                    # LIMIT 1. When a session yields several facts in one
+                    # category, writing them all just rewrites the same row N
+                    # times per run (measured: 97 UPDATE+commit ops for a single
+                    # real content change) — pure WAL churn on a 340MB DB now
+                    # that this runs hourly. Collapse to the last per category,
+                    # which is exactly the row that survives today anyway.
+                    _dedup: dict[str, tuple] = {}
+                    for act in acts:
+                        _dedup[act[0]] = act
+                    acts = list(_dedup.values())
 
-            for cat, content, imp, kind in acts:
-                res = upsert_memory(conn, project=proj, category=cat, content=content,
-                                    session_id=sess["id"], importance=imp, scope=scope,
-                                    shareable=shareable, kind=kind, dry_run=dry_run)
-                tally[res] += 1
-                if not quiet and res != "skip":
-                    log(f"    {res:6} {cat:22} {_clip(content, 90)}")
+                    processed += 1
+                    by_project[proj] = by_project.get(proj, 0) + 1
+                    by_db[label] = by_db.get(label, 0) + 1
+                    if not quiet:
+                        log(f"[{label}] {sess['id']}  {len(msgs)} turns -> {len(acts)} memories")
 
-            if mirror_transcripts:
-                n = mirror_transcript(conn, sess, msgs, proj, dry_run)
-                mirrored += n
-                if not quiet and n:
-                    log(f"    mirror {n:5} transcript rows -> hermes_{sess['id']}")
+                    for cat, content, imp, kind in acts:
+                        res = upsert_memory(conn, project=proj, category=cat, content=content,
+                                            session_id=sess["id"], importance=imp, scope=scope,
+                                            shareable=shareable, kind=kind, dry_run=dry_run)
+                        tally[res] += 1
+                        if not quiet and res != "skip":
+                            log(f"    {res:6} {cat:22} {_clip(content, 90)}")
 
-            state[sess["id"]] = {"project": proj, "synced_at": int(time.time() * 1000),
-                                 "messages": len(msgs)}
+                    if mirror_transcripts:
+                        n = mirror_transcript(conn, sess, msgs, proj, dry_run)
+                        mirrored += n
+                        if not quiet and n:
+                            log(f"    mirror {n:5} transcript rows -> hermes_{sess['id']}")
+
+                    state[sess["id"]] = {"project": proj, "db": label,
+                                         "synced_at": int(time.time() * 1000),
+                                         "messages": len(msgs)}
+            finally:
+                hc.close()
 
         if not dry_run:
             save_state(state)
     finally:
         conn.close()
-        hc.close()
 
     return {
         "applied": not dry_run,
@@ -601,6 +663,8 @@ def run_sync(*, days=30.0, since=None, min_messages=6, limit=0, project="",
         "reaped": reaped,
         "mirrored_rows": mirrored,
         "by_project": by_project,
+        "by_db": by_db,
+        "dbs": [f"{label}:{p}" for label, p in dbs],
     }
 
 
@@ -649,6 +713,9 @@ def main() -> int:
         print(f"  transcript rows    : {summary['mirrored_rows']}")
     for p, c in sorted(summary["by_project"].items(), key=lambda kv: -kv[1]):
         print(f"    {p}  ({c} sessions)")
+    if summary.get("by_db"):
+        for lbl, c in sorted(summary["by_db"].items()):
+            print(f"    db {lbl}: {c} sessions")
     return 0
 
 
