@@ -1,0 +1,1163 @@
+{
+ "178": [
+  "docs/REFERENCE.md",
+  "mcp/cloud_memory_mcp.py",
+  "memcore/REPORT-2026-09-29.md"
+ ],
+ "390": [
+  "mcp/cloud_memory_mcp.py",
+  "memcore/memcore_mcp_server.py"
+ ],
+ "4": [
+  "bin/hermes-agent/agent/anthropic_adapter.py",
+  "bin/hermes-agent/hermes_cli/model_switch.py",
+  "bin/hermes-agent/website/docs/developer-guide/provider-runtime.md",
+  "bin/hermes-agent/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/developer-guide/provider-runtime.md",
+  "hermes-agent/agent/anthropic_adapter.py",
+  "hermes-agent/agent/anthropic_endpoints.py",
+  "hermes-agent/tests/agent/test_opencode_session_affinity.py",
+  "hermes-agent/website/docs/integrations/providers.md"
+ ],
+ "6083": [
+  "ARCHITECTURE.md",
+  "chat-pool/ws_bridge.py"
+ ],
+ "6352": [
+  ".inbox_index.md",
+  "ARCHITECTURE.md",
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_PROJECT-STATUS-2026-09-10.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "deprecated/docs/ARCHITECTURE.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/TOWER-LADDER-2026-09-30.md",
+  "session-ses_f155.md",
+  "tools/bake_q4.c"
+ ],
+ "6358": [
+  "pre_embedding_filter/map_standalone.py"
+ ],
+ "6359": [
+  "ARCHITECTURE.md",
+  "chat-pool/ctx_plane.py",
+  "magic-context-mcp/magic_context_mcp_server.py",
+  "pre_embedding_filter/session-ses_f719.md"
+ ],
+ "6360": [
+  "core/geo_tensor_hub.h",
+  "tools/tess_capo_verify.c",
+  "tools/tesspack_bridge.c"
+ ],
+ "6367": [
+  "tools/bfs_evict_real.c"
+ ],
+ "6368": [
+  "core/dramtile_store.c",
+  "core/dramtile_store.h",
+  "core/infra/dramtile_store.h"
+ ],
+ "6376": [
+  "tests/gnn_colab_run.py"
+ ],
+ "6379": [
+  "tools/sid_kv_compact.c",
+  "tools/sid_kv_reanchor.c",
+  "tools/sid_kv_resume.c"
+ ],
+ "6386": [
+  "tools/kv_cold_delta.c",
+  "tools/sid_kv_compact.c",
+  "tools/sid_kv_resume.c"
+ ],
+ "6388": [
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "docs/TOWER-LADDER-2026-09-30.md",
+  "docs/WALKTHROUGH-BACKLOG.md",
+  "tests/test_capo_verify_residual.c",
+  "tools/tess_gguf_pack.c",
+  "tools/tesspack_bridge.c"
+ ],
+ "6409": [
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "docs/SESSION-2026-09-26-VOL6-TAIL.md",
+  "graft/bench/vulkan_bw_pull.md",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "6419": [
+  "core/geo_tess_container.h",
+  "core/scale_bridge.h",
+  "core/tesseract_container.h",
+  "docs/tess-format-spec.md",
+  "tests/test_scale_bridge.c"
+ ],
+ "6421": [
+  "core/huff_codec.h"
+ ],
+ "6446": [
+  "docs/ROADMAP_3PHASE.md",
+  "docs/SESSION_HANDOFF_2026-09-01.md",
+  "docs/geofs-prototype-design.md"
+ ],
+ "6449": [
+  "core/geofs_core.h",
+  "docs/geofs-prototype-design.md"
+ ],
+ "6461": [
+  "session-ses_f155.md"
+ ],
+ "6463": [
+  "_recovery/extract_step3.py",
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "graft/tools/tied_dedup_chain.md",
+  "session-ses_f155.md",
+  "tools/handoff.py",
+  "tools/tied_dedup_chain.c"
+ ],
+ "6469": [
+  "AGENTS.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-07.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-10.md",
+  "docs/OPCODE_CLI_RUN.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-16.md",
+  "session-ses_f155.md"
+ ],
+ "6471": [
+  "AGENTS.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-07.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-10.md",
+  "docs/OPCODE_CLI_RUN.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-16.md",
+  "session-ses_f155.md"
+ ],
+ "6472": [
+  "AGENTS.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-16.md",
+  "session-ses_f155.md"
+ ],
+ "6473": [
+  "_recovery/extract_step3.py",
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "session-ses_f155.md",
+  "tools/handoff.py"
+ ],
+ "6474": [
+  "_recovery/extract_step3.py",
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "session-ses_f155.md",
+  "tools/handoff.py"
+ ],
+ "6490": [
+  "core/infra/dramtile_store.h",
+  "graft/core/infra/dramtile_store.md"
+ ],
+ "6491": [
+  "core/geo_ghost_lift.h",
+  "core/geofs_core.h",
+  "docs/geofs-prototype-design.md"
+ ],
+ "6492": [
+  "core/geofs_core.h",
+  "graft/core/geofs_core.md"
+ ],
+ "6493": [
+  "core/geofs_core.h",
+  "graft/core/geofs_core.md"
+ ],
+ "6496": [
+  "session-ses_f155.md"
+ ],
+ "6497": [
+  "core/infra/geo_phase_rail.h",
+  "core/infra/geo_rail_sync.h"
+ ],
+ "6499": [
+  "core/infra/fibo_spine.h"
+ ],
+ "6500": [
+  "core/breathing_fs.h"
+ ],
+ "6509": [
+  "core/tesseract_container.h",
+  "docs/CONTAINER_MIGRATION_ANALYSIS.md"
+ ],
+ "6510": [
+  ".inbox_index.md",
+  "core/dwgls_codec_tess_oct.h",
+  "core/tesseract_container.h",
+  "docs/CONTAINER_MIGRATION_ANALYSIS.md",
+  "docs/LAYERED_CONTAINER_ARCHITECTURE.md",
+  "docs/TETRA_FIELD_STRUCTURE.md",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "docs/container-unification-architectures.md",
+  "test_tess.c",
+  "tools/hyp_candidate_map.c"
+ ],
+ "6518": [
+  "core/geofs_multivol.h",
+  "tools/geos_mv_serve.c"
+ ],
+ "6536": [
+  ".inbox_index.md",
+  "core/layer_manifest.h",
+  "graft/core/layer_manifest.md",
+  "graft/tools/layer_manifest_probe.md",
+  "tools/layer_manifest_probe.c"
+ ],
+ "6541": [
+  "graft/tools/kv_rid_serve.md",
+  "tools/kv_rid_serve.c"
+ ],
+ "6542": [
+  "tools/gguf_roundtrip.c"
+ ],
+ "6550": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "docs/HANDOFF-2026-09-01.md"
+ ],
+ "6551": [
+  "docs/ARCHIMEDEAN-STOCK-2026-08-22.md",
+  "docs/HANDOFF-2026-08-21-hyperbolic-geofs-serve.md",
+  "docs/HANDOFF-RID-PIPE-2026-08-23.md",
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "session-ses_f155.md",
+  "tests/test_gguf_graft_llama.c",
+  "tests/test_kv_delta.c",
+  "tests/test_tesspack_graft_llama.c",
+  "tools/dual_lazy_serve.c",
+  "tools/kv_dump_turns.c"
+ ],
+ "6555": [
+  "tests/test_tesspack_graft_llama.c",
+  "tools/gguf_graft_belt.c",
+  "tools/gguf_graft_page.c",
+  "tools/gguf_lazy_serve.c",
+  "tools/hj_infer_proof.c",
+  "tools/kv_quant_3level.c",
+  "tools/kv_rid_serve.c",
+  "tools/mem_reserve_test.c",
+  "tools/moe_expert_graft.c",
+  "tools/tesspack_llama_view.c"
+ ],
+ "6559": [
+  "collection/rdh/kv_page_rdh.h",
+  "core/geo_pyramid_carrier.h",
+  "core/kv_remap.h",
+  "core/kv_remap_rail.h",
+  "core/tess_moe_bridge.h",
+  "deprecated/dropbag/container_test.py",
+  "tests/test_moe_jet.c",
+  "tools/geo_kv_real_bench.c",
+  "tools/moe_expert_route.c",
+  "tools/tess_moe_bridge.c"
+ ],
+ "6582": [
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md",
+  "core/geo_monitor.h",
+  "deprecated/docs/ARCHITECTURE.md",
+  "tests/test_gguf_graft_llama.c",
+  "tests/test_monitor.c",
+  "tools/gguf_lazy_serve.c",
+  "tools/moe_expert_graft.c"
+ ],
+ "6626": [
+  "deprecated/docs/ARCHITECTURE.md",
+  "docs/tess-format-spec.md",
+  "tests/gguf_geometry_complete.c",
+  "tests/test_kis_v4_real_gguf.c",
+  "tools/bake_gcube.c",
+  "tools/dwgls_geo_cli.c",
+  "tools/gguf_tool.c",
+  "tools/tess_assemble.c",
+  "tools/tesspack_breathe_view.c",
+  "tools/tesspack_stream_view.c"
+ ],
+ "6639": [
+  "docs/MEMORY-EVIDENCE-2026-08-10.md"
+ ],
+ "6654": [
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "tools/mem_reserve_test.c",
+  "tools/moe_stream_proof.c"
+ ],
+ "6687": [
+  "tools/beam_cost_probe.c"
+ ],
+ "6695": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/TOWER-LADDER-2026-09-30.md"
+ ],
+ "6697": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_PROJECT-STATUS-2026-09-10.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/BASE-DISTILL-Y9-RDH-REPORT.md",
+  "docs/KV-QUANT-THRESHOLD-2026-09-23.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/TOWER-LADDER-2026-09-30.md",
+  "tests/test_qwen3_microscope.c",
+  "tools/bake_q4.c"
+ ],
+ "6709": [
+  "bench/tess_scatter_bench.cu",
+  "bench/tess_scatter_bench_v2.cu",
+  "bench/tess_scatter_decode.cu",
+  "core/infra/tess_scatter_gpu.h",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "graft/core/infra/tess_scatter_gpu.md"
+ ],
+ "6732": [
+  "tools/dual_lazy_serve.c"
+ ],
+ "6734": [
+  "tools/moe_expert_graft.c"
+ ],
+ "6735": [
+  "tools/gguf_lazy_serve.c"
+ ],
+ "6736": [
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-04.md",
+  "bench/bench_hex_quad_upgrades.c",
+  "bench/gpu_bandwidth_bench.cu",
+  "bench/gpu_batch_break_even.cu",
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "tools/bfs_user_mmap.c",
+  "tools/gguf_lazy_serve.c",
+  "tools/moe_expert_graft.c",
+  "tools/tesspack_bridge.c",
+  "tools/tesspack_stream_view.c"
+ ],
+ "6738": [
+  "ARCHITECTURE.md",
+  "deprecated/docs/ARCHITECTURE.md",
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "tools/tess_gguf_pack.c",
+  "tools/tess_packer.c",
+  "tools/tesspack_server.c",
+  "tools/tesspack_verify_pure_c.c"
+ ],
+ "6739": [
+  "core/dwgls_codec_tess.h",
+  "tests/test_codec_tess.c"
+ ],
+ "6742": [
+  "docs/TESSPACK-DENSE-MODEL-LIMITATION.md"
+ ],
+ "6744": [
+  "docs/TESSPACK-DENSE-MODEL-LIMITATION.md",
+  "tools/tess_gguf_pack.c"
+ ],
+ "6745": [
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "tools/gguf_gpu_zerocopy.c",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "6746": [
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "docs/TOWER-LADDER-2026-09-30.md",
+  "tools/tess_gguf_pack.c"
+ ],
+ "6752": [
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md"
+ ],
+ "6753": [
+  "ARCHITECTURE.md",
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md"
+ ],
+ "6754": [
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md"
+ ],
+ "6755": [
+  "collection/beam_addressing/beam_value.c",
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "tools/moe_stream_proof.c",
+  "tools/tess_gguf_pack.c"
+ ],
+ "6763": [
+  "core/codec_tess.h",
+  "core/geo_tensor_hub.h"
+ ],
+ "6766": [
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "tools/iso_user_path.c",
+  "tools/tesspack_bridge.c"
+ ],
+ "6767": [
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md"
+ ],
+ "6779": [
+  "tests/test_gguf_graft_llama.c",
+  "tools/tess_init_test.c"
+ ],
+ "6780": [
+  "docs/octahedron-addressing-research.md"
+ ],
+ "6786": [
+  "docs/octahedron-addressing-research.md"
+ ],
+ "6823": [
+  "ARCHITECTURE.md",
+  "bench/tess_scatter_bench.cu",
+  "core/beam_entropy_container.h",
+  "core/geo_tess_container.h",
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "tools/tess_gguf_pack.c",
+  "tools/tesspack_verify_pure_c.c"
+ ],
+ "6846": [
+  "docs/AGENTS-PATCH-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "tests/test_wonder_cube.c"
+ ],
+ "6855": [
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-13.md"
+ ],
+ "6907": [
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md"
+ ],
+ "6917": [
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-14.md",
+  "docs/COLD-KV-ARCH-2026-09-23.md",
+  "docs/HANDOFF-2026-08-09.md",
+  "docs/LEGACY_TESTS.md",
+  "docs/Primitives/DWGLS_vs_FGLS_DIFF.md",
+  "docs/RAIL_HUB_PLAN.md",
+  "docs/ROADMAP_3PHASE.md",
+  "docs/SESSION_HANDOFF_2026-09-01.md",
+  "docs/TIMELINE_WORKING_MODEL.md"
+ ],
+ "6925": [
+  "docs/VERIFY-SPARKX25-2026-09-17.md",
+  "tools/lora_accuracy_probe.c",
+  "tools/synth_lora_build.c"
+ ],
+ "6927": [
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md",
+  "docs/TRACE-MOE-EXPERT-AFFINITY-2026-09-17.md",
+  "tools/dual_lazy_serve.c"
+ ],
+ "6932": [
+  ".inbox_index.md",
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "core/moe_expert_addr.h",
+  "core/tess_moe_bridge.h",
+  "deprecated/docs/ARCHITECTURE.md",
+  "docs/Primitives/DWGLS_vs_FGLS_DIFF.md",
+  "docs/SESSION_HANDOFF_2026-09-01.md",
+  "tools/moe_expert_bake.c",
+  "tools/moe_expert_demo.c"
+ ],
+ "6949": [
+  "docs/LANGUAGES.md",
+  "docs/REPORT-COLAB-DWGLS-2026-08-24.md",
+  "tools/hexagram_cubes_probe.c"
+ ],
+ "6951": [
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "docs/DUALWORLD-GENESIS-2026-09-18.md",
+  "docs/PIPELINE-MAP.md",
+  "tools/tesspack_assemble.c"
+ ],
+ "6956": [
+  "AGENTS.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "docs/OPCODE_CLI_RUN.md",
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "6974": [
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-14.md"
+ ],
+ "7011": [
+  "bench/tess_scatter_bench_v2.cu",
+  "core/dramtile_store.c",
+  "core/dramtile_store.h",
+  "core/geo_fcc_dramtile.h",
+  "core/infra/dramtile_store.h"
+ ],
+ "7023": [
+  "AGENTS.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "docs/OPCODE_CLI_RUN.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "7057": [
+  "core/geo_tower_ladder.h"
+ ],
+ "7065": [
+  "core/geo_tower_ladder.h"
+ ],
+ "7066": [
+  "core/geo_jump_container.h",
+  "core/geo_sync_bridge.h",
+  "core/geo_tower_ladder.h",
+  "docs/TETRA_FIELD_STRUCTURE.md",
+  "graft/sid/geo_jump.md",
+  "tests/geo_jump_real_test.c",
+  "tests/test_geo_jump_roles.c"
+ ],
+ "7073": [
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "docs/COMPILE-TO-MANIFEST-2026-10-01.md",
+  "graft/tools/geo_field_query.md",
+  "tools/geo_field_query.c"
+ ],
+ "7074": [
+  "docs/COMPILE-TO-MANIFEST-2026-10-01.md",
+  "docs/OVERVIEW.md",
+  "docs/TESSPACK-DENSE-MODEL-LIMITATION.md",
+  "docs/TESSPACK-RESIDUAL-SPEC.md",
+  "docs/TIMELINE_WORKING_MODEL.md"
+ ],
+ "7078": [
+  "tests/test_chain_compile.c"
+ ],
+ "7080": [
+  "core/geo_ghost_lift.h",
+  "core/infra/fibo_spine.h",
+  "core/residual_space.h",
+  "docs/HANDOFF-2026-08-16-ghost-lift-chain.md",
+  "docs/Primitives/DWGLS_PRIMITIVES.md",
+  "docs/TIMELINE_WORKING_MODEL.md",
+  "tests/test_residual_space.c"
+ ],
+ "7086": [
+  "docs/SYNC-REPORT-2026-09-16.md",
+  "session-ses_f155.md"
+ ],
+ "7087": [
+  "session-ses_f155.md"
+ ],
+ "7102": [
+  "docs/ACTION-PLAN-2026-08-22.md",
+  "docs/imgs/prompts/01-framework-pipeline-map-blueprint.md"
+ ],
+ "7105": [
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-07.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md",
+  "session-ses_f155.md"
+ ],
+ "7124": [
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md"
+ ],
+ "7125": [
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md"
+ ],
+ "7156": [
+  "tools/inbox_manager.py"
+ ],
+ "7158": [
+  "core/anchor_route.h"
+ ],
+ "7163": [
+  ".inbox_index.md",
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "core/anchor_route.h",
+  "core/bfs_quadtree.h",
+  "core/geo_jump_container.h",
+  "core/mm_wang6.h",
+  "docs/PLAN-HNSW-MAZE.md",
+  "graft/sid/geo_jump.md",
+  "tests/geo_jump_explore.c",
+  "tests/test_anchor_route.c"
+ ],
+ "7165": [
+  "core/anchor_route.h"
+ ],
+ "7181": [
+  "AGENTS.md"
+ ],
+ "7183": [
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md"
+ ],
+ "7201": [
+  "core/scale_bridge.h"
+ ],
+ "7202": [
+  "graft/tools/tess_bake.md",
+  "graft/tools/tess_gguf_pack.md",
+  "tools/tess_bake.c",
+  "tools/tess_gguf_pack.c",
+  "tools/tesspack_assemble.c"
+ ],
+ "7203": [
+  "core/geo_tess_container.h",
+  "core/kis_codec_v6.h",
+  "tests/kis_codec_v6_test.c"
+ ],
+ "7204": [
+  "core/bfs_persist.h",
+  "core/bfs_v6b_adapter.h",
+  "graft/core/bfs_v6b_adapter.md"
+ ],
+ "7205": [
+  "core/bfs_v6b_adapter.h",
+  "core/kis_codec_v6b.h",
+  "tests/test_kis_v6b.c"
+ ],
+ "7207": [
+  "bench/tess_scatter_bench_v2.cu",
+  "deprecated/docs/ARCHITECTURE.md",
+  "deprecated/docs/STRUCTURE.md",
+  "docs/GPU-SMALL-BATCH-OVERHEAD-2026-09-23.md",
+  "docs/Primitives/DWGLS_vs_FGLS_DIFF.md"
+ ],
+ "7209": [
+  "tests/test_virtual_alloc.c",
+  "tools/gguf_graft_page.c",
+  "tools/mem_reserve_test.c"
+ ],
+ "7214": [
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "docs/AGENTS-PATCH-2026-09-15.md",
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "tools/hj_infer_proof.c",
+  "tools/kv_cold_reanchor.c",
+  "tools/logit_compare.c",
+  "tools/mem_reserve_test.c"
+ ],
+ "7215": [
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "tools/iso_user_path.c"
+ ],
+ "7216": [
+  "AGENTS.md",
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-05.md",
+  "_recovery/gap_2026-09-04_to_09-15/02_capture_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-07.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-08.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_thin_2026-09-10.md",
+  "docs/OPCODE_CLI_RUN.md",
+  "docs/SYNC-REPORT-2026-09-15.md",
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "7217": [
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "7218": [
+  "core/adaptive_memory_bridge.h",
+  "core/bfs_tensor_pipeline.h",
+  "core/frustum_memory_adapter.h",
+  "core/frustum_route.h",
+  "core/gguf_frustum_adapter.h",
+  "sid/adaptive_route_sid.h",
+  "tests/test_frustum_memory_adapter.c",
+  "tests/test_frustum_memory_resolve.c",
+  "tests/test_gguf_frustum_direct.c",
+  "tools/bfs_tensor_pipeline.c"
+ ],
+ "7221": [
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "tests/gnn_colab_run.py",
+  "tests/gnn_colab_test_real.py",
+  "tests/gnn_colab_train_fan24.py",
+  "tests/gnn_colab_train_real.py"
+ ],
+ "7224": [
+  "docs/octahedron-addressing-research.md"
+ ],
+ "7226": [
+  "core/geo_tower_ladder.h",
+  "docs/TOWER-LADDER-2026-09-30.md"
+ ],
+ "7231": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/KV-QUANT-THRESHOLD-2026-09-23.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/TOWER-LADDER-2026-09-30.md"
+ ],
+ "7239": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/KV-QUANT-THRESHOLD-2026-09-23.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/TOWER-LADDER-2026-09-30.md"
+ ],
+ "7245": [
+  "_recovery/gap_2026-09-04_to_09-15/01_sessions_json.md",
+  "_recovery/gap_2026-09-04_to_09-15/03_vectorize_search.md",
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "7261": [
+  "collection/rdh/tests/enclosure_livedemo.c",
+  "core/bfs_persist.h",
+  "core/dramtile_store.h",
+  "core/residual_space.h",
+  "tools/ann_pipe_real.c"
+ ],
+ "7272": [
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-04.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-07.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md",
+  "docs/FORAGE-GATE-2026-10-05.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/SYNC-REPORT-2026-09-16.md",
+  "tools/session_trail.py"
+ ],
+ "7273": [
+  "docs/FORAGE-GATE-2026-10-05.md"
+ ],
+ "7309": [
+  "core/geo_wang_latch.h",
+  "tests/test_wang_latch.c",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7314": [
+  "docs/MEMORY-EVIDENCE-2026-08-10.md"
+ ],
+ "7315": [
+  "docs/FIELD-ADDRESS-PROOF-2026-10-05.md",
+  "tools/dual_lazy_serve.c"
+ ],
+ "7316": [
+  "HANDOFF_TESSPACK_VERIFY.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_PROJECT-STATUS-2026-09-10.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/BASE-DISTILL-Y9-RDH-REPORT.md",
+  "docs/KV-QUANT-THRESHOLD-2026-09-23.md",
+  "docs/PROJECT-STATUS-2026-09-10.md",
+  "docs/SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "docs/TOWER-LADDER-2026-09-30.md",
+  "tests/test_qwen3_microscope.c",
+  "tools/bake_q4.c",
+  "tools/gguf_lazy_serve.c",
+  "tools/verify_field.c"
+ ],
+ "7318": [
+  "docs/FIELD-ADDRESS-PROOF-2026-10-05.md",
+  "tools/dual_lazy_serve.c",
+  "tools/field_address.c",
+  "tools/verify_field.c"
+ ],
+ "7320": [
+  "core/anchor_route.h",
+  "tools/forage_real.c"
+ ],
+ "7321": [
+  "tools/forage_real.c",
+  "tools/sift1m_prep.py"
+ ],
+ "7326": [
+  "core/geo_jump_container.h",
+  "graft/sid/geo_jump.md"
+ ],
+ "7329": [
+  "docs/FORAGE-GATE-2026-10-05.md",
+  "tools/forage_real.c",
+  "tools/sift1m_prep.py"
+ ],
+ "7333": [
+  "tools/inbox_board.py",
+  "tools/inbox_manager.py"
+ ],
+ "7335": [
+  "tools/forage_real.c"
+ ],
+ "7337": [
+  "collection/beam_addressing/beam_geo_group.c",
+  "core/kv_remap.h",
+  "core/tesseract_container.h",
+  "deprecated/PasteBin/zone_card.h",
+  "graft/collection/beam_addressing/det_codec.md",
+  "sid/zone_card.h",
+  "tests/spike_offset_sweep.c",
+  "tests/test_pair_table.c",
+  "tests/test_tess_leverage.c",
+  "tools/forage_real.c"
+ ],
+ "7338": [
+  "tools/gguf_lazy_serve.c",
+  "tools/verify_field.c"
+ ],
+ "7339": [
+  "core/kis_codec_v6.h",
+  "tools/forage_real.c"
+ ],
+ "7342": [
+  "bench/ann_route_kmeans.py",
+  "bench/ann_route_rule.py",
+  "bench/ann_route_sweep.py",
+  "docs/ANN-PRUNING-LIMIT-2026-10-08.md",
+  "docs/EMBED-500-TOKENIZER-GAP-2026-10-07.md",
+  "docs/HANDOFF-ANN-2026-10-07.md",
+  "docs/PLAN-HNSW-MAZE.md",
+  "experiments/ann-climate-2026-09-24/sift/bench_serve_overlap.c",
+  "tests/test_lazy_serve_search.c",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7344": [
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "_recovery/gap_2026-09-04_to_09-15/05_magicctx_2026-09-10.md",
+  "docs/ANN-CLIMATE-CAMPAIGN-2026-09-24.md",
+  "docs/HANDOFF-ANN-2026-10-07.md",
+  "docs/LLAMA-USER-BUFFER-PATCH.md",
+  "tests/test_lazy_serve_search.c",
+  "tools/dual_lazy_serve.c",
+  "tools/gguf_lazy_serve.c",
+  "tools/logit_compare.c"
+ ],
+ "7345": [
+  "Makefile",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7346": [
+  "core/frustum_route.h",
+  "tools/forage_real.c"
+ ],
+ "7347": [
+  "core/adaptive_memory_bridge.h",
+  "core/frustum_memory_adapter.h",
+  "core/frustum_route.h",
+  "sid/adaptive_route_sid.h",
+  "sid/zone_card_sid.h",
+  "tests/test_frustum_descent.c",
+  "tests/test_frustum_memory_resolve.c",
+  "tests/test_gguf_frustum_direct.c",
+  "tools/bfs_tensor_pipeline.c",
+  "tools/kv_graph_probe.c"
+ ],
+ "7352": [
+  "core/geo_wang_latch.h",
+  "docs/ANN-SYSTEM-REPORT-2026-10-08.md",
+  "docs/HANDOFF-2026-10-08-ann-tombstone.md",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7370": [
+  "ann/src/ann_search.c"
+ ],
+ "7371": [
+  "ann/src/ann_search.c"
+ ],
+ "7372": [
+  "ann/src/ann_search.c"
+ ],
+ "7373": [
+  "cloud_ws/memcore/tray_window.py"
+ ],
+ "7395": [
+  "I:/Hermes/sessions/saved/hermes_conversation_20261009_222340.json"
+ ],
+ "7396": [
+  "I:/Hermes/sessions/saved/hermes_conversation_20261009_222340.json"
+ ],
+ "7397": [
+  "I:/Hermes/profile-exports/default/sessions/saved"
+ ],
+ "7400": [
+  "ann/src/ann_search.c"
+ ],
+ "7401": [
+  "ann/src/ann_search.c"
+ ],
+ "7405": [
+  "ann/FORK.md",
+  "ann/README.md",
+  "ann/src/ann_search.c"
+ ],
+ "7408": [
+  "ann/include/anchor_route.h",
+  "ann/include/geo_wang_latch.h"
+ ],
+ "7414": [
+  "ann/include/anchor_letter.h"
+ ],
+ "7417": [
+  "ann/include/anchor_route.h",
+  "ann/tests/test_anchor_determinism.c",
+  "ann/tests/test_anchor_route.c",
+  "ann/tests/test_anchor_routed.c"
+ ],
+ "7418": [
+  "ann/include/anchor_route.h"
+ ],
+ "7419": [
+  "ann/src/ann_search.c"
+ ],
+ "7420": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/include/geo_curve_snapshot.h",
+  "ann/include/rdh_addr.h"
+ ],
+ "7421": [
+  "ann/include/anchor_route.h"
+ ],
+ "7427": [
+  "ann/include/anchor_route.h"
+ ],
+ "7429": [
+  "ann/include/anchor_route.h",
+  "ann/include/geo_wang_latch.h"
+ ],
+ "7430": [
+  "ann/src/ann_search.c"
+ ],
+ "7432": [
+  "ann/include/anchor_route.h"
+ ],
+ "7436": [
+  "ann/include/anchor_route.h"
+ ],
+ "7437": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c"
+ ],
+ "7438": [
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c"
+ ],
+ "7439": [
+  "ann/STRESS-REPORT.md",
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c",
+  "ann/tests/test_wang_latch.c"
+ ],
+ "7440": [
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c",
+  "ann/tests/test_wang_latch.c"
+ ],
+ "7441": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/include/geo_id_route_log.h",
+  "ann/include/geo_wang_latch.h",
+  "ann/tests/test_wang_latch.c"
+ ],
+ "7442": [
+  "ann/include/anchor_letter.h",
+  "ann/include/anchor_route.h",
+  "ann/src/ann_search.c",
+  "ann/tests/test_anchor_letter.c"
+ ],
+ "7444": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/include/geo_wang_latch.h",
+  "ann/tests/test_wang_latch.c"
+ ],
+ "7445": [
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/STRESS-REPORT.md"
+ ],
+ "7446": [
+  "ann/include/geo_id_route_log.h",
+  "ann/include/geo_wang_latch.h",
+  "ann/tests/test_wang_latch.c"
+ ],
+ "7447": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/include/geo_id_route_log.h",
+  "ann/include/geo_wang_latch.h"
+ ],
+ "7450": [
+  "ann/include/anchor_route.h",
+  "ann/src/ann_search.c",
+  "ann/tests/test_anchor_route.c"
+ ],
+ "7451": [
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/STRESS-REPORT.md",
+  "ann/tests/test_anchor_determinism.c"
+ ],
+ "7452": [
+  "ann/include/anchor_route.h",
+  "ann/tests/test_anchor_determinism.c"
+ ],
+ "7453": [
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/STRESS-REPORT.md",
+  "ann/tests/test_anchor_determinism.c"
+ ],
+ "7454": [
+  "ann/FORK.md",
+  "ann/include/anchor_route.h"
+ ],
+ "7456": [
+  "ann/include/anchor_route.h",
+  "ann/tests/test_anchor_determinism.c"
+ ],
+ "7466": [
+  "ann/include/geo_curve_snapshot.h",
+  "pre_embedding_filter/session-ses_f719.md"
+ ],
+ "7473": [
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/STRESS-REPORT.md"
+ ],
+ "7493": [
+  "chat-pool/kv_pool_bridge.py"
+ ],
+ "7494": [
+  "chat-pool/kv_pool_bridge.py"
+ ],
+ "750": [
+  ".inbox_index.md",
+  "ARCHITECTURE.md",
+  "STRUCTURE.md",
+  "_recovery/gap_2026-09-04_to_09-15/07_doc_SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "bench/make_deploy_v3.py",
+  "bench/make_deploy_v4.py",
+  "deprecated/docs/ARCHITECTURE.md",
+  "deprecated/docs/STRUCTURE.md",
+  "docs/SESSION-2026-09-10-GPU-SCATTER-DECODE.md",
+  "tools/tess_gguf_pack.c"
+ ],
+ "7501": [
+  "chat-pool/kv_pool_bridge.py"
+ ],
+ "7502": [
+  "ann/STRESS-REPORT.md",
+  "ann/include/geo_id_route_log.h",
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c"
+ ],
+ "752": [
+  "core/geo_hex_layer.h",
+  "core/hex_tile.h",
+  "docs/Primitives/DWGLS_CAPABILITIES.md",
+  "graft/core/geo_hex_layer.md",
+  "graft/core/hex_tile.md",
+  "tests/test_tess_hex_delta.c",
+  "tests/test_tess_trace.c"
+ ],
+ "7521": [
+  "chat-pool/pool.py"
+ ],
+ "7544": [
+  "tools/rdh_bench.c"
+ ],
+ "7554": [
+  "ann/STRESS-REPORT.md",
+  "ann/ann_route_watch.py",
+  "ann/src/ann_search.c"
+ ],
+ "7555": [
+  "ann/README.md",
+  "ann/ann_keepalive.py",
+  "ann/src/ann_search.c"
+ ],
+ "7558": [
+  "ann/README.md",
+  "ann/STRESS-REPORT.md",
+  "ann/include/anchor_route.h",
+  "ann/include/geo_wang_latch.h",
+  "ann/src/ann_search.c"
+ ],
+ "7562": [
+  "chat-pool/kv_pool_bridge.py",
+  "chat-pool/run_all.py"
+ ],
+ "7563": [
+  "ann/src/ann_search.c"
+ ],
+ "7567": [
+  "docs/RELABEL-2026-10-11.md",
+  "experiments/relabel-2026-10-11/truth.json",
+  "tools/relabel_index.c"
+ ],
+ "7571": [
+  "pre_embedding_filter/session-ses_f719.md"
+ ],
+ "7578": [
+  "core/rdh_capture.h",
+  "tests/test_anchor_metatron.c"
+ ],
+ "7579": [
+  "docs/ANN-SYSTEM-REPORT-2026-10-08.md",
+  "docs/HANDOFF-ANN-2026-10-07.md",
+  "docs/PLAN-HNSW-MAZE.md",
+  "docs/RELABEL-2026-10-11.md",
+  "experiments/kv-user-2026-10-11/README.md",
+  "experiments/relabel-2026-10-11/recall.py",
+  "include/kv_index_section.h",
+  "tests/test_kv_index_section.c",
+  "tools/build_derived_anchors.c",
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7580": [
+  "tools/gguf_lazy_serve.c"
+ ],
+ "7597": [
+  "docs/VERIFY-SPARKX25-2026-09-17.md"
+ ],
+ "7613": [
+  "core/rdh_capture.h"
+ ],
+ "7615": [
+  "ann/GRAPH-ROUTE.md",
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/README.md",
+  "ann/src/ann_search.c"
+ ],
+ "7616": [
+  "ann/scripts/graft_bias.py",
+  "ann/src/ann_search.c"
+ ],
+ "7618": [
+  "ann/src/ann_search.c"
+ ],
+ "7639": [
+  "docs/SYNC-REPORT-2026-09-16.md"
+ ],
+ "7652": [
+  "ARCHITECTURE.md",
+  "tests/test_breathing_fs.c"
+ ],
+ "7655": [
+  "tools/gguf_lazy_serve.c"
+ ],
+ "98": [
+  "bin/hermes-agent/gateway/kanban_watchers.py",
+  "bin/hermes-agent/hermes_cli/kanban.py",
+  "bin/hermes-agent/hermes_cli/kanban_db.py",
+  "bin/hermes-agent/website/docs/user-guide/features/kanban.md",
+  "hermes-agent/gateway/kanban_watchers_dispatcher.py",
+  "hermes-agent/hermes_cli/kanban_db.py",
+  "hermes-agent/hermes_cli/kanban_ops.py",
+  "hermes-agent/tests/hermes_cli/test_kanban_memory_guard.py",
+  "hermes-agent/website/docs/user-guide/features/kanban.md"
+ ],
+ "99": [
+  "AGENTS.md",
+  "bin/hermes-agent/plugins/memory/holographic/__init__.py",
+  "bin/hermes-agent/tests/agent/test_memory_provider.py",
+  "hermes-agent/plugins/memory/holographic/__init__.py",
+  "hermes-agent/tests/agent/test_memory_provider.py",
+  "scripts/auto_ingest_memory.py"
+ ]
+}
