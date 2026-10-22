@@ -62,6 +62,7 @@ typedef SOCKET sock_t;
 
 #include "anchor_route.h"
 #include "geo_wang_latch.h"
+#include "nfkc_table.h"
 
 /* ── paths (overridable so the fork is not hard-wired to one checkout) ──
  * ANN is the search core; KV is a USER of it, not part of it. The default
@@ -400,28 +401,32 @@ static int lz_sanitize(char *dst, int cap, const char *src) {
         if (cp >= 0x1D400 && cp <= 0x1D7FF) { if (lz_math_series(cp, dst, cap, &di)) continue; }
         /* fullwidth forms FF01..FF5E: NFKC shifts to ASCII (exact) */
         if (cp >= 0xFF01 && cp <= 0xFF5E) { lz_utf8_put(dst, &di, cap, cp - 0xFEE0); continue; }
-        /* halfwidth katakana FF61..FF9F: NFKC expands to fullwidth katakana
-         * (in the corpus build), we approximate by a hole — measured 500 raw */
-        if (cp >= 0xFF61 && cp <= 0xFF9F) { if (di < cap - 1) dst[di++] = ' '; continue; }
+        /* (FF61..FF9F halfwidth katakana hand rule removed — a hole-in-space is
+         * NOT what the corpus build does; NFKC expands ｱ to ア. The generated
+         * table carries the exact expansion, so the parity comes out of it.) */
         /* ideographic space */
         if (cp == 0x3000) { if (di < cap - 1) dst[di++] = ' '; continue; }
-        /* vulgar fractions + Roman numerals 2150..217F: NFKC expands — map
-         * each to its ASCII form (measured all 500 raw) */
-        if (cp >= 0x2150 && cp <= 0x217F) {
-            static const char *vu[] = {
-                "1/7","1/9","1/10","1/3","2/3","1/5","2/5","3/5","4/5","1/6","5/6",
-                "1/8","3/8","5/8","7/8","1/",
-                "I","II","III","IV","V","VI","VII","VIII","IX","X","XI","XII","L","C","D","M",
-                "i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","l","c","d","m",
-            };
-            const char *r2 = vu[cp - 0x2150];
-            for (const char *r = r2; *r && di < cap - 1; r++) dst[di++] = *r;
-            continue;
-        }
+        /* (vulgar fractions + Roman numerals 2150..217F removed — the hand range
+         * mapped REAL NFKC results like "3/5" with an ASCII slash while Python's
+         * NFKC keeps U+2044 fraction slash. The generated table holds the exact
+         * NFKC output for the whole range, so the parity comes out of the table.) */
         if (lz_is_thai_hole(cp)) continue;  /* drop: unrepresentable in this tokenizer */
         /* control/whitespace the tokenizer also 500s on (measured): \n \t \r and
          * other C0 controls -> a single space (keeps word separation, no hole). */
         if (cp < 0x20 || cp == 0x7F) { if (di < cap - 1) dst[di++] = ' '; continue; }
+        /* generated NFKC table (unicodedata — the exact normalize the corpus
+         * build embeds from) + sidecar-vocab gate: a cp the loaded GGUF vocab
+         * cannot represent 500s the sidecar even after NFKC (measured — no
+         * byte-fallback tokens in this tokenizer), so the vocab bitmap decides:
+         * in-vocab -> pass raw; not in vocab -> NFKC to a representable form
+         * when possible; otherwise drop the cp entirely. */
+        unsigned noff; unsigned char nlen;
+        if (cp > 0xFFFF) continue;                   /* astral: out of vocab, drop */
+        if (nfkc_in_vocab(cp)) { lz_utf8_put(dst, &di, cap, cp); continue; }
+        if (nfkc_lookup(cp, &noff, &nlen)) {
+            for (unsigned char j = 0; j < nlen && di < cap - 1; j++) dst[di++] = (char)nfkc_pool[noff + j];
+            continue;
+        }
         lz_utf8_put(dst, &di, cap, cp);
     }
     dst[di] = '\0';
@@ -909,6 +914,51 @@ static double lz_now_ms(void) {
     return (double)qt.QuadPart * 1000.0 / (double)qf.QuadPart;
 }
 
+/* ── Phase 0 canary (env ANN_CANARY=1) ─────────────────────────────────
+ * Option B (delete the sidecar + order; boot = replay the note and
+ * re-assign every row) is decided by a MEASUREMENT, not an opinion. This
+ * records exactly the facts that decision needs and nothing else:
+ *   per query — cache hit, align verdict, buckets visited/shut/skipped,
+ *               note (latch) events, scored / items_total
+ *   boot      — index load + note replay ms, and the ONE-SHOT cost of
+ *               re-assigning every row (the Option-B boot sweep)
+ *   skew      — per-bucket row counts (the phase-2 gate)
+ * Off by default: no file I/O and no counters when ANN_CANARY is unset.
+ * The record is one JSON line per query in <index>.canary.log so a gate
+ * script can read numbers, never a summary. */
+typedef struct {
+    long queries, cache_hit, cache_miss;
+    long warm_taken, align_cold, align_no_shut, align_all_shut, align_no_fit;
+    long buckets_visited, buckets_shut, buckets_skipped, note_events;
+    long scored_sum, nent_last, budget_last;
+    long note_bytes, note_records;
+    double boot_ms, boot_fog_ms, reassign_ms;
+    long reassign_rows;
+} LZCanary;
+static LZCanary g_cy;
+static int g_cy_on = 0;           /* env ANN_CANARY */
+static int g_cy_recompute = 0;    /* env ANN_CANARY_RECOMPUTE (boot sweep) */
+static const char *cy_path(void) {
+    static char p[640];
+    snprintf(p, sizeof(p), "%s.canary.log", PATH_INDEX);
+    return p;
+}
+static void cy_emit(const char *fmt, ...) {
+    if (!g_cy_on) return;
+    FILE *f = fopen(cy_path(), "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+static void cy_note_size(void) {
+    struct stat st;
+    if (PATH_LOG && stat(PATH_LOG, &st) == 0) {
+        g_cy.note_bytes = (long)st.st_size;
+        g_cy.note_records = (long)(st.st_size / IR_LOG_RECORD_SIZE);
+    }
+}
+
 /* ── regrow-side cache borrow (2026-10-22: regrow ไม่ parse เอง) ───────────
  * The incremental/full regrow used to call lz_index_load() itself — ~50 s on
  * a 258 MB jsonl, a pure duplicate of the parse the background loader had
@@ -1074,6 +1124,39 @@ static int lz_route_cached(int nent) {
     g_ord_cache = ord; g_ord_n = nent;
     for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
     return 1;
+}
+
+/* Option-B boot gate: what would it COST to throw the sidecar + order away
+ * and re-derive every row's bucket from (note replay + table)? This runs
+ * the same sweep the regrow does for new rows, over the whole index, once
+ * at boot — under env ANN_CANARY_RECOMPUTE only, because it is a
+ * measurement, not a feature. Assignments are NOT written: the sidecar
+ * stays the served truth. */
+static void cy_measure_reassign(void) {
+    LZEntry *ents = NULL; int nent = 0;
+    if (!lz_index_cached(&ents, &nent) || nent <= 0 || !ents) return;
+    if (!lz_route_cached(nent) || !g_anch_cache) return;
+    int t2[ANCHR_MAXK];
+    long rows = 0, hits = 0;
+    double t0 = lz_now_ms();
+    for (int i = 0; i < nent; i++) {
+        if (!ents[i].vec) continue;
+        int nb = anch_route(ents[i].vec, g_anch_cache, g_anch_k, g_anch_dim,
+                            LZ_OVERLAP_TOPB, t2);
+        rows++; if (nb > 0) hits++;
+    }
+    g_cy.reassign_ms = lz_now_ms() - t0;
+    g_cy.reassign_rows = rows;
+    lz_diag("[canary] option-b reassign: %ld rows (%ld hits) in %.1f ms "
+            "(%.2f us/row) K=%d dim=%d\n",
+            rows, hits, g_cy.reassign_ms,
+            rows ? g_cy.reassign_ms * 1000.0 / (double)rows : 0.0,
+            g_anch_k, g_anch_dim);
+    cy_emit("{\"event\":\"option-b-reassign\",\"rows\":%ld,\"hits\":%ld,"
+            "\"ms\":%.1f,\"us_per_row\":%.2f,\"K\":%d,\"dim\":%d}",
+            rows, hits, g_cy.reassign_ms,
+            rows ? g_cy.reassign_ms * 1000.0 / (double)rows : 0.0,
+            g_anch_k, g_anch_dim);
 }
 
 /* ── dot product (H -> G: 4 independent accumulator chains) ──────────
@@ -1381,6 +1464,10 @@ static int lz_mem_search(const float *qv, int qd,
     int rb[ANN_MAXK];
     for (int ri = 0; ri < ANN_MAXK; ri++) rb[ri] = 0;
     int rnb = 0, breads = 1, scored = 0;
+    /* canary (Phase 0): the align verdict and the skipped count are facts
+     * about THIS walk, so they are collected here and emitted once at the
+     * end. All zero when ANN_CANARY is off. */
+    int cy_nb_shut = 0, cy_warm = 0, cy_notes = 0;
     int truncated = 0;
     int fallback = 0;
     int scope_n = 0;      /* rows in the scoped walk; 0 = no scope (param "scope") */
@@ -1612,6 +1699,7 @@ static int lz_mem_search(const float *qv, int qd,
                     shut[i] = !wl_is_open(&g_fog, lz_fog_id(rb[i]));
                     if (shut[i]) nshut++;
                 }
+                cy_nb_shut = nshut;
                 if (nshut > 0 && nshut < rnb) {   /* some shut, some open */
                     int cov = 0;
                     for (int i = 0; i < nent; i++) {
@@ -1654,6 +1742,7 @@ static int lz_mem_search(const float *qv, int qd,
                             ord_own = o2; ord = o2;
                             budget = cov;
                             snprintf(rm, sizeof(rm), "%s", "warm");
+                            cy_warm = 1;
                             g_warm_ord = 1;   /* a warm path ran: the amplifier is live */
                         }
                     }
@@ -1666,9 +1755,11 @@ static int lz_mem_search(const float *qv, int qd,
              * without bound on repeat queries. */
             for (int rbi = 0; rbi < rnb; rbi++) {
                 uint32_t fid = lz_fog_id(rb[rbi]);
-                if (wl_is_open(&g_fog, fid))
+                if (wl_is_open(&g_fog, fid)) {
                     wl_traverse_log(&g_fog, fid,
                                     g_fog_log_open ? &g_fog_log : NULL);
+                    cy_notes++;
+                }
             }
             if (g_fog_log_open && g_fog_log.fp) fflush(g_fog_log.fp);
         } else {
@@ -2060,6 +2151,34 @@ static int lz_mem_search(const float *qv, int qd,
         fog_out->shut = sh;
         fog_out->lit = rnb;
         fog_out->replayed = g_fog_replayed;
+    }
+    if (g_cy_on && qv) {
+        const char *align = (rnb <= 0) ? "no-route"
+                          : !g_warm_on ? "cold"
+                          : cy_nb_shut == 0 ? "no-shut"
+                          : cy_nb_shut >= rnb ? "all-shut"
+                          : cy_warm ? "partial" : "no-fit";
+        long skip = cy_warm ? (long)(nent - budget) : 0;
+        cy_emit("{\"event\":\"query\",\"ts\":%.0f,\"cache\":%d,\"mode\":\"%s\","
+                "\"nb\":%d,\"shut\":%d,\"visited\":%d,\"skip\":%ld,"
+                "\"scored\":%d,\"nent\":%d,\"budget\":%d,\"cap\":%d,"
+                "\"us_item\":%.3f,\"align\":\"%s\",\"notes\":%d}",
+                lz_now_ms(), use_cache ? 1 : 0, rm, rnb, cy_nb_shut, rnb,
+                skip, scored, nent, budget, cap, us_per_item, align, cy_notes);
+        g_cy.queries++;
+        if (use_cache) g_cy.cache_hit++; else g_cy.cache_miss++;
+        if (cy_warm) g_cy.warm_taken++;
+        if (!strcmp(align, "cold")) g_cy.align_cold++;
+        else if (!strcmp(align, "no-shut")) g_cy.align_no_shut++;
+        else if (!strcmp(align, "all-shut")) g_cy.align_all_shut++;
+        else if (!strcmp(align, "no-fit")) g_cy.align_no_fit++;
+        g_cy.buckets_visited += rnb;
+        g_cy.buckets_shut += cy_nb_shut;
+        g_cy.buckets_skipped += skip;
+        g_cy.note_events += cy_notes;
+        g_cy.scored_sum += scored;
+        g_cy.nent_last = nent;
+        g_cy.budget_last = budget;
     }
     int nh = 0;
     if (top_sc) for (int ti = 0; ti < topk && top_sc[ti] > -2; ti++) nh++;
@@ -3396,6 +3515,67 @@ static int handle_health(sock_t cli) {
     return 0;
 }
 
+/* ── GET /v1/canary (Phase 0 measurement surface) ──────────────────────
+ * Read-only. Returns the aggregates the Option-B gate reads. The
+ * per-query stream lives in <index>.canary.log; this is the same data
+ * summed, plus the bucket skew that the phase-2 latch geometry needs
+ * before it is allowed to exist. */
+static int handle_canary(sock_t cli) {
+    LZEntry *ents = NULL; int nent = 0;
+    lz_index_cached(&ents, &nent);
+    cy_note_size();
+    /* bucket skew: rows hanging on each anchor bucket (anchor OR anchor2) */
+    int cnt[ANCHR_MAXK]; memset(cnt, 0, sizeof(cnt));
+    for (int i = 0; i < nent; i++) {
+        int a = ents[i].anchor;
+        if (a >= 0 && a < ANCHR_MAXK) cnt[a]++;
+        int a2 = ents[i].anchor2;
+        if (a2 >= 0 && a2 < ANCHR_MAXK) cnt[a2]++;
+    }
+    int srt[ANCHR_MAXK]; memcpy(srt, cnt, sizeof(cnt));
+    for (int i = 0; i < ANCHR_MAXK; i++)
+        for (int j = i + 1; j < ANCHR_MAXK; j++)
+            if (srt[j] < srt[i]) { int t = srt[i]; srt[i] = srt[j]; srt[j] = t; }
+    long sum = 0; int mn = srt[0], mx = srt[ANCHR_MAXK - 1];
+    for (int b = 0; b < ANCHR_MAXK; b++) sum += cnt[b];
+    double mean = (double)sum / (double)ANCHR_MAXK;
+    double var = 0.0;
+    for (int b = 0; b < ANCHR_MAXK; b++) {
+        double d = (double)cnt[b] - mean; var += d * d;
+    }
+    var /= (double)ANCHR_MAXK;
+    double cv = (mean > 0.0) ? sqrt(var) / mean : 0.0;
+    int p50 = srt[ANCHR_MAXK / 2];
+    int p90 = srt[(ANCHR_MAXK * 9) / 10 < ANCHR_MAXK ? (ANCHR_MAXK * 9) / 10 : ANCHR_MAXK - 1];
+
+    char b[2048]; int bl = 0;
+    bl += snprintf(b + bl, sizeof(b) - bl,
+        "{\"status\":\"ok\",\"canary\":{\"on\":%d,\"warm_path\":%d},\"queries\":{"
+        "\"n\":%ld,\"cache_hit\":%ld,\"cache_miss\":%ld,\"warm_taken\":%ld,"
+        "\"align\":{\"cold\":%ld,\"no_shut\":%ld,\"all_shut\":%ld,\"no_fit\":%ld},"
+        "\"buckets_visited\":%ld,\"buckets_shut\":%ld,\"skipped_rows\":%ld,"
+        "\"note_events\":%ld,\"scored_sum\":%ld},\"bucket_skew\":{",
+        g_cy_on, g_warm_on, g_cy.queries, g_cy.cache_hit, g_cy.cache_miss,
+        g_cy.warm_taken, g_cy.align_cold, g_cy.align_no_shut,
+        g_cy.align_all_shut, g_cy.align_no_fit,
+        g_cy.buckets_visited, g_cy.buckets_shut, g_cy.buckets_skipped,
+        g_cy.note_events, g_cy.scored_sum);
+    bl += snprintf(b + bl, sizeof(b) - bl,
+        "\"rows\":%d,\"min\":%d,\"p50\":%d,\"p90\":%d,\"max\":%d,"
+        "\"mean\":%.1f,\"cv\":%.3f,\"counts\":[", nent, mn, p50, p90, mx, mean, cv);
+    for (int k = 0; k < ANCHR_MAXK; k++)
+        bl += snprintf(b + bl, sizeof(b) - bl, "%s%d", k ? "," : "", cnt[k]);
+    bl += snprintf(b + bl, sizeof(b) - bl,
+        "]},\"note\":{\"path\":\"%s\",\"bytes\":%ld,\"records\":%ld},"
+        "\"boot\":{\"index_ms\":%.1f,\"fog_ms\":%.1f},"
+        "\"option_b\":{\"rows\":%ld,\"ms\":%.1f}}",
+        PATH_LOG ? PATH_LOG : "", g_cy.note_bytes, g_cy.note_records,
+        g_cy.boot_ms, g_cy.boot_fog_ms, g_cy.reassign_rows, g_cy.reassign_ms);
+    lz_http_send(cli, "200 OK", "application/json", b, bl);
+    sock_close(cli);
+    return 0;
+}
+
 /* parse a JSON float array field ("vec":[f,f,...]); returns count or 0.
  * Lets a caller send its OWN query vector instead of having the sidecar embed
  * the text, so ranking uses the caller's model. */
@@ -3778,6 +3958,8 @@ static void dispatch(sock_t cli, char *rq) {
     sscanf(rq, "%15s %255s", method, path);
     if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
         handle_health(cli);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/canary") == 0) {
+        handle_canary(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/restamp") == 0) {
         /* RESTAMP (2026-10-20): repair the ROUTING TABLE without touching
          * the vectors. The full regrow path rewrites the 233 MB jsonl and
@@ -3927,9 +4109,32 @@ int main(int argc, char **argv) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "wsa fail\n"); return 1; }
     InitializeCriticalSection(&g_lock);
+    { const char *ce = getenv("ANN_CANARY");
+      g_cy_on = (ce && atoi(ce)) ? 1 : 0;
+      const char *re = getenv("ANN_CANARY_RECOMPUTE");
+      g_cy_recompute = (re && atoi(re)) ? 1 : 0; }
+    double cy_t0 = lz_now_ms();
     lz_fog_init();
+    g_cy.boot_fog_ms = lz_now_ms() - cy_t0;
     { LZEntry *e; int n; int c = lz_index_cached(&e, &n);
       g_loaded_at_ms = lz_now_ms();
+      g_cy.boot_ms = g_loaded_at_ms - cy_t0;
+      cy_note_size();
+      if (g_cy_on) {
+          long sh = 0;
+          for (unsigned wi = 0; wi < WL_WORDS; wi++) {
+              uint64_t w = g_fog.w[wi];
+              while (w) { sh += (long)(w & 1ull); w >>= 1; }
+          }
+          cy_emit("{\"event\":\"boot\",\"entries\":%d,\"cache\":%d,"
+                  "\"fog_ms\":%.1f,\"index_ms\":%.1f,\"fog_replayed\":%d,"
+                  "\"fog_shut\":%ld,\"note_bytes\":%ld,\"note_records\":%ld}",
+                  n, c, g_cy.boot_fog_ms, g_cy.boot_ms, g_fog_replayed,
+                  sh, g_cy.note_bytes, g_cy.note_records);
+      }
+      /* Option-B gate (opt-in): what does re-deriving every label cost?
+       * Runs BEFORE the loader thread so nothing else touches the buffer. */
+      if (g_cy_recompute) cy_measure_reassign();
       /* the background loader owns every later reload: a rebuild of the
        * 258 MB index must never block a request (measured 2026-10-21: the
        * inline reload held the lock >60 s and /health timed out) */
