@@ -742,6 +742,8 @@ static int lz_index_cached(LZEntry **out, int *n_out) {
         if (g_loader_running && g_idx_cache) {
             *out = g_idx_cache; *n_out = g_idx_n; return 1;
         }
+        lz_diag("cached_fallback ts=%lld loader=%d cache=%p\n",
+                (long long)time(NULL), g_loader_running, (void *)g_idx_cache);
         lz_index_cache_invalidate();
         int sl = 0;
         if (lz_index_load(&g_idx_cache, &g_idx_n, &sl) == 0 && g_idx_cache) {
@@ -854,7 +856,11 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
                 !g_regrow_busy) {
                 LZEntry *na = NULL;
                 int nn = 0, nsl = 0;
-                lz_diag("loader_parse_start ts=%lld\n", (long long)time(NULL));
+                lz_diag("loader_parse_start ts=%lld why=%s mt=%ld/%ld sz=%ld/%ld\n",
+                        (long long)time(NULL),
+                        !g_idx_cache ? "cache_null" :
+                        (mt != g_idx_mtime) ? "mtime_diff" : "size_diff",
+                        mt, g_idx_mtime, sz, g_idx_size);
                 if (lz_index_load(&na, &nn, &nsl) == 0 && na) {
                     lz_diag("loader_swap_lock ts=%lld\n", (long long)time(NULL));
                     EnterCriticalSection(&g_lock);
