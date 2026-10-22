@@ -640,6 +640,7 @@ static long g_stamp_state_mtime = 0;   /* the regrow state file's identity */
  * 258 MB / 62,634 rows held the lock for >60 s and /health timed out) */
 static volatile LONG g_loader_stop = 0;
 static int g_loader_running = 0;
+static volatile LONG g_loader_parsing = 0;  /* 1 = the loader is mid-parse */
 static HANDLE g_loader_thread = NULL;
 static double g_loaded_at_ms = 0;
 
@@ -911,6 +912,27 @@ static int lz_index_borrow(LZEntry **out, int *n_out) {
         ok = 1;
     }
     LeaveCriticalSection(&g_lock);
+    /* WAIT for the loader's in-flight parse (2026-10-22). If the loader is
+     * already loading this exact file version, parsing it again here is a
+     * wasted duplicate (measured live: idx_borrow miss -> loader_swap_lock,
+     * both then parsed the same 62,752-row version — 52 s + 52 s back to
+     * back). So when the borrow misses AND the loader is mid-parse, poll
+     * for the matching buffer to appear; the loader's next swap ends the
+     * wait regardless of who loaded it. Bound: a 258 MB parse takes ~50 s
+     * on this box, 300 s covers slower disks; if the loader's parse ends
+     * without a match (a stat race) the caller still self-parses. */
+    for (int wi = 0; !ok && wi < 600 && g_loader_parsing; wi++) {
+        Sleep(500);
+        struct stat st2;
+        if (stat(PATH_INDEX, &st2) == 0) { mt = (long)st2.st_mtime; sz = (long)st2.st_size; }
+        EnterCriticalSection(&g_lock);
+        if (g_idx_cache && g_idx_n > 0 && mt == g_idx_mtime && sz == g_idx_size) {
+            *out = g_idx_cache;
+            *n_out = g_idx_n;
+            ok = 1;
+        }
+        LeaveCriticalSection(&g_lock);
+    }
     lz_diag("idx_borrow %s ts=%lld n=%d\n", ok ? "hit" : "miss",
             (long long)time(NULL), *n_out);
     return ok;
@@ -941,6 +963,7 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
                         !g_idx_cache ? "cache_null" :
                         (mt != g_idx_mtime) ? "mtime_diff" : "size_diff",
                         mt, g_idx_mtime, sz, g_idx_size);
+                InterlockedExchange(&g_loader_parsing, 1);
                 if (lz_index_load(&na, &nn, &nsl) == 0 && na) {
                     lz_diag("loader_swap_lock ts=%lld\n", (long long)time(NULL));
                     EnterCriticalSection(&g_lock);
@@ -959,6 +982,7 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
                             "[ann_search] index reloaded in the background: %d entries\n",
                             nn);
                 }
+                InterlockedExchange(&g_loader_parsing, 0);
             }
         }
         /* the stamp sidecar can change WITHOUT the index changing (the

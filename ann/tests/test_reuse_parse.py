@@ -26,6 +26,10 @@ Verifies on a scratch server (port 8098, NEVER the live :8096):
       no longer invalidates the index cache
   C6  the service is still correct: routed=1, search stays on the anchor
       route, /health keeps answering (the borrowed buffer was never freed)
+  C7  the collision case: when the regrow's borrow fires WHILE the loader
+      is mid-parse of the same version, the regrow now WAITS for the swap
+      and borrows it instead of parsing the same 62k rows a second time
+      (measured live: 52 s + 52 s back to back before this fix)
 
 Scratch lives under %TEMP% and is rebuilt per run — nothing inside the repo's
 data/ dir is written. Run: python test_reuse_parse.py  (exit 0 = PASS).
@@ -243,6 +247,45 @@ try:
           search()["route"]["mode"].startswith("anchor"))
     check("C6-d /health still answers (loader buffer survived)",
           health().get("status") == "ok")
+
+    # C7: the regrow must WAIT for the loader's in-flight parse instead of
+    # parsing the same version itself (the collision case). On the live
+    # 258 MB index this was 52 s + 52 s back to back. Recipe: append a big
+    # batch (a few seconds of parse — a wide window), fire the regrow the
+    # moment the loader's parse starts, and check the regrow came back
+    # WITHOUT a self-parse and WITHOUT a second loader parse.
+    before7 = diag()
+    VA7 = ",".join("0.013333" for _ in range(D))
+    n_batch = 3000
+    with open(IDX, "a", encoding="utf-8") as f:
+        for i in range(n_batch):
+            f.write('{"sid":"batch-%04d","file":"_batch","npast":1,"dim":384,'
+                    '"vec":[%s]}\n' % (i, VA7))
+    parsed0 = before7.count("loader_parse_start")
+    fired = False
+    for _ in range(120):
+        time.sleep(0.25)
+        if diag().count("loader_parse_start") > parsed0:
+            fired = True
+            break
+    check("C7-a loader parse started (window opened)", fired,
+          f"loader_parse_start {parsed0} -> {diag().count('loader_parse_start')}")
+    w7, d7 = regrow()
+    rg7 = d7.get("regrow", {})
+    check("C7-b regrow waited for the loader (no self-parse)",
+          rg7.get("load_src") == "borrowed",
+          f"load_src={rg7.get('load_src')} load="
+          f"{rg7.get('ms_per_phase', {}).get('load')}ms")
+    check("C7-c borrow hit after the wait",
+          "idx_borrow hit" in diag() or rg7.get("load_src") == "borrowed",
+          f"entries={d7.get('nent')}")
+    time.sleep(6)
+    lp7 = diag().count("loader_parse_start")
+    check("C7-d loader parsed the new version exactly once", lp7 == parsed0 + 1,
+          f"loader parses {parsed0} -> {lp7} (regrow={rg7.get('mode')})")
+    rp7 = len(re.findall(r"regrow_load src=parse", diag()))
+    check("C7-e self-parse count still zero", rp7 == 0,
+          f"regrow_load src=parse x{rp7}")
 finally:
     srv.kill()
     time.sleep(1)
