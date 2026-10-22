@@ -290,6 +290,40 @@ static const char *lz_ascii_map(unsigned cp) {
         case 0x23F8: return " pause ";
         case 0x27FA: return " <=> ";
         case 0x2B20: return " pentagon ";
+        /* single chars whose NFKC EXPANDS — the tokenizer 500s on them raw
+         * (measured live: 2160-B and 2150-F all 500, № ℀ ℁ … ½ too).  The
+         * corpus build (scripts/build_index.py) NFKC's every row before
+         * embedding, so the query side must land in the SAME space. */
+        case 0x2026: return "...";
+        case 0x2025: return "..";
+        case 0x22EF: return "...";
+        case 0x2116: return "No";
+        case 0x2100: return "a/c";
+        case 0x2101: return "a/c";
+        case 0x00BC: return "1/4";
+        case 0x00BD: return "1/2";
+        case 0x00BE: return "3/4";
+        /* Letterlike math: NFKC expands each to its plain letter(s). */
+        case 0x2102: return "C";  case 0x2103: return "deg C";
+        case 0x2107: return "E";  case 0x2109: return "deg F";
+        case 0x210A: return "g";  case 0x210B: return "H";
+        case 0x210C: return "H";  case 0x210D: return "H";
+        case 0x210E: return "h";  case 0x210F: return "hbar";
+        case 0x2110: return "I";  case 0x2111: return "I";
+        case 0x2112: return "L";  case 0x2113: return "l";
+        case 0x2115: return "N";  case 0x2119: return "P";
+        case 0x211A: return "Q";  case 0x211B: return "R";
+        case 0x211C: return "R";  case 0x211D: return "R";
+        case 0x2122: return "TM"; case 0x2124: return "Z";
+        case 0x2126: return "ohm"; case 0x212A: return "K";
+        case 0x212B: return "A";
+        case 0x212C: return "B";  case 0x212D: return "C";
+        case 0x212F: return "e";  case 0x2130: return "E";
+        case 0x2131: return "F";  case 0x2133: return "M";
+        case 0x2134: return "o";
+        /* math alphanumeric series fold mechanically: each series is base+26
+         * (uppercase) / base+52 (lowercase) / base+78 (digits live at their
+         * own bases); fixed by structure, not spelled out per letter. */
         default: return NULL;
     }
 }
