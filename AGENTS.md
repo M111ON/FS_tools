@@ -100,3 +100,32 @@ safety guards."*
 - **path ของ Python/gcc ต้องเป็น Windows path** (`I:\...`) — ส่ง `/i/...`
   แล้วจะไปสร้างที่ `I:\i\...` (เจอจริง)
 - ลบไฟล์ temp ที่ตัวเองสร้างเสมอเมื่อจบงาน — อย่าทิ้งไว้ในโฟลเดอร์ของเจ้าของ
+
+---
+
+## Tooling สำหรับ agent ที่ทำงานใน I:\tools (เลือกใช้ตามความเหมาะสม)
+
+**ก่อนเริ่มงาน — ตรวจสอบ context ก่อนเสมอ (ห้ามเดา):**
+- **graft** (`I:/tools/graft`, CLI `graft`) — สำหรับเข้าใจโค้ด/หาตำแหน่ง symbol/trace call graph ใน repo นี้ ก่อน grep/read source. `graft ask "<คำถาม>" --source` (1 call ส่วนใหญ่พอ)
+- **magic context** (`ctx_search`, `ctx_memory`, `ctx_note`, `ctx_expand`) — project memory/rules/constraints + pending intentions. ใช้ก่อนแก้โค้ดในโปรเจกต์ที่เคยทำ. อ่าน DB read-only ได้ทุกเมื่อ (`I:/cortexkit/magic-context/context.db`)
+- **memcore** (`memcore_query`, `memcore_stats`, `memo_query`) — hybrid semantic+keyword รวมทุก platform (chat logs, decisions, findings). ใช้เมื่อถามเรื่องงานเก่า/ประวัติ/การตัดสินใจที่ผ่านมา (ไทย/อังกฤษได้)
+- **ANN server** (`http://127.0.0.1:8096`, `I:/tools/ann`) — semantic search เร็วกว่า memcore v2.search (~60ms vs 568ms) บน memcore 57k entries, exact recall. ใช้เมื่อต้องการ semantic search ความเร็วสูง; fallback เป็น `memcore_query` ถ้า ANN ไม่ healthy. เช็ค `GET /health` ก่อน; keepalive task `ann-keepalive` รันทุก 5 นาที
+
+**การเลือกใช้:**
+- เข้าใจโค้ด/หาไฟล์/trace → graft ก่อน (ถ้า repo นี้ถูก index แล้ว)
+- กฎ/ข้อจำกัด/การตัดสินใจของโปรเจกต์ → magic context (`ctx_search` + `<project-memory>`)
+- งานเก่า/ประวัติข้าม session/platform → memcore (`memcore_query`) หรือ ANN (เร็วกว่า)
+- memo ดิบ → `memo_query`
+- ถ้า ANN ไม่ตอบ → ใช้ memcore_query (ช้ากว่าแต่เสถียร)
+
+**บันทึกข้าม session (taskboard + handoff):**
+- **taskboard** (MCP `taskboard`, HTTP `:8390/task/ui`) — สร้าง/อัพเดท task การ์ดข้าม session: `board_post`, `board_update` (claim/status/note), `board_list`, `board_summary`, `holds`. ใช้เก็บงานที่ยังค้าง/ส่งต่อ. register app identity ก่อน (`POST :8390/register {"app":"<platform>-<role>-<rand>"}`)
+- **ctx_note** — note ที่ตั้งใจจะกลับมาทำ (พร้อม evidence). ใช้สำหรับ finding ที่จะ revisit; ไม่ใช่สถานะโลกปัจจุบัน
+- **ctx_memory** — fact ถาวรของโปรเจกต์ (rule/constraint/config) ที่ต้องไม่ต้องหาใหม่
+- **handoff** — งาน cloud-memory workspace: `ws_handoff(workspace_id, to_agent, message, agent)` เมื่องานเสร็จ/ส่งต่อ; `ws_pickup` เมื่อรับงาน. agent name รูปแบบ `<platform>-<role>-<rand>` ตัวเล็ก+ขีดกลาง
+- **chat-pool** (`pool_send`/`pool_inbox`) — ข้าม app (opencode/claude/hermes) ส่งข้อความ; `@ชื่อ` = tag เข้า inbox
+
+**กติกา:**
+- ห้าม merge tool เหล่านี้เข้ากัน (แต่ละส่วนมี chain ของตัวเอง, คุยกันแค่ input/output) — ดู memory #7500/#7511
+- งานที่ spawn agent/model (map-memories/verify) ห้ามผ่าน task ของ plugin — ใช้ standalone (`mc_cycle.py`) แทน (ดู MAGIC-CONTEXT-MAP-VERIFY.md)
+- ลบไฟล์ temp ที่ตัวเองสร้างเสมอเมื่อจบงาน

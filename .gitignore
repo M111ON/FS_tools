@@ -73,3 +73,43 @@ graft/
 .playwright-mcp/
 .workspace/
 .wrangler/
+
+# ── nested repos — own git history, never tracked from root ──
+cloud_ws/
+cloud-workspace/
+
+# ── installed toolchains (binaries, not source) ──
+gcc13/
+cmake/
+
+# ── runtime data, drops, archives ──
+chat_drop/
+opencode/
+zip/
+/chat_fact_pipeline.zip
+chat-pool/pool.db
+chat-pool/*.log
+chat-pool/shot.ok
+chat-pool/_shot_*.png
+chat-pool/.wsbridge_state.json
+pre_embedding_filter/map_run.err
+magic-context-mcp/hermes_mc_sync.log
+ann/-
+ann/contre
+ann/build_err.txt
+ann/.ann_route_watch.log
+ann/.ann_route_watch_state.json
+
+# ── secrets / local credentials ──
+.relay_token
+ocvpn/creds.txt
+
+# ── ocvpn runtime state ──
+ocvpn/*.lock
+ocvpn/watch.log
+ocvpn/state.json
+ocvpn/watch_state.json
+ocvpn/cfg/*.log
+
+# ── wrangler build outputs ──
+ai-relay-worker/tmp/
