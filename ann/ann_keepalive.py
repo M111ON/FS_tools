@@ -250,6 +250,7 @@ def _port_listening(port):
 
 def once():
     if _healthy():
+        _maybe_regrow()
         return True
     # A server that is UP but busy (loading the index, or the embed sidecar
     # is slow) answers no health yet still owns the port. Starting a second
@@ -279,7 +280,170 @@ def once():
     return False
 
 
+# ---------------------------------------------------------------------------
+# COLD-PATH WATCHER (2026-10-23)
+#
+# The index is append-only and grows continuously (ann-sync). Nothing watched
+# it: the server self-heals labels from the rows + anchor table at boot, but
+# the TABLE is a training-time snapshot and the bucket count K is derived from
+# the row count. So two things must happen on the cold path, never inside a
+# request:
+#   * K crosses a breakpoint -> the table is trained for the OLD K and the
+#     largest bucket grows past LZ_SEARCH_BUDGET again (measured: K=8 at 62.8k
+#     rows gave one 25,693-row bucket vs a 24,000 budget -> every query
+#     truncated; K=24 gave 9,081 -> no truncation, R@5 .9533 -> .9680)
+#   * the route is dead (routed=0) -> re-anchor is the only repair
+#
+# Rule parity with the C code (src/ann_search.c, regrow path):
+#   K = round_up_to_4(ceil(n / 3000)), clamped to [8, 48]
+# `--selfcheck` asserts this against the values the C rule produces.
+K_TARGET_ROWS = 3000
+K_MIN, K_MAX = 8, 48
+STATE = os.path.join(DIR, ".anchor_state.json")
+REGROW_MIN_GAP = 600            # never regrow twice inside 10 minutes
+REGROW_URL = "http://127.0.0.1:%d/v1/state/regrow" % PORT
+
+
+def k_for(n):
+    """Bucket count the C regrow path would pick for n rows (keep in sync)."""
+    if n < 64:
+        return 8 if n >= 64 else (4 if n >= 32 else 2)
+    want = -(-n // K_TARGET_ROWS)
+    want = ((want + 3) // 4) * 4
+    return max(K_MIN, min(K_MAX, want))
+
+
+def _health_json(timeout=10):
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except (urllib.error.URLError, ValueError, OSError):
+        return None
+
+
+def _load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(st):
+    try:
+        with open(STATE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def _regrow_decision(h, st):
+    """(act, why) — pure, so --selfcheck can exercise it without a server."""
+    n = int(h.get("entries") or 0)
+    k_have = int(h.get("k") or 0)
+    routed = int(h.get("routed") or 0)
+    if n <= 0:
+        return False, "no entries"
+    if routed == 0:
+        return True, "route dead (routed=0)"
+    if not k_have:
+        return False, "server has no k field (old binary)"
+    k_want = k_for(n)
+    if k_want != k_have:
+        return True, "K breakpoint: n=%d has k=%d, rule wants %d" % (n, k_have, k_want)
+    last = int(st.get("n") or 0)
+    if last and n < last:
+        return False, "index shrank %d -> %d (rebuilt?) - watching, not regrowing" % (last, n)
+    return False, "in contract (n=%d k=%d)" % (n, k_have)
+
+
+def _maybe_regrow():
+    h = _health_json()
+    if not h:
+        return
+    st = _load_state()
+    act, why = _regrow_decision(h, st)
+    n = int(h.get("entries") or 0)
+    if not st:
+        st = {"n": n, "k": int(h.get("k") or 0), "at": 0, "note": "seeded"}
+        _save_state(st)
+        _log("watch: seeded n=%d k=%s" % (n, h.get("k")))
+        if not act:
+            return
+    if not act:
+        if st.get("note") != why:
+            st["note"] = why
+            _save_state(st)
+        return
+    if time.time() - float(st.get("at") or 0) < REGROW_MIN_GAP:
+        _log("watch: %s (suppressed, regrow ran %.0fs ago)"
+             % (why, time.time() - float(st.get("at") or 0)))
+        return
+    _do_regrow(why, n)
+
+
+def _do_regrow(why, n):
+    _log("watch: regrow because %s" % why)
+    st = {"n": n, "k": 0, "at": time.time(), "note": ""}
+    try:
+        req = urllib.request.Request(
+            REGROW_URL, data=b'{"force":1}',
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            res = json.loads(r.read().decode("utf-8", "ignore"))
+        took = (res.get("regrow") or {}).get("ms")
+        after = _health_json(timeout=180)
+        ok = bool(after) and int(after.get("routed") or 0) == 1 and \
+            int(after.get("k") or 0) == k_for(int(after.get("entries") or 0))
+        st = {"n": int((after or {}).get("entries") or n),
+              "k": int((after or {}).get("k") or 0),
+              "at": time.time(),
+              "note": ("regrow ok (%s ms)" % round(took)) if ok
+                      else "REGROW FAILED: routed=%s k=%s"
+                           % ((after or {}).get("routed"), (after or {}).get("k"))}
+        _save_state(st)
+        _log("watch: %s, n=%s k=%s" % (st["note"], st["n"], st["k"]))
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        st["at"] = time.time()
+        st["note"] = "REGROW ERROR: %r" % e
+        _save_state(st)
+        _log("watch: REGROW ERROR %r" % e)
+
+
+def _selfcheck():
+    """Rule parity with C + decision table. No server, no writes."""
+    cases = {10: 2, 40: 4, 64: 8, 2999: 8, 3000: 8, 12000: 8,
+             12001: 8, 24000: 8, 30000: 12, 47999: 16, 48000: 16,
+             62869: 24, 72000: 24, 72001: 28, 96000: 32, 144000: 48,
+             200000: 48, 1: 2}
+    for n, want in cases.items():
+        got = k_for(n)
+        assert got == want, "k_for(%d)=%d want %d" % (n, got, want)
+    base = {"entries": 62869, "k": 24, "routed": 1}
+    assert _regrow_decision(base, {"n": 62869})[0] is False
+    assert _regrow_decision(dict(base, routed=0), {})[0] is True
+    assert _regrow_decision(dict(base, k=20), {})[0] is True
+    assert _regrow_decision(dict(base, entries=72001, k=24), {})[0] is True
+    assert _regrow_decision(dict(base, entries=62869, k=24), {"n": 70000})[0] is False
+    assert _regrow_decision({"entries": 0, "k": 8, "routed": 1}, {})[0] is False
+    print("selfcheck ok: %d k_for cases + 6 decisions" % len(cases))
+
+
 def main():
+    if "--selfcheck" in sys.argv:
+        _selfcheck()
+        return 0
+    if "--plan" in sys.argv:
+        h = _health_json() or {}
+        act, why = _regrow_decision(h, _load_state())
+        print(json.dumps({"act": act, "why": why,
+                          "entries": h.get("entries"), "k": h.get("k")}))
+        return 0
+    if "--force-regrow" in sys.argv:
+        h = _health_json() or {}
+        _do_regrow("forced by --force-regrow", int(h.get("entries") or 0))
+        print(open(STATE, encoding="utf-8").read())
+        return 0
     if "--once" in sys.argv:
         ok = once()
         print("healthy" if ok else "not healthy")

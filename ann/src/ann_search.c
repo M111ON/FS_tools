@@ -81,6 +81,21 @@ static void paths_init(void) {
     e = getenv("ANN_ROUTE_LOG");  PATH_LOG   = (e && e[0]) ? e : "data/lz_route.log";
 }
 
+/* ── label source (Option B structure, env ANN_LABELS=derive) ──────────
+ * The served walk needs two derived things per row: which bucket(s) the
+ * row belongs to, and the bucket-major walk order. Both are functions of
+ * (row vector, anchor table) — 5 us/row, measured — so neither has to be
+ * stored. `stamp` (8 B/row) and `order` become pure caches.
+ * Default is DERIVE since 2026-10-23: the gate measured 5.03 us/row
+ * (62,861 rows = 316 ms) and proved 20/20 identical routes against stamp
+ * mode, while the sidecars were observed drifting (one absent, one 5 rows
+ * stale, table 4 rows short) faster than any writer refreshed them.
+ * ANN_LABELS=stamp opts back in for A/B. The note (latch log) stays as it is: it is
+ * a record of which buckets were WALKED, not of where rows live. */
+static int g_labels_derive = 1;              /* default since 2026-10-23;
+                                              * ANN_LABELS=stamp opts back in */
+static const char *g_labels_src = "fruit";   /* fruit | stamp | derive */
+
 /* ── minimal HTTP helpers (from gguf_lazy_serve.c L44-116) ── */
 static int lz_http_recv(sock_t fd, char *buf, int cap) {
     int total = 0;
@@ -593,7 +608,11 @@ static inline uint32_t lz_fog_id(int bucket) {
 
 /* ── anchor-bucket routing over the index ── */
 #define LZ_ANCH_MIN 16
-#define LZ_ANCH_MAXK 8
+#define LZ_ANCH_MAXK 64   /* phase-2 bucket-balance headroom; was 8 (== the
+                           * fixed K, so K>8 silently clamped). The table
+                           * format allows ANCHR_MAXK (512); 64 keeps the
+                           * regrow stack arrays at 256 B while giving the
+                           * bench room to balance 62.8k rows. */
 #define LZ_OVERLAP_TOPB 2
 #define LZ_ROUTE_HEADROOM_DEF 4
 #define LZ_SEARCH_BUDGET_DEF 24000
@@ -923,17 +942,19 @@ static double lz_now_ms(void) {
  *   boot      — index load + note replay ms, and the ONE-SHOT cost of
  *               re-assigning every row (the Option-B boot sweep)
  *   skew      — per-bucket row counts (the phase-2 gate)
- * Off by default: no file I/O and no counters when ANN_CANARY is unset.
+ * Counters always accumulate (cheap, in-memory); the per-query file stream
+ * is off unless ANN_CANARY=1.
  * The record is one JSON line per query in <index>.canary.log so a gate
  * script can read numbers, never a summary. */
 typedef struct {
     long queries, cache_hit, cache_miss;
     long warm_taken, align_cold, align_no_shut, align_all_shut, align_no_fit;
     long buckets_visited, buckets_shut, buckets_skipped, note_events;
-    long scored_sum, nent_last, budget_last;
+    long scored_sum, nent_last, budget_last, trunc;
     long note_bytes, note_records;
     double boot_ms, boot_fog_ms, reassign_ms;
     long reassign_rows;
+    int k_last;
 } LZCanary;
 static LZCanary g_cy;
 static int g_cy_on = 0;           /* env ANN_CANARY */
@@ -1022,6 +1043,8 @@ static int lz_index_borrow(LZEntry **out, int *n_out) {
     return ok;
 }
 
+static void lz_route_selfheal(void);   /* defined after lz_restamp */
+
 static DWORD WINAPI index_loader_thread(LPVOID arg) {
     (void)arg;
     /* LOW PRIORITY (2026-10-22): the box has 2 cores and the loader's parse
@@ -1081,10 +1104,16 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
         { struct stat ts; if (stat(regrow_state_path(), &ts) == 0) stm = (long)ts.st_mtime; }
         if ((smt != g_stamp_mtime || ssz != g_stamp_size) || stm != g_stamp_state_mtime) {
             EnterCriticalSection(&g_lock);
-            if (g_idx_cache) g_stamp_live = lz_stamp_overlay(g_idx_cache, g_idx_n);
+            /* derive mode: the sidecar is not a truth here — applying it
+             * would overwrite labels computed from the rows themselves. */
+            if (!g_labels_derive && g_idx_cache)
+                g_stamp_live = lz_stamp_overlay(g_idx_cache, g_idx_n);
             g_stamp_state_mtime = stm;
             LeaveCriticalSection(&g_lock);
         }
+        /* the binding can die without either file changing (an append moves
+         * the row count past the table's ntr) - heal it, loudly, once. */
+        lz_route_selfheal();
     }
     return 0;
 }
@@ -1093,6 +1122,7 @@ static float *g_anch_cache = NULL;
 static int g_anch_k = 0, g_anch_dim = 0, g_anch_ntr = 0;
 static uint32_t *g_ord_cache = NULL;
 static int g_ord_n = 0;
+static long g_ord_stale = 0;   /* .order refused (stale/torn) -> derived in memory */
 static long g_anch_key[4] = {0, 0, 0, 0};
 static void lz_route_cache_invalidate(void) {
     free(g_anch_cache); g_anch_cache = NULL;
@@ -1100,27 +1130,109 @@ static void lz_route_cache_invalidate(void) {
     g_anch_k = g_anch_dim = g_anch_ntr = 0; g_ord_n = 0;
     for (int i = 0; i < 4; i++) g_anch_key[i] = 0;
 }
+
+/* Option B: fill every row's bucket id from the table, then build the
+ * bucket-major walk order in memory. Same arithmetic the regrow uses
+ * (anch_route -> rows -> anch_perm), just without writing a file.
+ * Returns the number of live labels, or -1 when the table cannot cover
+ * this buffer (caller refuses the route instead of guessing). */
+static int lz_labels_derive(LZEntry *a, int n) {
+    if (!a || n <= 0 || !g_anch_cache) return -1;
+    /* APPEND-ONLY CONTRACT (#7565): rows may grow past the table's training
+     * count — the same centroids route them. A SHRUNK index (n < ntr) is a
+     * different corpus and must not be replayed against this table. */
+    if (n < g_anch_ntr) return -1;
+    int K = g_anch_k, dim = g_anch_dim;
+    int *rows = (int *)malloc((size_t)n * sizeof(int));
+    uint32_t *perm = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    if (!rows || !perm) { free(rows); free(perm); return -1; }
+    int t2[ANCHR_MAXK];
+    int live = 0;
+    for (int i = 0; i < n; i++) {
+        if (!a[i].vec || a[i].dim != dim) {
+            a[i].anchor = -1; a[i].anchor2 = -1; rows[i] = -1;
+            continue;
+        }
+        int nb = anch_route(a[i].vec, g_anch_cache, K, dim, LZ_OVERLAP_TOPB, t2);
+        a[i].anchor  = nb > 0 ? t2[0] : -1;
+        a[i].anchor2 = nb > 1 ? t2[1] : -1;
+        rows[i] = a[i].anchor;
+        if (a[i].anchor >= 0) live++;
+    }
+    if (anch_perm(rows, n, K, perm) != 0) {
+        free(rows); free(perm); return -1;
+    }
+    free(rows);
+    free(g_ord_cache); g_ord_cache = perm; g_ord_n = n;
+    g_stamp_live = live;   /* derive mode: this IS the live-label count */
+    lz_diag("[labels] derive n=%d K=%d dim=%d live=%d\n", n, K, dim, live);
+    cy_emit("{\"event\":\"labels-derive\",\"n\":%d,\"K\":%d,\"dim\":%d,"
+            "\"live\":%d,\"ms\":%.1f}", n, K, dim, live, 0.0);
+    return live;
+}
+
+
 static int lz_route_cached(int nent) {
     struct stat sa, so;
-    if (stat(PATH_ANCH, &sa) != 0 || stat(PATH_ORDER, &so) != 0) return 0;
-    long key[4] = { (long)sa.st_mtime, (long)sa.st_size,
-                    (long)so.st_mtime, (long)so.st_size };
+    if (stat(PATH_ANCH, &sa) != 0) return 0;
+    /* derive mode: the order file is an OUTPUT of the table, never an input,
+     * so its absence is not a reason to refuse the route. */
+    if (!g_labels_derive && stat(PATH_ORDER, &so) != 0) return 0;
+    long key[4] = { (long)sa.st_mtime, (long)sa.st_size, 0, 0 };
+    if (!g_labels_derive) {
+        key[2] = (long)so.st_mtime; key[3] = (long)so.st_size;
+    } else {
+        /* the labels are a function of the ROWS, so an index reload must
+         * invalidate them; the table file alone cannot witness that. */
+        key[2] = (long)g_idx_mtime; key[3] = (long)g_idx_size;
+    }
     int fresh = g_anch_cache && g_ord_cache && g_ord_n == nent;
     for (int i = 0; i < 4 && fresh; i++) if (g_anch_key[i] != key[i]) fresh = 0;
     if (fresh) return 1;
     lz_route_cache_invalidate();
     float *C = (float *)malloc((size_t)ANCHR_MAXK * ANCHR_MAXD * sizeof(float));
-    uint32_t *ord = (uint32_t *)malloc((nent ? (size_t)nent : 1) * sizeof(uint32_t));
-    if (!C || !ord) { free(C); free(ord); return 0; }
+    if (!C) return 0;
     int adim = 0, antr = 0;
     int K = anch_load(PATH_ANCH, C, ANCHR_MAXK, ANCHR_MAXD, &adim, &antr);
-    if (K <= 0 || antr != nent) { free(C); free(ord); return 0; }
+    if (K <= 0 || nent < antr) { free(C); return 0; }   /* shrink = wrong table */
+    g_anch_cache = C; g_anch_k = K; g_anch_dim = adim; g_anch_ntr = antr;
+    if (g_labels_derive) {
+        /* H2 stays: the table must still cover this row count (checked
+         * above). What disappears is the second file that could disagree. */
+        LZEntry *ents = NULL; int n = 0;
+        if (!lz_index_cached(&ents, &n) || n != nent ||
+            lz_labels_derive(ents, nent) < 0) {
+            lz_route_cache_invalidate();
+            return 0;
+        }
+        for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
+        return 1;
+    }
+    uint32_t *ord = (uint32_t *)malloc((nent ? (size_t)nent : 1) * sizeof(uint32_t));
+    if (!ord) { lz_route_cache_invalidate(); return 0; }
     /* H2: the pair is bound — order must carry this table's K/ntr/checksum
      * (headerless, re-anchored, or torn files refuse here, not in the walk). */
     if (ord_load(PATH_ORDER, ord, nent, K, anch_cksum(C, K, adim)) != 0) {
-        free(C); free(ord); return 0;
+        /* 2026-10-23 (Option B): a stale .order used to REFUSE the route —
+         * silently, so a restart fell back to a full scan and nothing said
+         * why (observed live: .order 62,862 rows vs 62,857 parsed, .stamp
+         * absent — only the warm process still routed). The order is a
+         * FUNCTION of (table, rows), so on mismatch derive it in memory
+         * instead of refusing. Not silent: the counter is in /health and the
+         * diag line names the file. */
+        free(ord);
+        g_ord_stale++;
+        lz_diag("[labels] %s stale/inconsistent at n=%d — deriving in memory\n",
+                PATH_ORDER, nent);
+        LZEntry *ents = NULL; int n = 0;
+        if (!lz_index_cached(&ents, &n) || n != nent ||
+            lz_labels_derive(ents, nent) < 0) {
+            lz_route_cache_invalidate();
+            return 0;
+        }
+        for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
+        return 1;
     }
-    g_anch_cache = C; g_anch_k = K; g_anch_dim = adim; g_anch_ntr = antr;
     g_ord_cache = ord; g_ord_n = nent;
     for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
     return 1;
@@ -2152,13 +2264,17 @@ static int lz_mem_search(const float *qv, int qd,
         fog_out->lit = rnb;
         fog_out->replayed = g_fog_replayed;
     }
-    if (g_cy_on && qv) {
+    if (qv) {
         const char *align = (rnb <= 0) ? "no-route"
                           : !g_warm_on ? "cold"
                           : cy_nb_shut == 0 ? "no-shut"
                           : cy_nb_shut >= rnb ? "all-shut"
                           : cy_warm ? "partial" : "no-fit";
         long skip = cy_warm ? (long)(nent - budget) : 0;
+        /* counters always accumulate (a dozen increments, no I/O) so
+         * GET /v1/canary reports real service traffic without a flag;
+         * only the per-query file log is gated. */
+        if (g_cy_on)
         cy_emit("{\"event\":\"query\",\"ts\":%.0f,\"cache\":%d,\"mode\":\"%s\","
                 "\"nb\":%d,\"shut\":%d,\"visited\":%d,\"skip\":%ld,"
                 "\"scored\":%d,\"nent\":%d,\"budget\":%d,\"cap\":%d,"
@@ -2177,8 +2293,13 @@ static int lz_mem_search(const float *qv, int qd,
         g_cy.buckets_skipped += skip;
         g_cy.note_events += cy_notes;
         g_cy.scored_sum += scored;
+        /* Warm queries set budget == cov (the shut-bucket coverage) by
+         * construction, so scoring up to it is NOT truncation. Only a cold
+         * walk that exhausts the global cap was actually cut short. */
+        if (!cy_warm && budget > 0 && scored >= budget) g_cy.trunc++;
         g_cy.nent_last = nent;
         g_cy.budget_last = budget;
+        g_cy.k_last = g_anch_k;
     }
     int nh = 0;
     if (top_sc) for (int ti = 0; ti < topk && top_sc[ti] > -2; ti++) nh++;
@@ -2824,6 +2945,55 @@ static int lz_restamp(int *n_out, int *K_out) {
     return rc;
 }
 
+/* ── route self-heal (2026-10-23, Option B structure) ─────────────────────
+ * Observed live on :8096 before this was written: the .stamp sidecar was
+ * GONE, .order carried 62,862 rows against 62,861 parsed, and the anchors
+ * table said ntr=62,857 — three layers, three different row counts. The only
+ * thing still routing was that process's warm cache; any restart would have
+ * silently fallen to a full scan (routed:0, hits still plausible, no error).
+ *
+ * The heal is the existing restamp primitive: re-route every row against the
+ * table that is ALREADY on disk and rebind ntr/K/checksum. No vector is
+ * rewritten (%.6g serialization trap documented above), no retrain.
+ *
+ * Discipline: only when the row/label binding is actually dead, only when the
+ * index mtime is quiet (a writer owns the file otherwise), and at most once
+ * per minute so an appending writer cannot turn the heal into a parse loop.
+ * Everything it does is logged as an event — never silent.
+ * ponytail: restamp re-parses the index (~50 s at 62k rows) instead of
+ * borrowing the loader's buffer. Correct first; borrow when the heal fires
+ * often enough to matter. */
+static long g_heal_last_ms = 0;
+static long g_heal_ok = 0, g_heal_fail = 0;
+static void lz_route_selfheal(void) {
+    if (!g_idx_cache || g_idx_n <= 0) return;
+    if (g_loader_parsing || g_regrow_busy) return;
+    struct stat st;
+    if (stat(PATH_INDEX, &st) != 0) return;
+    if ((long)st.st_mtime != g_idx_mtime) return;   /* writer active: next tick */
+    if (!stamps_route_dead(g_idx_n)) return;        /* binding is sound */
+    long now = (long)lz_now_ms();
+    if (g_heal_last_ms && now - g_heal_last_ms < 60000) return;
+    g_heal_last_ms = now;
+    InterlockedExchange(&g_regrow_busy, 1);
+    int n = 0, K = 0;
+    double t0 = lz_now_ms();
+    int rc = lz_restamp(&n, &K);
+    double ms = lz_now_ms() - t0;
+    lz_route_cache_invalidate();
+    InterlockedExchange(&g_regrow_busy, 0);
+    if (rc == 0) {
+        g_heal_ok++;
+        lz_diag("[heal] restamp ok n=%d K=%d %.0f ms\n", n, K, ms);
+        cy_emit("{\"event\":\"route-heal\",\"ok\":1,\"n\":%d,\"K\":%d,\"ms\":%.0f}",
+                n, K, ms);
+    } else {
+        g_heal_fail++;
+        lz_diag("[heal] restamp FAILED rc=%d — route stays dead\n", rc);
+        cy_emit("{\"event\":\"route-heal\",\"ok\":0,\"rc\":%d}", rc);
+    }
+}
+
 /* ── TREE-SIDE LABEL READ (2026-10-20) ────────────────────────────────────
  * The routing labels live in the TREE's channel: <index>.stamp (8 bytes per
  * row: anchor, anchor2). Reading them is a TREE operation — it never touches
@@ -3014,7 +3184,35 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
         load0_size  = (long)sti_load0.st_size;
     }
     if (n >= LZ_ANCH_MIN && a[0].dim > 0 && a[0].dim <= ANCHR_MAXD) {
+        /* Bucket count. The old rule was a fixed 8 for any corpus >= 64 rows,
+         * which is why the live 62.8k index carries buckets of 6,998..26,533
+         * rows (cv 8.7) and one bucket alone exceeds the 24,000 walk budget
+         * (measured 2026-10-23, /v1/canary). Keep the legacy rule as the
+         * default so phase 1 changes no routing; ANN_ANCHOR_K lets the
+         * phase-2 bucket-balance bench pick K explicitly (measured, never
+         * asserted). */
         int dim = a[0].dim, K = n >= 64 ? 8 : n >= 32 ? 4 : 2;
+        { const char *ke = getenv("ANN_ANCHOR_K");
+          if (ke && atoi(ke) > 0) K = atoi(ke);
+          else if (n >= 64) {
+              /* Bucket count scales with the corpus instead of pinning at 8.
+               * Measured 2026-10-23 (300q vs numpy brute oracle, budget
+               * 24000, cv over the K live buckets):
+               *   K=8   62.8k rows: R@5 .9533 R@10 .9367, walk truncated 300/300
+               *   K=24  62.8k rows: R@5 .9680 R@10 .9613, 16.3k scored, no trunc
+               * Target ~3000 rows per bucket (budget/8) so the largest bucket
+               * (~3.5x mean, measured) stays inside half the budget; rounded
+               * up to a multiple of 4 so 144 = 4*6*6 latch geometry divides
+               * evenly. The 48 cap is the point where the cap binds again
+               * (~144k rows and beyond) — that regime needs placement, not a
+               * bigger table. */
+              int want = (n + 2999) / 3000;
+              want = ((want + 3) / 4) * 4;
+              if (want < 8) want = 8;
+              if (want > 48) want = 48;
+              K = want;
+          }
+        }
         if (K > LZ_ANCH_MAXK) K = LZ_ANCH_MAXK;
         int m = 0;
         for (int i = 0; i < n; i++) if (a[i].dim == dim) m++;
@@ -3501,12 +3699,14 @@ static int handle_health(sock_t cli) {
     int bl = snprintf(b, sizeof(b),
         "{\"status\":\"%s\",\"service\":\"ann_search\",\"fork_of\":\"DWGLS 8c85f9f\","
         "\"index\":\"%s\",\"entries\":%d,\"routed\":%d,\"stamps_live\":%d,"
-        "\"route_dead\":%d,\"maxk\":%d,\"embed\":\"%s\","
+        "\"route_dead\":%d,\"maxk\":%d,\"k\":%d,\"embed\":\"%s\","
+        "\"labels\":\"%s\",\"order_stale\":%ld,\"heal_ok\":%ld,\"heal_fail\":%ld,"
         "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
         "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
-        esc, nent, routed, stamps_live, route_dead, ANN_MAXK, embed_ok ? "ok" : "down",
+        esc, nent, routed, stamps_live, route_dead, ANN_MAXK, g_anch_k, embed_ok ? "ok" : "down",
+        g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
         g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
         g_fog_replayed, sh, (unsigned)WL_FREE);
@@ -3524,29 +3724,33 @@ static int handle_canary(sock_t cli) {
     LZEntry *ents = NULL; int nent = 0;
     lz_index_cached(&ents, &nent);
     cy_note_size();
-    /* bucket skew: rows hanging on each anchor bucket (anchor OR anchor2) */
+    /* bucket skew: rows hanging on each anchor bucket (anchor OR anchor2).
+     * Statistics are taken over the K buckets that EXIST, not over the
+     * ANCHR_MAXK (512) table slots — dividing by the slot capacity made
+     * mean/cv meaningless and reported min=0 for every empty slot. */
+    int kk = (g_anch_k > 0 && g_anch_k <= ANCHR_MAXK) ? g_anch_k : LZ_ANCH_MAXK;
     int cnt[ANCHR_MAXK]; memset(cnt, 0, sizeof(cnt));
     for (int i = 0; i < nent; i++) {
         int a = ents[i].anchor;
-        if (a >= 0 && a < ANCHR_MAXK) cnt[a]++;
+        if (a >= 0 && a < kk) cnt[a]++;
         int a2 = ents[i].anchor2;
-        if (a2 >= 0 && a2 < ANCHR_MAXK) cnt[a2]++;
+        if (a2 >= 0 && a2 < kk) cnt[a2]++;
     }
-    int srt[ANCHR_MAXK]; memcpy(srt, cnt, sizeof(cnt));
-    for (int i = 0; i < ANCHR_MAXK; i++)
-        for (int j = i + 1; j < ANCHR_MAXK; j++)
+    int srt[ANCHR_MAXK]; memcpy(srt, cnt, (size_t)kk * sizeof(int));
+    for (int i = 0; i < kk; i++)
+        for (int j = i + 1; j < kk; j++)
             if (srt[j] < srt[i]) { int t = srt[i]; srt[i] = srt[j]; srt[j] = t; }
-    long sum = 0; int mn = srt[0], mx = srt[ANCHR_MAXK - 1];
-    for (int b = 0; b < ANCHR_MAXK; b++) sum += cnt[b];
-    double mean = (double)sum / (double)ANCHR_MAXK;
+    long sum = 0; int mn = srt[0], mx = srt[kk - 1];
+    for (int bi = 0; bi < kk; bi++) sum += cnt[bi];
+    double mean = (double)sum / (double)kk;
     double var = 0.0;
-    for (int b = 0; b < ANCHR_MAXK; b++) {
-        double d = (double)cnt[b] - mean; var += d * d;
+    for (int bi = 0; bi < kk; bi++) {
+        double d = (double)cnt[bi] - mean; var += d * d;
     }
-    var /= (double)ANCHR_MAXK;
+    var /= (double)kk;
     double cv = (mean > 0.0) ? sqrt(var) / mean : 0.0;
-    int p50 = srt[ANCHR_MAXK / 2];
-    int p90 = srt[(ANCHR_MAXK * 9) / 10 < ANCHR_MAXK ? (ANCHR_MAXK * 9) / 10 : ANCHR_MAXK - 1];
+    int p50 = srt[kk / 2];
+    int p90 = srt[(kk * 9) / 10 < kk ? (kk * 9) / 10 : kk - 1];
 
     char b[2048]; int bl = 0;
     bl += snprintf(b + bl, sizeof(b) - bl,
@@ -3554,22 +3758,26 @@ static int handle_canary(sock_t cli) {
         "\"n\":%ld,\"cache_hit\":%ld,\"cache_miss\":%ld,\"warm_taken\":%ld,"
         "\"align\":{\"cold\":%ld,\"no_shut\":%ld,\"all_shut\":%ld,\"no_fit\":%ld},"
         "\"buckets_visited\":%ld,\"buckets_shut\":%ld,\"skipped_rows\":%ld,"
-        "\"note_events\":%ld,\"scored_sum\":%ld},\"bucket_skew\":{",
+        "\"note_events\":%ld,\"scored_sum\":%ld,\"trunc\":%ld,"
+        "\"budget\":%ld,\"k_used\":%d},\"bucket_skew\":{",
         g_cy_on, g_warm_on, g_cy.queries, g_cy.cache_hit, g_cy.cache_miss,
         g_cy.warm_taken, g_cy.align_cold, g_cy.align_no_shut,
         g_cy.align_all_shut, g_cy.align_no_fit,
         g_cy.buckets_visited, g_cy.buckets_shut, g_cy.buckets_skipped,
-        g_cy.note_events, g_cy.scored_sum);
+        g_cy.note_events, g_cy.scored_sum, g_cy.trunc,
+        g_cy.budget_last, g_cy.k_last);
     bl += snprintf(b + bl, sizeof(b) - bl,
-        "\"rows\":%d,\"min\":%d,\"p50\":%d,\"p90\":%d,\"max\":%d,"
-        "\"mean\":%.1f,\"cv\":%.3f,\"counts\":[", nent, mn, p50, p90, mx, mean, cv);
-    for (int k = 0; k < ANCHR_MAXK; k++)
+        "\"k\":%d,\"rows\":%d,\"min\":%d,\"p50\":%d,\"p90\":%d,\"max\":%d,"
+        "\"mean\":%.1f,\"cv\":%.3f,\"counts\":[", kk, nent, mn, p50, p90, mx, mean, cv);
+    for (int k = 0; k < kk; k++)
         bl += snprintf(b + bl, sizeof(b) - bl, "%s%d", k ? "," : "", cnt[k]);
+    char esc_note[768];
+    lz_json_escape(esc_note, sizeof(esc_note), PATH_LOG ? PATH_LOG : "");
     bl += snprintf(b + bl, sizeof(b) - bl,
         "]},\"note\":{\"path\":\"%s\",\"bytes\":%ld,\"records\":%ld},"
         "\"boot\":{\"index_ms\":%.1f,\"fog_ms\":%.1f},"
         "\"option_b\":{\"rows\":%ld,\"ms\":%.1f}}",
-        PATH_LOG ? PATH_LOG : "", g_cy.note_bytes, g_cy.note_records,
+        esc_note, g_cy.note_bytes, g_cy.note_records,
         g_cy.boot_ms, g_cy.boot_fog_ms, g_cy.reassign_rows, g_cy.reassign_ms);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
@@ -4113,6 +4321,10 @@ int main(int argc, char **argv) {
       g_cy_on = (ce && atoi(ce)) ? 1 : 0;
       const char *re = getenv("ANN_CANARY_RECOMPUTE");
       g_cy_recompute = (re && atoi(re)) ? 1 : 0; }
+    /* Option B (structure): labels + walk order are derived from the rows
+     * and the table instead of read from .stamp/.order. */
+    { const char *le = getenv("ANN_LABELS");
+      if (le) g_labels_derive = (strcmp(le, "stamp") != 0); }
     double cy_t0 = lz_now_ms();
     lz_fog_init();
     g_cy.boot_fog_ms = lz_now_ms() - cy_t0;
@@ -4120,6 +4332,21 @@ int main(int argc, char **argv) {
       g_loaded_at_ms = lz_now_ms();
       g_cy.boot_ms = g_loaded_at_ms - cy_t0;
       cy_note_size();
+      g_labels_src = g_labels_derive ? "derive"
+                   : (g_stamp_live > 0 ? "stamp" : "fruit");
+      /* derive mode: pay the sweep at boot, once, so the first query is not
+       * the one that discovers its cost. Logged either way. */
+      if (g_labels_derive) {
+          double lt0 = lz_now_ms();
+          int ok = lz_route_cached(n);
+          double lms = lz_now_ms() - lt0;
+          lz_diag("[labels] boot derive ok=%d n=%d ms=%.1f\n", ok, n, lms);
+          if (g_cy_on)
+              cy_emit("{\"event\":\"labels-derive-boot\",\"ok\":%d,\"n\":%d,"
+                      "\"ms\":%.1f,\"src\":\"%s\"}", ok, n, lms, g_labels_src);
+          fprintf(stderr, "[ann_search] labels=derive ok=%d rows=%d ms=%.1f\n",
+                  ok, n, lms);
+      }
       if (g_cy_on) {
           long sh = 0;
           for (unsigned wi = 0; wi < WL_WORDS; wi++) {
