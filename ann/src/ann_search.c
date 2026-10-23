@@ -614,6 +614,9 @@ static inline uint32_t lz_fog_id(int bucket) {
                            * regrow stack arrays at 256 B while giving the
                            * bench room to balance 62.8k rows. */
 #define LZ_OVERLAP_TOPB 2
+/* ANN_TOPB overrides the walk width. Coverage is topb/K, so topb must scale with
+ * K: 2/24 = 8.3% at K=24, but 2/256 = 0.8% at K=256. */
+static int g_topb = LZ_OVERLAP_TOPB;
 #define LZ_ROUTE_HEADROOM_DEF 4
 #define LZ_SEARCH_BUDGET_DEF 24000
 /* Recall knee is corpus-size-relative (measured 2026-10-11, 300q x2 corpora
@@ -1153,7 +1156,7 @@ static int lz_labels_derive(LZEntry *a, int n) {
             a[i].anchor = -1; a[i].anchor2 = -1; rows[i] = -1;
             continue;
         }
-        int nb = anch_route(a[i].vec, g_anch_cache, K, dim, LZ_OVERLAP_TOPB, t2);
+        int nb = anch_route(a[i].vec, g_anch_cache, K, dim, g_topb, t2);
         a[i].anchor  = nb > 0 ? t2[0] : -1;
         a[i].anchor2 = nb > 1 ? t2[1] : -1;
         rows[i] = a[i].anchor;
@@ -1254,7 +1257,7 @@ static void cy_measure_reassign(void) {
     for (int i = 0; i < nent; i++) {
         if (!ents[i].vec) continue;
         int nb = anch_route(ents[i].vec, g_anch_cache, g_anch_k, g_anch_dim,
-                            LZ_OVERLAP_TOPB, t2);
+                            g_topb, t2);
         rows++; if (nb > 0) hits++;
     }
     g_cy.reassign_ms = lz_now_ms() - t0;
@@ -2895,7 +2898,7 @@ static int lz_restamp(int *n_out, int *K_out) {
     for (int i = 0; i < n; i++) {
         if (a[i].dim != dim) { rows[i] = -1; rows2[i] = -1; continue; }
         int t2[LZ_ANCH_MAXK];
-        int nb = anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2);
+        int nb = anch_route(a[i].vec, C, K, dim, g_topb, t2);
         rows[i]  = nb > 0 ? t2[0] : -1;
         rows2[i] = nb > 1 ? t2[1] : -1;
     }
@@ -3192,7 +3195,8 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
          * phase-2 bucket-balance bench pick K explicitly (measured, never
          * asserted). */
         int dim = a[0].dim, K = n >= 64 ? 8 : n >= 32 ? 4 : 2;
-        { const char *ke = getenv("ANN_ANCHOR_K");
+        { const char *tb = getenv("ANN_TOPB"); if (tb && atoi(tb) > 0) { g_topb = atoi(tb); if (g_topb > LZ_ANCH_MAXK) g_topb = LZ_ANCH_MAXK; }
+      const char *ke = getenv("ANN_ANCHOR_K");
           if (ke && atoi(ke) > 0) K = atoi(ke);
           else if (n >= 64) {
               /* Bucket count scales with the corpus instead of pinning at 8.
@@ -3200,16 +3204,21 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                * 24000, cv over the K live buckets):
                *   K=8   62.8k rows: R@5 .9533 R@10 .9367, walk truncated 300/300
                *   K=24  62.8k rows: R@5 .9680 R@10 .9613, 16.3k scored, no trunc
-               * Target ~3000 rows per bucket (budget/8) so the largest bucket
-               * (~3.5x mean, measured) stays inside half the budget; rounded
-               * up to a multiple of 4 so 144 = 4*6*6 latch geometry divides
-               * evenly. The 48 cap is the point where the cap binds again
-               * (~144k rows and beyond) — that regime needs placement, not a
-               * bigger table. */
-              int want = (n + 2999) / 3000;
+               *   K=64  62.8k rows: R@5 .9627 R@10 .9623, 10.3k scored (R@1 .9833)
+               *   K=64 topb=5     : R@1 .9867 but R@5 .9307 at 12.4k scored —
+               *                      extra buckets spend the budget on farther
+               *                      rows, so topb stays 3 while K grows.
+               * Goal: K grows with the corpus (rows per bucket kept near the
+               * measured sweet spot), rounded up to a multiple of 4 so
+               * 144 = 4*6*6 latch geometry divides evenly. K costs O(K*dim)
+               * to route (0.2 MFLOP at K=512) — negligible next to walking a
+               * bucket — so the fence is table/derive cost, not compute. The
+               * cap is LZ_ANCH_MAXK (route scratch); past it the answer is
+               * placement/hierarchy, not a bigger table. */
+              int want = (n + 999) / 1000;
               want = ((want + 3) / 4) * 4;
               if (want < 8) want = 8;
-              if (want > 48) want = 48;
+              if (want > LZ_ANCH_MAXK) want = LZ_ANCH_MAXK;
               K = want;
           }
         }
@@ -3355,7 +3364,7 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                         } else {
                             int t2[LZ_ANCH_MAXK];
                             int nb = (a[i].dim == dim)
-                                ? anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2) : 0;
+                                ? anch_route(a[i].vec, C, K, dim, g_topb, t2) : 0;
                             rows[i] = nb > 0 ? t2[0] : -1;
                             rows2[i] = nb > 1 ? t2[1] : -1;
                         }
@@ -3495,7 +3504,7 @@ full_pipeline:
                         QueryPerformanceCounter(&t_route0);
                         for (int i = 0; i < n; i++) {
                             if (a[i].dim != dim) { rows[i] = -1; rows2[i] = -1; continue; }
-                            int nb = anch_route(a[i].vec, C, K, dim, LZ_OVERLAP_TOPB, t2);
+                            int nb = anch_route(a[i].vec, C, K, dim, g_topb, t2);
                             rows[i] = nb > 0 ? t2[0] : -1;
                             rows2[i] = nb > 1 ? t2[1] : -1;
                         }

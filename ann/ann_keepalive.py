@@ -297,8 +297,8 @@ def once():
 # Rule parity with the C code (src/ann_search.c, regrow path):
 #   K = round_up_to_4(ceil(n / 3000)), clamped to [8, 48]
 # `--selfcheck` asserts this against the values the C rule produces.
-K_TARGET_ROWS = 3000
-K_MIN, K_MAX = 8, 48
+K_TARGET_ROWS = 1000
+K_MIN, K_MAX = 8, 64   # K_MAX mirrors LZ_ANCH_MAXK (route scratch)
 STATE = os.path.join(DIR, ".anchor_state.json")
 REGROW_MIN_GAP = 600            # never regrow twice inside 10 minutes
 REGROW_URL = "http://127.0.0.1:%d/v1/state/regrow" % PORT
@@ -307,7 +307,7 @@ REGROW_URL = "http://127.0.0.1:%d/v1/state/regrow" % PORT
 def k_for(n):
     """Bucket count the C regrow path would pick for n rows (keep in sync)."""
     if n < 64:
-        return 8 if n >= 64 else (4 if n >= 32 else 2)
+        return 4 if n >= 32 else 2
     want = -(-n // K_TARGET_ROWS)
     want = ((want + 3) // 4) * 4
     return max(K_MIN, min(K_MAX, want))
