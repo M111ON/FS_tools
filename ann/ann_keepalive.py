@@ -295,7 +295,10 @@ def once():
 #   * the route is dead (routed=0) -> re-anchor is the only repair
 #
 # Rule parity with the C code (src/ann_search.c, regrow path):
-#   K = round_up_to_4(ceil(n / 3000)), clamped to [8, 48]
+#   K = round_up_to_4(ceil(n / 1000)), clamped to [8, 64]
+# The K cap binds from 63k rows on, so above that the K-breakpoint trigger can
+# never fire again — past 63k the only auto-repair left is routed==0, and the
+# next lever is placement/hierarchy, not a bigger table (measured 2026-10-23).
 # `--selfcheck` asserts this against the values the C rule produces.
 K_TARGET_ROWS = 1000
 K_MIN, K_MAX = 8, 64   # K_MAX mirrors LZ_ANCH_MAXK (route scratch)
@@ -412,19 +415,18 @@ def _do_regrow(why, n):
 
 def _selfcheck():
     """Rule parity with C + decision table. No server, no writes."""
-    cases = {10: 2, 40: 4, 64: 8, 2999: 8, 3000: 8, 12000: 8,
-             12001: 8, 24000: 8, 30000: 12, 47999: 16, 48000: 16,
-             62869: 24, 72000: 24, 72001: 28, 96000: 32, 144000: 48,
-             200000: 48, 1: 2}
+    cases = {1: 2, 10: 2, 40: 4, 64: 8, 2999: 8, 3000: 8, 7999: 8, 8000: 8,
+             8001: 12, 12000: 12, 24000: 24, 30000: 32, 47999: 48, 48000: 48,
+             50000: 52, 62869: 64, 72000: 64, 96000: 64, 200000: 64}
     for n, want in cases.items():
         got = k_for(n)
         assert got == want, "k_for(%d)=%d want %d" % (n, got, want)
-    base = {"entries": 62869, "k": 24, "routed": 1}
+    base = {"entries": 62869, "k": 64, "routed": 1}
     assert _regrow_decision(base, {"n": 62869})[0] is False
     assert _regrow_decision(dict(base, routed=0), {})[0] is True
-    assert _regrow_decision(dict(base, k=20), {})[0] is True
-    assert _regrow_decision(dict(base, entries=72001, k=24), {})[0] is True
-    assert _regrow_decision(dict(base, entries=62869, k=24), {"n": 70000})[0] is False
+    assert _regrow_decision(dict(base, k=24), {})[0] is True
+    assert _regrow_decision(dict(base, entries=8001), {})[0] is True
+    assert _regrow_decision(dict(base, entries=62869, k=64), {"n": 70000})[0] is False
     assert _regrow_decision({"entries": 0, "k": 8, "routed": 1}, {})[0] is False
     print("selfcheck ok: %d k_for cases + 6 decisions" % len(cases))
 

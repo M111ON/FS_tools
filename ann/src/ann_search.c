@@ -281,9 +281,11 @@ static int lz_http_post(const char *host, int port, const char *path,
  * The index build side already normalizes with the SAME rule
  * (scripts/build_index.py:sanitize), so a query must be normalized identically
  * or the query text and the indexed text live in different spaces. This is the
- * C twin of that function: NFKC-lite for the codepoints NFKC actually fixes
- * (U+0E33 -> U+0E4D U+0E32, a 1->2 byte expansion) plus an ASCII map for the
- * symbols NFKC leaves alone, and a drop for the remaining Thai-block holes.
+ * C twin of that function: NFKC for every codepoint with a delta (generated
+ * table below), an ASCII map for the symbols NFKC leaves alone, and a drop for
+ * the remaining Thai-block holes and for codepoints the vocab cannot represent
+ * at all. The vocab bitmap gates only the NON-delta codepoints and the NFKC
+ * OUTPUT: asking it first about the input is what sent the delta class raw.
  * Meaning-preserving; no-op for English/plain ASCII. */
 static int lz_is_thai_hole(unsigned cp) {
     /* Thai block codepoints the e5 GGUF tokenizer 500s on (measured), minus
@@ -314,11 +316,12 @@ static const char *lz_ascii_map(unsigned cp) {
         case 0x2025: return "..";
         case 0x22EF: return "...";
         case 0x2116: return "No";
-        case 0x2100: return "a/c";
-        case 0x2101: return "a/c";
-        case 0x00BC: return "1/4";
-        case 0x00BD: return "1/2";
-        case 0x00BE: return "3/4";
+        /* NOTE: 00BC/00BD/00BE and 2100/2101 are NOT here — real NFKC expands
+         * them to "1⁄4" (U+2044 FRACTION SLASH) and "a/c" respectively, and the
+         * ASCII-slash hand fold made the query land elsewhere than its own NFKC
+         * twin (measured: sid-parity raw vs nfkc returned different top docs).
+         * The generated table below holds the exact expansion, so they are left
+         * to it. */
         /* Letterlike math: NFKC expands each to its plain letter(s). */
         case 0x2102: return "C";  case 0x2103: return "deg C";
         case 0x2107: return "E";  case 0x2109: return "deg F";
@@ -437,12 +440,27 @@ static int lz_sanitize(char *dst, int cap, const char *src) {
          * when possible; otherwise drop the cp entirely. */
         unsigned noff; unsigned char nlen;
         if (cp > 0xFFFF) continue;                   /* astral: out of vocab, drop */
-        if (nfkc_in_vocab(cp)) { lz_utf8_put(dst, &di, cap, cp); continue; }
+        /* NFKC FIRST, always — every cp with a delta 500s the tokenizer raw
+         * (measured 2026-10-23: 2160..217F roman, 2150..215F fractions, FF71
+         * halfwidth katakana, 00B2 superscript: all 500 raw, all 200 after
+         * NFKC), and the corpus rows were embedded AFTER real NFKC, so the
+         * expanded form is the only one in the same space. The old order asked
+         * the vocab bitmap first, and that bitmap says "in vocab" for the whole
+         * delta class (2682/2682), which sent them raw -> 503. */
         if (nfkc_lookup(cp, &noff, &nlen)) {
-            for (unsigned char j = 0; j < nlen && di < cap - 1; j++) dst[di++] = (char)nfkc_pool[noff + j];
+            const char *pool = (const char *)nfkc_pool + noff;
+            int used = 0;
+            while (used < (int)nlen) {
+                unsigned ocp; int oadv = lz_utf8_next(pool + used, &ocp);
+                used += oadv;
+                if (nfkc_in_vocab(ocp)) lz_utf8_put(dst, &di, cap, ocp);
+                /* unrepresentable output cp: drop it, never emit it raw */
+            }
             continue;
         }
-        lz_utf8_put(dst, &di, cap, cp);
+        if (nfkc_in_vocab(cp)) { lz_utf8_put(dst, &di, cap, cp); continue; }
+        /* no delta and not representable: drop (measured: unassigned U+0378,
+         * U+FFFD and ZWSP U+200B all 500 the tokenizer raw) */
     }
     dst[di] = '\0';
     return di;
