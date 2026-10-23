@@ -1123,6 +1123,93 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
 /* anchors + order cache */
 static float *g_anch_cache = NULL;
 static int g_anch_k = 0, g_anch_dim = 0, g_anch_ntr = 0;
+
+/* ── ZONE ORDER (2026-10-23) ─────────────────────────────────────────────
+ * The 3-circle / caridoid zonation carries real signal (probe: neighbours
+ * share a zone 0.6997 vs 0.2375 random) but as a HARD filter its ceiling is
+ * 0.6997, below the bucket path's 0.9627 — so it may only ORDER work, never
+ * remove a candidate. The two projection axes are DERIVED from the centroid
+ * table (PCA-2 by power iteration), so this adds no stored state: the same
+ * rows + table reproduce the same zones at boot. */
+static float *g_zp = NULL;             /* 2 x dim projection axes, derived */
+static int g_bzone[ANCHR_MAXK];        /* zone id per bucket */
+static int g_zone_ok = 0, g_zone_k = 0;
+
+static int lz_zone_of(float x, float y) {
+    /* 3 unit directions at 0/120/240 deg -> 3 wedges; half-plane -> 6 zones.
+     * No atan2 and no division by a tuned constant: two multiplies a candidate. */
+    static const float cz[3][2] = {{1.0f, 0.0f}, {-0.5f, 0.8660254f}, {-0.5f, -0.8660254f}};
+    float r = sqrtf(x * x + y * y);
+    if (r < 1e-6f) return 6;                       /* degenerate: centre */
+    x /= r; y /= r;
+    int k = 0; float best = -2.0f;
+    for (int i = 0; i < 3; i++) {
+        float s = x * cz[i][0] + y * cz[i][1];
+        if (s > best) { best = s; k = i; }
+    }
+    return k * 2 + (best < 0.5f ? 1 : 0);
+}
+
+static void lz_zone_build(void) {
+    g_zone_ok = 0; g_zone_k = 0;
+    if (!g_anch_cache || g_anch_k <= 2 || g_anch_dim <= 0) return;
+    int K = g_anch_k, d = g_anch_dim;
+    if (!g_zp) g_zp = (float *)malloc((size_t)2 * (size_t)d * sizeof(float));
+    float *mean = (float *)calloc((size_t)d, sizeof(float));
+    float *t = (float *)malloc((size_t)d * sizeof(float));
+    if (!g_zp || !mean || !t) { free(mean); free(t); return; }
+    for (int k = 0; k < K; k++) {
+        const float *r = g_anch_cache + (size_t)k * d;
+        for (int j = 0; j < d; j++) mean[j] += r[j];
+    }
+    for (int j = 0; j < d; j++) mean[j] /= (float)K;
+    for (int c = 0; c < 2; c++) {
+        float *v = g_zp + (size_t)c * d;
+        for (int j = 0; j < d; j++) v[j] = (float)((j % 7) - 3);   /* fixed seed */
+        for (int it = 0; it < 24; it++) {
+            double nv = 0.0;
+            for (int j = 0; j < d; j++) nv += (double)v[j] * v[j];
+            nv = sqrt(nv);
+            if (nv < 1e-12) break;
+            for (int j = 0; j < d; j++) v[j] = (float)(v[j] / nv);
+            memset(t, 0, (size_t)d * sizeof(float));
+            for (int k = 0; k < K; k++) {
+                const float *r = g_anch_cache + (size_t)k * d;
+                double p = 0.0;
+                for (int j = 0; j < d; j++) p += (double)(r[j] - mean[j]) * v[j];
+                for (int j = 0; j < d; j++) t[j] += (float)(p * (double)(r[j] - mean[j]));
+            }
+            if (c == 1) {                       /* deflate the first component */
+                double q = 0.0;
+                for (int j = 0; j < d; j++) q += (double)t[j] * g_zp[j];
+                for (int j = 0; j < d; j++) t[j] -= (float)(q * (double)g_zp[j]);
+            }
+            memcpy(v, t, (size_t)d * sizeof(float));
+        }
+    }
+    for (int k = 0; k < K; k++) {
+        const float *r = g_anch_cache + (size_t)k * d;
+        double x = 0.0, y = 0.0;
+        for (int j = 0; j < d; j++) {
+            x += (double)(r[j] - mean[j]) * g_zp[j];
+            y += (double)(r[j] - mean[j]) * g_zp[(size_t)d + j];
+        }
+        g_bzone[k] = lz_zone_of((float)x, (float)y);
+    }
+    g_zone_ok = 1; g_zone_k = K;
+    free(mean); free(t);
+}
+
+static int lz_zone_of_vec(const float *q, int d) {
+    if (!g_zone_ok || !g_zp || d != g_anch_dim) return -1;
+    double x = 0.0, y = 0.0;
+    for (int j = 0; j < d; j++) {
+        x += (double)q[j] * g_zp[j];
+        y += (double)q[j] * g_zp[(size_t)d + j];
+    }
+    return lz_zone_of((float)x, (float)y);
+}
+
 static uint32_t *g_ord_cache = NULL;
 static int g_ord_n = 0;
 static long g_ord_stale = 0;   /* .order refused (stale/torn) -> derived in memory */
@@ -1130,6 +1217,7 @@ static long g_anch_key[4] = {0, 0, 0, 0};
 static void lz_route_cache_invalidate(void) {
     free(g_anch_cache); g_anch_cache = NULL;
     free(g_ord_cache);  g_ord_cache = NULL;
+    free(g_zp); g_zp = NULL; g_zone_ok = 0; g_zone_k = 0;
     g_anch_k = g_anch_dim = g_anch_ntr = 0; g_ord_n = 0;
     for (int i = 0; i < 4; i++) g_anch_key[i] = 0;
 }
@@ -1199,6 +1287,7 @@ static int lz_route_cached(int nent) {
     int K = anch_load(PATH_ANCH, C, ANCHR_MAXK, ANCHR_MAXD, &adim, &antr);
     if (K <= 0 || nent < antr) { free(C); return 0; }   /* shrink = wrong table */
     g_anch_cache = C; g_anch_k = K; g_anch_dim = adim; g_anch_ntr = antr;
+    lz_zone_build();   /* derived from the table; no stored state */
     if (g_labels_derive) {
         /* H2 stays: the table must still cover this row count (checked
          * above). What disappears is the second file that could disagree. */
@@ -1629,6 +1718,9 @@ static int lz_mem_search(const float *qv, int qd,
     { const char *fk = getenv("ANN_FLOAT_KERNEL");
       g_float_kernel = (fk && atoi(fk)) ? 1 : 0; }
     if (g_float_kernel && ents && nent > 0) lazy_inv_build(ents, nent);
+    int walk_zone = 0;   /* ANN_WALK_ORDER=zone: order rb[] by zone, never filter */
+    { const char *wo = getenv("ANN_WALK_ORDER");
+      if (wo && strcmp(wo, "zone") == 0) walk_zone = 1; }
     int walk_prune = 0; double walk_floor = 0.0;
     { const char *wp = getenv("ANN_WALK_PRUNE");
       if (wp && atoi(wp) > 0) walk_prune = 1; }
@@ -1793,6 +1885,34 @@ static int lz_mem_search(const float *qv, int qd,
                         if (!dup) { rb[rnb++] = bi; added++; }
                     }
                     if (added) snprintf(rm, sizeof(rm), "%s", "anchor+g");
+                }
+            }
+
+            /* ── zone order (env ANN_WALK_ORDER=zone) ───────────────
+             * The 3-circle/6-wedge zonation (probe 2026-10-23) carries real
+             * signal: neighbours share a zone 0.6997 vs 0.2375 random. But as
+             * a HARD filter it caps recall at 0.6997, below the bucket path
+             * (0.9627 at K=64). So the zone may only ORDER the buckets the
+             * route already picked: it can change which part of the walk
+             * survives the budget cut, never remove a candidate. A wrong zone
+             * costs one extra cell visit, not a lost neighbour (bulkhead, not
+             * filter). Zone vectors are DERIVED from the centroid table at
+             * load; nothing extra is stored. */
+            if (walk_zone && rnb > 1 && g_zone_ok && g_zone_k == K) {
+                int qz = lz_zone_of_vec(qv, qd);
+                if (qz >= 0) {
+                    int zrb[ANN_MAXK], nz = 0;
+                    for (int pass = 0; pass < 2; pass++)
+                        for (int r = 0; r < rnb; r++) {
+                            int bz = (rb[r] >= 0 && rb[r] < ANCHR_MAXK) ? g_bzone[rb[r]] : -1;
+                            if ((pass == 0) == (bz == qz)) zrb[nz++] = rb[r];
+                        }
+                    if (nz == rnb) {
+                        int moved = 0;
+                        for (int r = 0; r < rnb; r++) if (zrb[r] != rb[r]) moved = 1;
+                        memcpy(rb, zrb, (size_t)rnb * sizeof(int));
+                        if (moved) { char t[64]; snprintf(t, sizeof(t), "%s+zone", rm); snprintf(rm, sizeof(rm), "%s", t); }
+                    }
                 }
             }
 
