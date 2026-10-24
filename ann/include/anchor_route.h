@@ -18,6 +18,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+extern int fileno(FILE *);
+#endif
 
 #define ANCHR_MAGIC   0x414E4352u /* "ANCR" */
 #define ANCHR_MAXK    512
@@ -49,13 +62,15 @@ static inline int anch_assign(const float *q, const float *C, int K, int dim) {
 }
 
 /* top-b buckets by centroid distance (partial selection; K unbounded, O(K)
- * scratch via malloc; out must hold K ints). Returns min(topb,K). */
+ * scratch via malloc). out needs only room for min(topb,K) ints.
+ * Returns min(topb,K), 0 on bad args/OOM. */
 static inline int anch_route(const float *q, const float *C, int K, int dim,
                              int topb, int *out) {
     if (!q || !C || !out || K <= 0 || dim <= 0 || topb <= 0) return 0;
     if (topb > K) topb = K;
     double *bd = (double *)malloc((size_t)K * sizeof(double));
-    if (!bd) return 0;
+    int *idx = (int *)malloc((size_t)K * sizeof(int));
+    if (!bd || !idx) { free(bd); free(idx); return 0; }
     for (int k = 0; k < K; k++) {
         double d = 0;
         const float *c = C + (size_t)k * dim;
@@ -64,13 +79,14 @@ static inline int anch_route(const float *q, const float *C, int K, int dim,
             d += e * e;
         }
         bd[k] = d;
-        out[k] = k;
+        idx[k] = k;
     }
-    /* partial selection sort on first topb */
+    /* partial selection sort on first topb (same order/ties as before) */
     for (int a = 0; a < topb; a++)
         for (int b = a + 1; b < K; b++)
-            if (bd[out[b]] < bd[out[a]]) { int t = out[a]; out[a] = out[b]; out[b] = t; }
-    free(bd);
+            if (bd[idx[b]] < bd[idx[a]]) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+    memcpy(out, idx, (size_t)topb * sizeof(int));
+    free(idx); free(bd);
     return topb;
 }
 
@@ -198,8 +214,22 @@ static inline int anch_save_atomic(const char *path, const float *C, int K, int 
     char tmp[512];
     if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return -1;
     if (anch_save(tmp, C, K, dim, ntr) != 0) { remove(tmp); return -1; }
-    remove(path);
+    /* reopen tmp and flush to disk */
+    FILE *f = fopen(tmp, "rb+");
+    if (!f) { remove(tmp); return -1; }
+    int ok = 1;
+#if defined(_WIN32)
+    ok = ok && _commit(_fileno(f)) == 0;
+#else
+    ok = ok && fsync(fileno(f)) == 0;
+#endif
+    ok = ok && (fclose(f) == 0);
+    if (!ok) { remove(tmp); return -1; }
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { remove(tmp); return -1; }
+#else
     if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+#endif
     return 0;
 }
 
