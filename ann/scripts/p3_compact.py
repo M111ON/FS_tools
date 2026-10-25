@@ -42,7 +42,7 @@ import zlib
 
 REC = 32
 HEADER_LEN = 3
-WL_NAME_HASH = 0x77616E676C617463  # "wanglatc"
+WL_NAME_HASH = 0x77616E676C617464  # "wanglatd" — epoch 2 (choice-1 latch ids)
 ACTION_WRITE, ACTION_CLEAR, ACTION_MOVE, ACTION_ANCHOR = 0, 1, 2, 3
 
 

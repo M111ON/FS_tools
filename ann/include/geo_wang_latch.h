@@ -34,8 +34,14 @@
 #define WL_WORDS       (WL_COUNT / 64u)  /* 162 */
 #define WL_BYTES       (WL_WORDS * 8u)   /* 1296 B */
 
-/* records tagged with this name_hash are latch events, not identity events */
-#define WL_NAME_HASH   0x77616E676C617463ull  /* "wanglatc" */
+/* records tagged with this name_hash are latch events, not identity events.
+ * EPOCH 2 (2026-10-25): "wanglatd". The id space moved from wl_id(cell,0) to
+ * wl_id(cell,1) (wl_bucket_id — choice 1 makes every bucket latchable, since
+ * wl_id(0,0) is the reserved apex). A new id space is a new epoch, and the tag
+ * IS the epoch switch: records written under "wanglatc" are ignored by this
+ * build (foreign name_hash = no-op), so a deployment starts all-OPEN and
+ * re-learns by walking. Nothing is deleted; the old records stay inert. */
+#define WL_NAME_HASH   0x77616E676C617464ull  /* "wanglatd" */
 
 typedef struct {
     uint64_t w[WL_WORDS];
@@ -65,6 +71,46 @@ static inline int wl_clear(wl_latch_t *L, uint32_t id) {
     if (id >= WL_COUNT) return 0;
     L->w[id >> 6] &= ~(1ull << (id & 63u));
     return 1;
+}
+
+/* ──── cell geometry: (pair << 1) | end  (phase-2, 2026-10-23) ─────────
+ * Spec: the 144-cell axis is a 4 x 6 x 6 lattice whose LOW BIT is the
+ * HOURGLASS END — the point reflection through the shared centre (pin:
+ * tests/test_addr_orbit.c T14; core/isometric_map.h IM_CROSS pairs a face with
+ * its opposite ring) swaps the two ends of a pair. Reading the flat cell as
+ *     cell = (pair << 1) | end,   pair = cell >> 1 in [0,72), end = cell & 1
+ * makes that crossing EXACTLY one XOR: no table, no walk (T15).
+ *   - self-inverse, 72 pairs, 0 fixed points (T14 d^1 over the doubled digit);
+ *   - the two ends stay INDEPENDENT — shutting end 0 must NOT shut end 1
+ *     (G2.5: +X closed, -X still open);
+ *   - it is a bijection, so it moves NO route: only the integer naming a cell.
+ * The pair is a LABEL of the bucket ids, not a spatial fact: bucket b pairs
+ * with b^1, so the crossing is live for any even K. Which bucket ids form a
+ * pair is the one choice left open (owner decision, ANN-UPGRADE-EXT doc). */
+static inline uint32_t wl_cell_pair(uint32_t cell)  { return cell >> 1; }
+static inline uint32_t wl_cell_end(uint32_t cell)   { return cell & 1u; }
+static inline uint32_t wl_cell_cross(uint32_t cell) { return cell ^ 1u; }
+/* flat -> cell. The flat cell already IS the (pair<<1)|end encoding, so this is
+ * the negative-safe normalisation of `bucket % 144`, named so the contract
+ * lives in one place instead of at every call site. */
+static inline uint32_t wl_cell_of(int flat) {
+    int c = flat % 144;
+    if (c < 0) c += 144;
+    return (uint32_t)c;
+}
+
+/* Latch id for an ANCHOR BUCKET (ann_search.c). ALWAYS choice 1, never 0:
+ * wl_id(cell,0) for cell 0 IS WL_RESERVED_LO (0), and wl_traverse refuses
+ * reserved ids, so bucket 0 could never shut — observed live 2026-10-20
+ * (ANN_DOOR_TRACE; the door walk had to skip it) and re-flagged in the
+ * phase-2 review. choice 1 keeps EVERY bucket in the minor pool:
+ *   cell 0   -> 1      (was 0 = reserved)
+ *   cell 143 -> 10297  (< WL_RESERVED_HI 10367)
+ * Records already in a P3 log under choice 0 keep their slot; they simply
+ * stop matching (the latch is a derived cache, so a boot after this change
+ * starts all-OPEN and re-learns by walking — nothing is lost, nothing lies). */
+static inline uint32_t wl_bucket_id(int bucket) {
+    return wl_id(wl_cell_of(bucket), 1u);
 }
 
 /* ──── P3 append sink (the FINGERPRINT) ───────────────────────────────

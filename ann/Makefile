@@ -57,7 +57,15 @@ p3-compact-dry: | $(BUILD)
 latency-split:
 	$(PY) bench_latency_split.py
 
+# Phase-2 latch A/B (card task-tcce8f5f2): budget-limited, snapshot-pinned,
+# repeatable. The earlier A/B scored every row on both arms because its scratch
+# copy was inconsistent (anchors of one moment, index of another) — this one
+# refuses to run unless the snapshot is a coherent prefix, and its VALID gate
+# fails the run when the walk degenerates into a full scan.
+latch-ab: $(BUILD)/ann_search.exe | $(BUILD)
+	$(PY) bench_latch_ab.py --runs 5 --queries 40 --exe $(BUILD)/ann_search.exe
+
 clean:
 	rm -f $(BUILD)/ann_search.exe $(BUILD)/test_*.exe $(BUILD)/p3_*.exe
 
-.PHONY: all test serve clean p3-tools p3-compact-dry latency-split
+.PHONY: all test serve clean p3-tools p3-compact-dry latency-split latch-ab

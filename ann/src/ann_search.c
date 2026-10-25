@@ -596,12 +596,18 @@ static float *lz_embed_batch(const char * const *qs, int nq, float *out,
 
 /* ── fog latch over the anchor-bucket space (from L219-256) ──
  * The ROUTE WALKED is what shuts the latch. Buckets collapse to a wang-latch
- * cell = bucket % 144. Reload from the P3 route log on boot. */
+ * cell = (pair << 1) | end (wl_cell_of) — 144 cells whose low bit is the
+ * hourglass end, so the centre crossing is one XOR (wl_cell_cross). Reload
+ * from the P3 route log on boot. */
 static wl_latch_t g_fog;
 static int g_fog_ready = 0;
 static wl_log_t g_fog_log;
 static int g_fog_log_open = 0;
 static int g_fog_replayed = 0;
+/* partner policy: 2 = centroid table (default, G2.6), 1 = legacy cell^1
+ * parity (kept only so the A/B can measure what the parity choice cost),
+ * 0 = own bucket only. Env ANN_PAIR selects; default is centroid. */
+static int g_pair_mode = 2;
 typedef struct { int open; int shut; int lit; int replayed; } LZFog;
 static int g_warm_on = 0;       /* tombstone warm path (env ANN_TOMBSTONE_WARM) */
 static void lz_fog_init(void) {
@@ -617,11 +623,37 @@ static void lz_fog_init(void) {
     g_fog_ready = 1;
     const char *we = getenv("ANN_TOMBSTONE_WARM");
     g_warm_on = (we && atoi(we)) ? 1 : 0;
+    /* partner policy: "centroid" (default) | "parity" | "own" */
+    { const char *pe = getenv("ANN_PAIR");
+      if (pe && pe[0]) {
+          if (!strcmp(pe, "own"))         g_pair_mode = 0;
+          else if (!strcmp(pe, "parity")) g_pair_mode = 1;
+          else                            g_pair_mode = 2;
+      } }
 }
 static inline uint32_t lz_fog_id(int bucket) {
-    int c = bucket % 144;
-    if (c < 0) c += 144;
-    return wl_id((uint32_t)c, 0u);
+    /* choice 1, not 0: wl_id(cell,0) for cell 0 is WL_RESERVED_LO, which the
+     * latch refuses — bucket 0 could never shut (see wl_bucket_id). */
+    return wl_bucket_id(bucket);
+}
+/* ── partner table: which bucket is an hourglass PARTNER (G2.6) ────────
+ * The two ends of a pair are a fact about the CENTROID TABLE, not about the
+ * integer parity of k-means bucket ids: b and b^1 are neighbours only by
+ * accident, so "own is shut therefore the partner is warm" had no support.
+ * lz_pair_build() derives, once per table load, partner[k] = the centroid
+ * with the highest cosine to centroid k — the ADJACENT region, i.e. the
+ * bucket a nearby query would route to instead of k. Derived, never stored;
+ * deterministic (ties -> lowest id). Fail-safe: no table -> -1 -> the warm
+ * test reads OWN only. */
+static int g_pair[ANCHR_MAXK];
+static int g_pair_n = 0;
+static int lz_pair_of(int bucket);
+static inline int lz_fog_shut(int bucket) {
+    if (!wl_is_open(&g_fog, lz_fog_id(bucket))) return 1;
+    int p = -1;
+    if (g_pair_mode == 1)      p = (int)wl_cell_cross(wl_cell_of(bucket));
+    else if (g_pair_mode == 2) p = lz_pair_of(bucket);
+    return (p >= 0 && p != bucket && !wl_is_open(&g_fog, lz_fog_id(p))) ? 1 : 0;
 }
 
 /* ── anchor-bucket routing over the index ── */
@@ -644,6 +676,35 @@ static int g_topb = LZ_OVERLAP_TOPB;
  * it scales. Explicit LZ_SEARCH_BUDGET still overrides both. */
 #define LZ_SEARCH_BUDGET_FRAC_DEF 0.40
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
+
+/* partner table body (declared above lz_fog_shut; see the comment there) */
+static int lz_pair_of(int bucket) {
+    if (bucket < 0 || bucket >= g_pair_n || bucket >= ANCHR_MAXK) return -1;
+    return g_pair[bucket];
+}
+static void lz_pair_build(const float *C, int K, int dim) {
+    g_pair_n = 0;
+    for (int i = 0; i < ANCHR_MAXK; i++) g_pair[i] = -1;
+    if (!C || K < 2 || dim <= 0) return;
+    if (K > ANCHR_MAXK) K = ANCHR_MAXK;
+    for (int k = 0; k < K; k++) {
+        double na = 0.0;
+        for (int j = 0; j < dim; j++) { double v = C[(size_t)k * dim + j]; na += v * v; }
+        int best = -1; double bs = -DBL_MAX;
+        for (int m = 0; m < K; m++) {
+            if (m == k) continue;
+            double nb = 0.0, dot = 0.0;
+            for (int j = 0; j < dim; j++) {
+                double a = C[(size_t)k * dim + j], b = C[(size_t)m * dim + j];
+                nb += b * b; dot += a * b;
+            }
+            double s = dot / (sqrt(na) * sqrt(nb) + 1e-12);
+            if (s > bs) { bs = s; best = m; }   /* ties -> lowest id (scan order) */
+        }
+        g_pair[k] = best;
+    }
+    g_pair_n = K;
+}
 typedef struct { char sid[64]; char file[256]; int npast; int dim; int anchor; int anchor2; float *vec; double norm; int goff; int gn; } LZEntry;
 
 /* graft bias hooks (defined after lz_mem_search; used inside it) */
@@ -1237,6 +1298,7 @@ static void lz_route_cache_invalidate(void) {
     free(g_ord_cache);  g_ord_cache = NULL;
     free(g_zp); g_zp = NULL; g_zone_ok = 0; g_zone_k = 0;
     g_anch_k = g_anch_dim = g_anch_ntr = 0; g_ord_n = 0;
+    g_pair_n = 0;   /* the partner table is derived FROM the centroids */
     for (int i = 0; i < 4; i++) g_anch_key[i] = 0;
 }
 
@@ -1304,7 +1366,18 @@ static int lz_route_cached(int nent) {
     int adim = 0, antr = 0;
     int K = anch_load(PATH_ANCH, C, ANCHR_MAXK, ANCHR_MAXD, &adim, &antr);
     if (K <= 0 || nent < antr) { free(C); return 0; }   /* shrink = wrong table */
+    /* The table FORMAT allows ANCHR_MAXK (512) but every route scratch array is
+     * LZ_ANCH_MAXK (64). A table written elsewhere with a bigger K would make
+     * topb (<= 64) safe but leave buckets >= 64 unreachable, so clamp K here —
+     * one place, before any array sees it — and say so. The clamp is consistent
+     * (rows, labels and route all use the same K), so routing stays valid. */
+    if (K > LZ_ANCH_MAXK) {
+        lz_diag("[anchors] table K=%d > LZ_ANCH_MAXK=%d — clamped\n",
+                K, LZ_ANCH_MAXK);
+        K = LZ_ANCH_MAXK;
+    }
     g_anch_cache = C; g_anch_k = K; g_anch_dim = adim; g_anch_ntr = antr;
+    lz_pair_build(C, K, adim);   /* G2.6: pair buckets by centroid, not parity */
     lz_zone_build();   /* derived from the table; no stored state */
     if (g_labels_derive) {
         /* H2 stays: the table must still cover this row count (checked
@@ -1683,8 +1756,8 @@ static int lz_mem_search(const float *qv, int qd,
     }
     char rm[16];
     snprintf(rm, sizeof(rm), "%s", "brute");
-    int rb[ANN_MAXK];
-    for (int ri = 0; ri < ANN_MAXK; ri++) rb[ri] = 0;
+    int rb[LZ_ANCH_MAXK];
+    for (int ri = 0; ri < LZ_ANCH_MAXK; ri++) rb[ri] = 0;
     int rnb = 0, breads = 1, scored = 0;
     /* canary (Phase 0): the align verdict and the skipped count are facts
      * about THIS walk, so they are collected here and emitted once at the
@@ -1869,6 +1942,7 @@ static int lz_mem_search(const float *qv, int qd,
                      int hr = (hre && atoi(hre) >= 0) ? atoi(hre) : LZ_ROUTE_HEADROOM_DEF;
                      topb = topk + hr; } }
             if (topb > K) topb = K;
+            if (topb > LZ_ANCH_MAXK) topb = LZ_ANCH_MAXK;  /* rb[]/shut[] scratch */
             if (topb < 1) topb = 1;
             rnb = anch_route(qv, C, K, qd, topb, rb);
             routed = 1;
@@ -1919,7 +1993,7 @@ static int lz_mem_search(const float *qv, int qd,
             if (walk_zone && rnb > 1 && g_zone_ok && g_zone_k == K) {
                 int qz = lz_zone_of_vec(qv, qd);
                 if (qz >= 0) {
-                    int zrb[ANN_MAXK], nz = 0;
+                    int zrb[LZ_ANCH_MAXK], nz = 0;
                     for (int pass = 0; pass < 2; pass++)
                         for (int r = 0; r < rnb; r++) {
                             int bz = (rb[r] >= 0 && rb[r] < ANCHR_MAXK) ? g_bzone[rb[r]] : -1;
@@ -1946,10 +2020,10 @@ static int lz_mem_search(const float *qv, int qd,
              * The warm set is also handed to the graft bias (below) as the
              * "tombstone × graft" amplifier. */
             if (g_warm_on && rnb > 0) {
-                int shut[ANN_MAXK];
+                int shut[LZ_ANCH_MAXK];
                 int nshut = 0;
                 for (int i = 0; i < rnb; i++) {
-                    shut[i] = !wl_is_open(&g_fog, lz_fog_id(rb[i]));
+                    shut[i] = lz_fog_shut(rb[i]);
                     if (shut[i]) nshut++;
                 }
                 cy_nb_shut = nshut;
@@ -2181,10 +2255,11 @@ static int lz_mem_search(const float *qv, int qd,
                 free(pmem); pmem = NULL;
                 free(pseen); pseen = NULL;
                 /* pick the FIRST routed bucket whose tombstone is actually
-                 * SHUT — bucket 0 maps to wl id 0 = WL_RESERVED_LO, which
-                 * wl_traverse refuses, so bucket 0 can never shut (probed
-                 * 2026-10-20 via ANN_DOOR_TRACE). Skipping reserved-id
-                 * buckets is the same rule the walk itself obeys. */
+                 * SHUT (own tombstone only — the door follows the bucket the
+                 * latch shut, not its centroid partner). Bucket 0 used to map
+                 * to wl id 0 = WL_RESERVED_LO and could never shut (probed
+                 * 2026-10-20); lz_fog_id now uses choice 1 (wl_bucket_id), so
+                 * every bucket is minor-latchable. */
                 int dbk = -1;
                 for (int ri = 0; ri < rnb; ri++) {
                     uint32_t fi = lz_fog_id(rb[ri]);
@@ -2384,7 +2459,10 @@ static int lz_mem_search(const float *qv, int qd,
     }
     if (!use_cache) lz_index_free(ents, nent);
     if (route_mode) snprintf(route_mode, 16, "%s", rm);
-    if (route_bk) for (int ri = 0; ri < ANN_MAXK; ri++) route_bk[ri] = rb[ri];
+    if (route_bk) {                            /* rnb <= topb <= LZ_ANCH_MAXK */
+        int rn = (rnb > LZ_ANCH_MAXK) ? LZ_ANCH_MAXK : rnb;
+        for (int ri = 0; ri < LZ_ANCH_MAXK; ri++) route_bk[ri] = (ri < rn) ? rb[ri] : 0;
+    }
     if (route_nb_out) *route_nb_out = rnb;
     if (block_reads_out) *block_reads_out = breads;
     if (items_scored_out) *items_scored_out = scored;
@@ -3850,13 +3928,13 @@ static int handle_health(sock_t cli) {
         "\"labels\":\"%s\",\"order_stale\":%ld,\"heal_ok\":%ld,\"heal_fail\":%ld,"
         "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
-        "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u}}",
+        "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, g_anch_k, embed_ok ? "ok" : "down",
         g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
         g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
-        g_fog_replayed, sh, (unsigned)WL_FREE);
+        g_fog_replayed, sh, (unsigned)WL_FREE, g_pair_n);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
@@ -4068,7 +4146,7 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         char top_sid[ANN_MAXK][64]; char top_file[ANN_MAXK][256];
         int top_np[ANN_MAXK]; double top_sc[ANN_MAXK];
         char route_mode[16];
-        int route_bk[ANN_MAXK], route_nb = 0, block_reads = 0;
+        int route_bk[LZ_ANCH_MAXK], route_nb = 0, block_reads = 0;
         int items_scored = 0, nent = 0, budget = 0, truncated = 0, fallback = 0;
         double us_per_item = 0;
         LZFog fog = { (int)WL_FREE, 0, 0, 0 };
@@ -4096,8 +4174,8 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,",
             block_reads, items_scored, nent, us_per_item, budget, truncated, fallback);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u},",
-            fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE);
+            "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
+            fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE, g_pair_n);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"amp\":{\"on\":%d,\"k\":%.2f,\"applied\":%d}}}",
             (g_amp_boost && g_graft_on) ? 1 : 0, (double)g_amp_k, g_amp_applied);
@@ -4557,4 +4635,3 @@ int main(int argc, char **argv) {
     WSACleanup();
     return 0;
 }
-

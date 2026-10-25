@@ -163,6 +163,114 @@ int main(void) {
         remove(path);
     }
 
+    /* T7 — CELL GEOMETRY (phase-2): the flat cell reads as (pair<<1)|end and the
+     * hourglass centre crossing is one XOR. Expectations from T14/T15 math, not
+     * from the header's output: wl_cell_of is a bijection on [0,144) (with the
+     * negative/wrap normalisation), and wl_cell_cross is a self-inverse
+     * involution with 72 pairs and 0 fixed points. */
+    {
+        static unsigned char cseen[144];
+        memset(cseen, 0, sizeof cseen);
+        int bij = 1, wrap = 1;
+        for (int c = 0; c < 144; c++) {
+            uint32_t cell = wl_cell_of(c);
+            if (cell >= 144u || cseen[cell]) bij = 0; else cseen[cell] = 1;
+            if (wl_cell_of(c + 144) != cell || wl_cell_of(c - 144) != cell) wrap = 0;
+        }
+        CHECK(bij, "T7 wl_cell_of bijective over [0,144)");
+        CHECK(wrap, "T7 wl_cell_of wraps +/-144 (mod-144 normalisation)");
+        CHECK(wl_cell_of(-1) == 143u && wl_cell_of(144) == 0u, "T7 negative/overflow normalised");
+
+        int inv = 1, fixed = 0, pairs = 0;
+        for (uint32_t c = 0; c < 144u; c++) {
+            uint32_t k = wl_cell_cross(c);
+            if (wl_cell_cross(k) != c) inv = 0;      /* self-inverse  */
+            if (k == c) fixed++;                      /* 0 fixed points */
+            if (k > c) pairs++;                       /* count pairs once */
+        }
+        CHECK(inv, "T7 wl_cell_cross self-inverse on [0,144)");
+        CHECK(fixed == 0 && pairs == 72, "T7 72 pairs, 0 fixed (== T14 d^1)");
+    }
+
+    /* T8 — G2.5: the two ends of an hourglass pair are INDEPENDENT cells.
+     * Closing +X must leave -X OPEN and closing -X must leave +X open; the
+     * crossing reaches exactly the partner cell and nothing else. Without this
+     * a 3-PAIR collapse would falsely close both ends on one walk. The reserved
+     * major ids are excluded from the minor pool, so exactly one end of the
+     * pair set (id 0 = all-open major input) is not minor-latchable. */
+    {
+        int indep = 1, partner_ok = 1, reserved = 0, minors = 0;
+        for (uint32_t p = 0; p < 72u; p++) {
+            uint32_t cell0 = (p << 1) | 0u, cell1 = (p << 1) | 1u;
+            uint32_t e0 = wl_id(cell0, 0u), e1 = wl_id(cell1, 0u);
+            if (wl_cell_cross(cell0) != cell1 || e0 == e1) partner_ok = 0;
+            int r0 = wl_is_reserved(e0), r1 = wl_is_reserved(e1);
+            reserved += r0 + r1; minors += (!r0) + (!r1);
+            if (!r0) {                            /* close +X on a fresh pair */
+                wl_latch_t P; wl_reset(&P);
+                wl_traverse(&P, e0);
+                if (wl_is_open(&P, e0))  indep = 0;   /* +X closed      */
+                if (!wl_is_open(&P, e1)) indep = 0;   /* -X must stay open */
+            }
+            if (!r1) {                            /* mirror: close -X only */
+                wl_latch_t Q; wl_reset(&Q);
+                wl_traverse(&Q, e1);
+                if (wl_is_open(&Q, e1))  indep = 0;   /* -X closed      */
+                if (!wl_is_open(&Q, e0)) indep = 0;   /* +X must stay open */
+            }
+        }
+        CHECK(indep, "T8 closing one end leaves the other open (ends independent, G2.5)");
+        CHECK(partner_ok, "T8 wl_cell_cross reaches exactly the pair partner");
+        CHECK(reserved == 1, "T8 exactly 1 reserved end (id 0 = major input) in the pair set");
+        CHECK(minors == 143, "T8 143/144 ends are minor-latchable (cell 0 is major-only)");
+    }
+
+    /* T9 — PRODUCTION ids: an anchor BUCKET is latched through wl_bucket_id
+     * (choice 1). The phase-2 review asked whether bucket 0 collides with the
+     * apex reserved id; it did (id 0 = WL_RESERVED_LO), which made bucket 0
+     * permanently un-shutt-able. Assert the fix at the id level. */
+    {
+        int inrange = 1, unreserved = 1, bij = 1, period = 1;
+        for (int b = 0; b < 4096; b++) {
+            uint32_t id = wl_bucket_id(b);
+            if (id >= WL_COUNT) inrange = 0;
+            if (wl_is_reserved((int)id)) unreserved = 0;
+            if (wl_bucket_id(b % 144) != id) period = 0;
+        }
+        for (int a = 0; a < 144 && bij; a++)
+            for (int b = a + 1; b < 144; b++)
+                if (wl_bucket_id(a) == wl_bucket_id(b)) { bij = 0; break; }
+        CHECK(inrange, "T9 bucket latch ids stay inside [0, WL_COUNT)");
+        CHECK(unreserved, "T9 no bucket maps to a reserved id (bucket 0 included)");
+        CHECK(period, "T9 bucket id follows cell = bucket % 144");
+        CHECK(bij, "T9 144 buckets -> 144 distinct cells");
+
+        wl_latch_t L; wl_reset(&L);
+        CHECK(wl_traverse(&L, wl_bucket_id(0)) == 1, "T9 bucket 0 IS latchable (was id 0 = reserved)");
+        CHECK(!wl_is_open(&L, wl_bucket_id(0)), "T9 bucket 0 reads SHUT after traverse");
+        CHECK(wl_is_open(&L, wl_bucket_id(2)), "T9 neighbouring bucket still OPEN");
+        wl_reset(&L);
+        CHECK(wl_traverse(&L, wl_bucket_id(143)) == 1 &&
+              wl_bucket_id(143) != WL_RESERVED_HI,
+              "T9 cell 143 → 10297, never the major-output id");
+    }
+
+    /* T10 — G2.5 under the PRODUCTION ids: shutting one end of an hourglass
+     * pair must leave the other end open for every bucket id, so a walk can
+     * never collapse both ends of a 3-PAIR at once. */
+    {
+        int indep = 1;
+        for (int b = 0; b < 144; b++) {
+            wl_latch_t L; wl_reset(&L);
+            uint32_t own = wl_bucket_id(b);
+            uint32_t other = wl_bucket_id(wl_cell_cross(wl_cell_of(b)));
+            wl_traverse(&L, own);
+            if (wl_is_open(&L, own)) indep = 0;      /* own must shut   */
+            if (!wl_is_open(&L, other)) indep = 0;   /* other stays open */
+        }
+        CHECK(indep, "T10 one end shut leaves the pair end open (production ids)");
+    }
+
     printf(fails ? "FAIL %d\n" : "ALL PASS (%d)\n", fails);
     return fails != 0;
 }
