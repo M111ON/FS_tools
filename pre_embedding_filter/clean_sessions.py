@@ -99,16 +99,21 @@ def clean_session(content: str) -> str:
 
 
 files = sorted(INPUT_DIR.glob("session-*.md"))
-print(f"Found {len(files)} files")
+FORCE = "--force" in sys.argv
+print(f"Found {len(files)} files" + ("" if FORCE else " (incremental: unchanged md skipped)"))
 
 total_turns = 0
+skipped = 0
 for i, f in enumerate(files, 1):
     if "_clean" in f.stem or "_debug" in f.stem:
+        continue
+    out = OUTPUT_DIR / f"{f.stem}_clean.md"
+    if not FORCE and out.exists() and out.stat().st_mtime >= f.stat().st_mtime:
+        skipped += 1
         continue
     try:
         raw = f.read_text(encoding="utf-8", errors="replace")
         cleaned = clean_session(raw)
-        out = OUTPUT_DIR / f"{f.stem}_clean.md"
         out.write_text(cleaned, encoding="utf-8")
         
         # Count turns
@@ -119,4 +124,4 @@ for i, f in enumerate(files, 1):
     except Exception as e:
         print(f"[{i}/{len(files)}] {f.stem} ERROR: {e}")
 
-print(f"\nTotal: {total_turns} turns across {len(files)} files")
+print(f"\nTotal: {total_turns} turns across {len(files)} files (skipped {skipped} unchanged)")
