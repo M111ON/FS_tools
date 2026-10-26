@@ -138,7 +138,7 @@ def start_extra(env_extra):
            "ANN_ORDER_PATH": os.path.join(SCRATCH, "order.bin"),
            "ANN_ROUTE_LOG": os.path.join(SCRATCH, "route.log"),
            "ANN_PORT": str(PORT),
-           "ANN_TOMBSTONE_WARM": "1",
+           "ANN_TOTEM_WARM": "1",
            **env_extra}
     errlog = open(os.path.join(SCRATCH, "srv_err.log"), "w", encoding="utf-8")
     p = subprocess.Popen([EXE, "--serve", str(PORT)], env=env,

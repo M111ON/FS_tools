@@ -41,7 +41,7 @@ env = {**os.environ,
        "ANN_ANCH_PATH":  ANCH,
        "ANN_ORDER_PATH": ORDP,
        "ANN_ROUTE_LOG":  LOGP,
-       "ANN_TOMBSTONE_WARM": "1",
+       "ANN_TOTEM_WARM": "1",
        "ANN_FLOAT_KERNEL": "1"}
 
 def build_index():

@@ -55,7 +55,7 @@ def start(env_extra):
            "ANN_ORDER_PATH": os.path.join(idx, "ann_index.order"),
            "ANN_ROUTE_LOG": os.path.join(SCRATCH, "route.log"),
            "ANN_PORT": str(PORT),
-           "ANN_TOMBSTONE_WARM": "1",
+           "ANN_TOTEM_WARM": "1",
            "ANN_WALK_PRUNE": "1",
            "ANN_FLOAT_KERNEL": "1",
            "ANN_WALK_FLOOR": "2.1",     # force every query below the floor

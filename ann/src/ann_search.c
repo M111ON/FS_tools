@@ -1042,7 +1042,7 @@ typedef struct {
     long queries, cache_hit, cache_miss;
     long warm_taken, align_cold, align_no_shut, align_all_shut, align_no_fit;
     long buckets_visited, buckets_shut, buckets_skipped, note_events;
-    long scored_sum, nent_last, budget_last, trunc;
+    long scored_sum, examined_sum, nent_last, budget_last, trunc;
     long note_bytes, note_records;
     double boot_ms, boot_totem_ms, reassign_ms;
     long reassign_rows;
@@ -1303,9 +1303,11 @@ static uint32_t *g_ord_cache = NULL;
 static int g_ord_n = 0;
 static long g_ord_stale = 0;   /* .order refused (stale/torn) -> derived in memory */
 static long g_anch_key[4] = {0, 0, 0, 0};
+static void lz_roster_free(void);
 static void lz_route_cache_invalidate(void) {
     free(g_anch_cache); g_anch_cache = NULL;
     free(g_ord_cache);  g_ord_cache = NULL;
+    lz_roster_free();   /* derived from (ents, ord): dies with them */
     free(g_zp); g_zp = NULL; g_zone_ok = 0; g_zone_k = 0;
     g_anch_k = g_anch_dim = g_anch_ntr = 0; g_ord_n = 0;
     g_pair_n = 0;   /* the partner table is derived FROM the centroids */
@@ -1353,6 +1355,101 @@ static int lz_labels_derive(LZEntry *a, int n) {
 }
 
 
+/* ── ROSTER (2026-10-26) ───────────────────────────────────────────────
+ * door -> the rows that sit behind it, IN WALK ORDER.
+ *
+ * The stamp sidecar already records each row's (anchor, anchor2) when the row
+ * is appended — that is the write-path fingerprint. The roster is the same
+ * fact read the other way round, so a routed query JUMPS to a door's members
+ * instead of looking at every row once per door (measured 2026-10-26: 5 doors
+ * x 63,808 rows = 319,040 row looks per query to find 11,087 members).
+ *
+ * Derived, never stored: rebuilt from (ents, ord) whenever the route cache is
+ * rebuilt, so it cannot drift from the stamps. Walk order is the SAME order
+ * the gather pass used (ord, or identity when there is no order sidecar), so
+ * the walk list a query sees is byte-identical to the scan-built one.
+ */
+static uint32_t **g_roster = NULL;   /* [door] -> row indices, walk order */
+static int *g_roster_n = NULL;       /* [door] -> count                 */
+static int g_roster_doors = 0;
+static int g_roster_rows = 0;        /* total memberships (<= 2 * n)    */
+static int g_roster_on = -1;         /* env ANN_ROSTER, default ON      */
+
+static int lz_roster_enabled(void) {
+    if (g_roster_on < 0) {
+        const char *e = getenv("ANN_ROSTER");
+        g_roster_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_roster_on;
+}
+
+static void lz_roster_free(void) {
+    if (g_roster) {
+        for (int d = 0; d < g_roster_doors; d++) free(g_roster[d]);
+        free(g_roster); g_roster = NULL;
+    }
+    free(g_roster_n); g_roster_n = NULL;
+    g_roster_doors = 0; g_roster_rows = 0;
+}
+
+/* ord == NULL means the walk uses identity order. NOTE: in derive mode
+ * lz_labels_derive() installs its own bucket-major perm in g_ord_cache, so the
+ * caller must pass g_ord_cache there, never NULL — passing NULL built the
+ * roster in row order while the walk ran in perm order (found 2026-10-26 by
+ * the walk fingerprint: same set, different sequence). */
+static int lz_roster_build(LZEntry *ents, int n, const uint32_t *ord, int K) {
+    lz_roster_free();
+    if (!ents || n <= 0 || K <= 0 || K > LZ_ANCH_MAXK) return 0;
+    uint32_t **R = (uint32_t **)calloc((size_t)K, sizeof(uint32_t *));
+    int *cnt = (int *)calloc((size_t)K, sizeof(int));
+    int *fill = (int *)calloc((size_t)K, sizeof(int));
+    if (!R || !cnt || !fill) { free(R); free(cnt); free(fill); return 0; }
+    /* pass 1: how many rows per door */
+    for (int i = 0; i < n; i++) {
+        int ei = ord ? (int)ord[i] : i;
+        if (ei < 0 || ei >= n) continue;
+        int a = ents[ei].anchor, b = ents[ei].anchor2;
+        if (a >= 0 && a < K) cnt[a]++;
+        if (b >= 0 && b < K && b != a) cnt[b]++;
+    }
+    long total = 0;
+    for (int d = 0; d < K; d++) {
+        if (cnt[d] > 0) {
+            R[d] = (uint32_t *)malloc((size_t)cnt[d] * sizeof(uint32_t));
+            if (!R[d]) { for (int q = 0; q < K; q++) free(R[q]); free(R); free(cnt); free(fill); return 0; }
+        }
+        total += cnt[d];
+    }
+    /* pass 2: fill in walk order (the same order the scan used) */
+    for (int i = 0; i < n; i++) {
+        int ei = ord ? (int)ord[i] : i;
+        if (ei < 0 || ei >= n) continue;
+        int a = ents[ei].anchor, b = ents[ei].anchor2;
+        if (a >= 0 && a < K) R[a][fill[a]++] = (uint32_t)ei;
+        if (b >= 0 && b < K && b != a) R[b][fill[b]++] = (uint32_t)ei;
+    }
+    free(fill);
+    g_roster = R; g_roster_n = cnt; g_roster_doors = K;
+    g_roster_rows = (int)total;
+    return 1;
+}
+
+/* build with a receipt: the roster is O(n) with one malloc per door, done once
+ * per route-cache rebuild — /health and the diag line must show its cost. */
+static int lz_roster_build_timed(LZEntry *ents, int n, const uint32_t *ord, int K) {
+    LARGE_INTEGER f, a, b;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    int ok = lz_roster_build(ents, n, ord, K);
+    QueryPerformanceCounter(&b);
+    double ms = f.QuadPart ? (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart : -1.0;
+    lz_diag("[roster] %s doors=%d rows=%d n=%d build=%.1fms\n",
+            ok ? "built" : "FAILED", g_roster_doors, g_roster_rows, n, ms);
+    cy_emit("{\"event\":\"roster-build\",\"ok\":%d,\"doors\":%d,\"rows\":%d,"
+            "\"n\":%d,\"ms\":%.1f}", ok, g_roster_doors, g_roster_rows, n, ms);
+    return ok;
+}
+
 static int lz_route_cached(int nent) {
     struct stat sa, so;
     if (stat(PATH_ANCH, &sa) != 0) return 0;
@@ -1398,6 +1495,7 @@ static int lz_route_cached(int nent) {
             lz_route_cache_invalidate();
             return 0;
         }
+        if (lz_roster_enabled()) lz_roster_build_timed(ents, nent, g_ord_cache, K);
         for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
         return 1;
     }
@@ -1423,10 +1521,16 @@ static int lz_route_cached(int nent) {
             lz_route_cache_invalidate();
             return 0;
         }
+        if (lz_roster_enabled()) lz_roster_build_timed(ents, nent, g_ord_cache, K);
         for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
         return 1;
     }
     g_ord_cache = ord; g_ord_n = nent;
+    /* the caller already loaded the index (it passed `nent`); use the buffer it
+     * is looking at — never re-enter lz_index_cached from here, that path can
+     * invalidate and reload the index underneath the caller. */
+    if (lz_roster_enabled() && g_idx_cache && g_idx_n == nent)
+        lz_roster_build_timed(g_idx_cache, nent, ord, K);
     for (int i = 0; i < 4; i++) g_anch_key[i] = key[i];
     return 1;
 }
@@ -1738,7 +1842,12 @@ static int lz_mem_search(const float *qv, int qd,
                          char route_mode[16], int route_bk[], int *route_nb_out,
                          int *block_reads_out, int *items_scored_out, int *nent_out,
                          int *budget_out, int *truncated_out, double *us_per_item_out,
-                         LZTotem *totem_out, int *fallback_out) {
+                         LZTotem *totem_out, int *fallback_out,
+                         long long *examined_out, int *roster_out,
+                         unsigned *walk_hash_out) {
+    if (examined_out) *examined_out = 0;
+    if (roster_out) *roster_out = 0;
+    if (walk_hash_out) *walk_hash_out = 0;
     if (top_sc) for (int ti = 0; ti < ANN_MAXK; ti++) top_sc[ti] = -2;
     if (top_sid) for (int ti = 0; ti < ANN_MAXK; ti++) top_sid[ti][0] = '\0';
     if (top_file) for (int ti = 0; ti < ANN_MAXK; ti++) top_file[ti][0] = '\0';
@@ -1746,6 +1855,9 @@ static int lz_mem_search(const float *qv, int qd,
     if (topk < 1) topk = 1;
     if (topk > ANN_MAXK) topk = ANN_MAXK;
     if (!sid_filter) sid_filter = "";
+    long long examined = 0;   /* rows LOOKED AT: gather passes + scored walk */
+    int roster_used = 0;
+    unsigned walk_hash = 0;   /* ANN_WALK_HASH=1: order-sensitive walk fingerprint */
     double qn = 0;
     for (int qi = 0; qi < qd; qi++) qn += (double)qv[qi] * qv[qi];
     qn = sqrt(qn);
@@ -2162,8 +2274,28 @@ static int lz_mem_search(const float *qv, int qd,
             pseen = (unsigned char *)calloc((size_t)(nent ? nent : 1), 1);
             if (pmem && pseen) {
                 int w = 0;
+                /* ROSTER (2026-10-26): if the door -> rows table is live, JUMP
+                 * to each routed door's members instead of looking at every
+                 * row once per door. Same rows, same order, same walk list —
+                 * only the number of row LOOKS changes. */
+                if (g_roster && g_roster_n && g_roster_doors == K) {
+                    roster_used = 1;
+                    for (int r = 0; r < rnb && w < nent; r++) {
+                        int d = rb[r];
+                        if (d < 0 || d >= g_roster_doors) continue;
+                        examined += g_roster_n[d];
+                        for (int j = 0; j < g_roster_n[d]; j++) {
+                            int ei = (int)g_roster[d][j];
+                            if (ei < 0 || ei >= nent) continue;
+                            if (pseen[ei]) continue;
+                            pseen[ei] = 1;
+                            pmem[w++] = (uint32_t)ei;
+                        }
+                    }
+                } else
                 for (int r = 0; r < rnb && w < nent; r++)
                     for (int i = 0; i < nent; i++) {
+                        examined++;   /* every row is LOOKED AT once per bucket */
                         int ei = (int)ord[i];
                         if (ei < 0 || ei >= nent) continue;
                         if (pseen[ei]) continue;
@@ -2184,6 +2316,39 @@ static int lz_mem_search(const float *qv, int qd,
         LARGE_INTEGER qf, qt0, qt1;
         QueryPerformanceFrequency(&qf);
         QueryPerformanceCounter(&qt0);
+        /* WALK FINGERPRINT (env ANN_WALK_HASH=1): an ORDER-SENSITIVE hash of the
+         * exact row sequence the scoring loop will see. Two arms that claim the
+         * same walk must produce the same number here — a top-k diff alone
+         * cannot tell a reordered walk from a tie on identical scores. */
+        walk_hash = 0;
+        if (getenv("ANN_WALK_HASH") && getenv("ANN_WALK_HASH")[0] == '1') {
+            walk_hash = 2166136261u;
+            for (int oi = 0; oi < nwalk; oi++) {
+                uint32_t e2 = walk[oi];
+                for (int bb = 0; bb < 4; bb++) {
+                    walk_hash ^= (unsigned char)((e2 >> (8 * bb)) & 0xff);
+                    walk_hash *= 16777619u;
+                }
+            }
+        }
+        /* ANN_WALK_DUMP=<path>: the first rows of the walk, keyed by the hash —
+         * the only way to see WHERE two arms diverge, not just that. (stderr is
+         * not usable here: the server's stderr is not the parent's.) */
+        { const char *dp = getenv("ANN_WALK_DUMP");
+          if (dp && dp[0]) {
+            static FILE *dfp = NULL;
+            if (!dfp) dfp = fopen(dp, "a");
+            if (dfp) {
+                fprintf(dfp, "WALKDUMP %08x n=%d:", walk_hash, nwalk);
+                for (int oi = 0; oi < nwalk && oi < 16; oi++) fprintf(dfp, " %u", walk[oi]);
+                fprintf(dfp, " | ord0=%u,%u,%u nent=%d roster=%d doors=%d rn0=%d rb0=%d",
+                        ord ? ord[0] : 0u, ord ? ord[1] : 0u, ord ? ord[2] : 0u,
+                        nent, roster_used, g_roster_doors, g_roster_n ? g_roster_n[0] : -1,
+                        rnb > 0 ? rb[0] : -1);
+                fprintf(dfp, "\n");
+                fflush(dfp);
+            }
+          } }
         int in_run = 0;
         breads = 0;
         int full2 = 0;      /* fallback pass: unrestricted full walk */
@@ -2195,6 +2360,7 @@ static int lz_mem_search(const float *qv, int qd,
         if (scope_bad) { budget = 0; cap = 0; }
         for (;;) {
         for (int oi = 0; walk && oi < nwalk; oi++) {
+            examined++;
             int ei = (int)walk[oi];
             if (ei < 0 || ei >= nent) continue;
             int sel = 1;
@@ -2303,6 +2469,7 @@ static int lz_mem_search(const float *qv, int qd,
                         int w = 0;
                         /* door members first ... */
                         for (int i = 0; i < nent; i++) {
+                            examined++;
                             int ei = (int)ord[i];
                             if (ei < 0 || ei >= nent || pseen2[ei]) continue;
                             if (ents[ei].anchor == dbk || ents[ei].anchor2 == dbk) {
@@ -2312,6 +2479,7 @@ static int lz_mem_search(const float *qv, int qd,
                         /* ... then the REST of the routed buckets' members ... */
                         for (int r = 1; r < rnb; r++) {
                             for (int i = 0; i < nent; i++) {
+                                examined++;
                                 int ei = (int)ord[i];
                                 if (ei < 0 || ei >= nent || pseen2[ei]) continue;
                                 if (ents[ei].anchor == rb[r] || ents[ei].anchor2 == rb[r]) {
@@ -2322,6 +2490,7 @@ static int lz_mem_search(const float *qv, int qd,
                         /* ... then everything else (kept: the door only
                          * REORDERS the walk). */
                         for (int i = 0; i < nent; i++) {
+                            examined++;
                             int ei = (int)ord[i];
                             if (ei < 0 || ei >= nent || pseen2[ei]) continue;
                             pseen2[ei] = 1; pmem2[w++] = (uint32_t)ei;
@@ -2543,6 +2712,7 @@ static int lz_mem_search(const float *qv, int qd,
         g_cy.buckets_skipped += skip;
         g_cy.note_events += cy_notes;
         g_cy.scored_sum += scored;
+        g_cy.examined_sum += (long)examined;
         /* Warm queries set budget == cov (the shut-bucket coverage) by
          * construction, so scoring up to it is NOT truncation. Only a cold
          * walk that exhausts the global cap was actually cut short. */
@@ -2553,6 +2723,9 @@ static int lz_mem_search(const float *qv, int qd,
     }
     int nh = 0;
     if (top_sc) for (int ti = 0; ti < topk && top_sc[ti] > -2; ti++) nh++;
+    if (examined_out) *examined_out = examined;
+    if (roster_out) *roster_out = roster_used;
+    if (walk_hash_out) *walk_hash_out = walk_hash;
     return nh;
 }
 
@@ -3959,13 +4132,15 @@ static int handle_health(sock_t cli) {
         "\"labels\":\"%s\",\"order_stale\":%ld,\"heal_ok\":%ld,\"heal_fail\":%ld,"
         "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
-        "\"totem\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d}}",
+        "\"totem\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d},"
+        "\"roster\":{\"on\":%d,\"doors\":%d,\"rows\":%d}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, g_anch_k, embed_ok ? "ok" : "down",
         g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
         g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
-        g_totem_replayed, sh, (unsigned)WL_FREE, g_pair_n);
+        g_totem_replayed, sh, (unsigned)WL_FREE, g_pair_n,
+        lz_roster_enabled(), g_roster_doors, g_roster_rows);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
@@ -4014,13 +4189,13 @@ static int handle_canary(sock_t cli) {
         "\"n\":%ld,\"cache_hit\":%ld,\"cache_miss\":%ld,\"warm_taken\":%ld,"
         "\"align\":{\"cold\":%ld,\"no_shut\":%ld,\"all_shut\":%ld,\"no_fit\":%ld},"
         "\"buckets_visited\":%ld,\"buckets_shut\":%ld,\"skipped_rows\":%ld,"
-        "\"note_events\":%ld,\"scored_sum\":%ld,\"trunc\":%ld,"
+        "\"note_events\":%ld,\"scored_sum\":%ld,\"examined_sum\":%ld,\"trunc\":%ld,"
         "\"budget\":%ld,\"k_used\":%d},\"bucket_skew\":{",
         g_cy_on, g_warm_on, g_warm_keep_pct, g_cy.queries, g_cy.cache_hit, g_cy.cache_miss,
         g_cy.warm_taken, g_cy.align_cold, g_cy.align_no_shut,
         g_cy.align_all_shut, g_cy.align_no_fit,
         g_cy.buckets_visited, g_cy.buckets_shut, g_cy.buckets_skipped,
-        g_cy.note_events, g_cy.scored_sum, g_cy.trunc,
+        g_cy.note_events, g_cy.scored_sum, g_cy.examined_sum, g_cy.trunc,
         g_cy.budget_last, g_cy.k_last);
     bl += snprintf(b + bl, sizeof(b) - bl,
         "\"k\":%d,\"rows\":%d,\"min\":%d,\"p50\":%d,\"p90\":%d,\"max\":%d,"
@@ -4179,13 +4354,17 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         char route_mode[16];
         int route_bk[LZ_ANCH_MAXK], route_nb = 0, block_reads = 0;
         int items_scored = 0, nent = 0, budget = 0, truncated = 0, fallback = 0;
+        long long examined = 0;
+        int roster_used = 0;
+        unsigned walk_hash = 0;
         double us_per_item = 0;
         LZTotem totem = { (int)WL_FREE, 0, 0, 0 };
         lz_mem_search(qv, qd, sid_filter, scope_buf, stopk,
             top_sid, top_file, top_np, top_sc,
             route_mode, route_bk, &route_nb,
             &block_reads, &items_scored, &nent,
-            &budget, &truncated, &us_per_item, &totem, &fallback);
+            &budget, &truncated, &us_per_item, &totem, &fallback, &examined,
+            &roster_used, &walk_hash);
         srlen = snprintf(sresp, sizeof(sresp), "{\"status\":\"ok\",\"hits\":[");
         for (int ti = 0; ti < stopk && top_sc[ti] > -2; ti++) {
             char esid[256], efile[1024];
@@ -4202,8 +4381,8 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
                 "%s%d", rb ? "," : "", route_bk[rb]);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,",
-            block_reads, items_scored, nent, us_per_item, budget, truncated, fallback);
+            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,\"examined\":%lld,\"roster\":%d,\"walk_hash\":%u,",
+            block_reads, items_scored, nent, us_per_item, budget, truncated, fallback, examined, roster_used, walk_hash);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"totem\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
             totem.lit, totem.open, totem.shut, totem.replayed, (unsigned)WL_FREE, g_pair_n);

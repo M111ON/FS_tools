@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ab_door_live.py — live-scale A/B for the tombstone DOOR (ANN_DOOR).
+"""ab_door_live.py — live-scale A/B for the totem DOOR (ANN_DOOR).
 
 WHY THIS SHAPE
 --------------
@@ -23,11 +23,11 @@ THE MECHANIC UNDER TEST (read from ann_search.c, 2026-10-20)
 
 SETUP
   * the live index is COPIED to a scratch dir (the server must not touch
-    the live data; the copy also isolates the tombstone log per arm)
+    the live data; the copy also isolates the totem log per arm)
   * two servers, one per arm, on separate ports, started in sequence
   * each query is sent to both arms; the oracle is computed once per query
   * the below-floor path is reached with queries that have no good match
-    (out-of-corpus phrasing), and the tombstone state is warmed by
+    (out-of-corpus phrasing), and the totem state is warmed by
     repeating each query (the walk SHUTS the buckets it visits)
 
 USAGE
@@ -211,7 +211,7 @@ def setup_scratch():
         src = os.path.join(SRC, fn)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(idx_dir, fn))
-    # each arm gets its own tombstone log so the arms do not share latches
+    # each arm gets its own totem log so the arms do not share latches
     for arm in ("off", "on"):
         os.makedirs(os.path.join(SCRATCH, arm), exist_ok=True)
 
@@ -226,7 +226,7 @@ def start_arm(arm, port, door, floor="0.5", exit_early=False, exit_floor=None):
            "ANN_ORDER_PATH": os.path.join(idx, "ann_index.order"),
            "ANN_ROUTE_LOG": os.path.join(arm_dir, "route.log"),
            "ANN_PORT": str(port),
-           "ANN_TOMBSTONE_WARM": "1",
+           "ANN_TOTEM_WARM": "1",
            "ANN_WALK_PRUNE": "1",
            "ANN_FLOAT_KERNEL": "1",
            "LZ_ROUTE_BUCKETS": "5",
@@ -314,7 +314,7 @@ def main():
     skipped = []
     try:
         # warm the ORACLE-independent state: each arm sees the same query
-        # sequence, so the tombstone latches evolve the same way
+        # sequence, so the totem latches evolve the same way
         for i, qv in enumerate(qvecs):
             # a query the embedder could not represent (zero vector) has no
             # truth set -> it is excluded from the comparison, not scored 0

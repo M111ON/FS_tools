@@ -65,7 +65,7 @@ def start(idx_dir, work_dir, env_extra):
            "ANN_ORDER_PATH": os.path.join(idx_dir, "ann_index.order"),
            "ANN_ROUTE_LOG": os.path.join(work_dir, "route.log"),
            "ANN_PORT": str(PORT),
-           "ANN_TOMBSTONE_WARM": "1",
+           "ANN_TOTEM_WARM": "1",
            "ANN_WALK_PRUNE": "1",
            "ANN_FLOAT_KERNEL": "1",
            "ANN_GRAFT": "1",

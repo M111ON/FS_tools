@@ -83,6 +83,10 @@ def main():
         N = 20000
         write_index(idx, N, "old")
         env = dict(os.environ)
+        # L5 is about the STAMP sidecar: pin the label source. Under the
+        # default (derive) the overlay is a no-op by design, so the assertion
+        # would test the environment, not the code.
+        env["ANN_LABELS"] = "stamp"
         env["ANN_INDEX_PATH"] = idx
         env["ANN_ANCH_PATH"] = os.path.join(tmp, "anchors.bin")
         env["ANN_ORDER_PATH"] = os.path.join(tmp, "order.bin")

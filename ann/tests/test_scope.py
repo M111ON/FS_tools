@@ -15,7 +15,7 @@ index (27 rows, 384-dim, five file groups across four kinds). Verifies:
   S6  scope whose kind cannot hold topk -> HTTP 400 scope_too_narrow.
   S7  the scoped top-k EQUALS numpy's exact cosine top-k over exactly those
       rows (server and oracle agree on the same candidate set).
-  S8  a scoped query writes NO tombstone: fog.shut is identical before and
+  S8  a scoped query writes NO totem: totem.shut is identical before and
       after (scope skips the route layer entirely).
 """
 import json
@@ -112,7 +112,7 @@ def start():
            "ANN_ROUTE_LOG": os.path.join(SCRATCH, "route.log"),
            "ANN_TAGS_PATH": os.path.join(SCRATCH, "ann_tags.tsv"),
            "ANN_PORT": str(PORT),
-           "ANN_TOMBSTONE_WARM": "0"}
+           "ANN_TOTEM_WARM": "0"}
     errlog = open(os.path.join(SCRATCH, "srv_err.log"), "w", encoding="utf-8")
     p = subprocess.Popen([EXE, "--serve", str(PORT)], env=env,
                          stdout=subprocess.DEVNULL, stderr=errlog)
@@ -149,7 +149,7 @@ def main():
         ok(len(r.get("hits", [])) >= 1, "S1 hits>=1 without scope", mode)
         ok(not mode.startswith("scope"), "S1 mode is not a scope mode", mode)
 
-        shut_before = http("/health", to=10)["fog"]["shut"]
+        shut_before = http("/health", to=10)["totem"]["shut"]
 
         # S2 — file scope big enough
         vec = [float(x) for x in rows[0]["vec"]]
@@ -274,11 +274,11 @@ def main():
         ok(rt14["items_scored"] == 7, "S14 tag scope spans 7 single-row files",
            str(rt14["items_scored"]))
 
-        # S8 — scoped queries shut no tombstone (route layer untouched)
+        # S8 — scoped queries shut no totem (route layer untouched)
         for _ in range(3):
             http("/v1/state/search", {"vec": vec, "topk": 5, "scope": "alpha/big"})
-        shut_after = http("/health", to=10)["fog"]["shut"]
-        ok(shut_after == shut_before, "S8 no tombstone written by scoped queries",
+        shut_after = http("/health", to=10)["totem"]["shut"]
+        ok(shut_after == shut_before, "S8 no totem written by scoped queries",
            f"shut {shut_before} -> {shut_after}")
     finally:
         p.poll() or p.kill()

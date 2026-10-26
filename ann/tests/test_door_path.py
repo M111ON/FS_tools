@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_door_path.py — tombstone DOOR contract (2026-10-20, env ANN_DOOR).
+"""test_door_path.py — totem DOOR contract (2026-10-20, env ANN_DOOR).
 
 Scratch server on port 8097 only (NEVER the live :8096). 384-dim deterministic
 index (test_incr_fix.py shape). Verifies:
@@ -57,7 +57,7 @@ def start(extra_env):
            "ANN_ORDER_PATH": os.path.join(SCRATCH, "order.bin"),
            "ANN_ROUTE_LOG": os.path.join(SCRATCH, "route.log"),
            "ANN_PORT": str(PORT),
-           "ANN_TOMBSTONE_WARM": "1",
+           "ANN_TOTEM_WARM": "1",
            **extra_env}
     errlog = open(os.path.join(SCRATCH, "srv_err.log"), "w", encoding="utf-8")
     p = subprocess.Popen([EXE, "--serve", str(PORT)], env=env,
@@ -106,7 +106,7 @@ def main():
         # (or anchor+full fallback) fires with a real route decision.
         on_nons = search(q="zzqqx", k=5)
         # first nonsense call routes to a bucket and SHUTS it (open->shut);
-        # the SECOND call finds the tombstone pinned -> the door branch fires.
+        # the SECOND call finds the totem pinned -> the door branch fires.
         mode1 = on_nons["route"]["mode"]
         on_nons2 = search(q="zzqqx", k=5)
         mode = on_nons2["route"]["mode"]

@@ -19,7 +19,7 @@ QUERIES = [
     "how does the dreamer lease work",
     "gguf roundtrip failure",
     "kv cache cold start trap",
-    "wang latch tombstone routing",
+    "wang latch totem routing",
     "anchor bucket count",
     "why did we choose sqlite",
     "hyper jump orbit length",
