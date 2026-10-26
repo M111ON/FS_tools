@@ -114,18 +114,23 @@ Production path exercised end-to-end: `cloud_ws/memcore/v2.py` →
 1. `task-ta90e5e78` — owner: Q1–Q3 answered by shipped code, only **Q4** open
    (phase-2 = geometry only?) + whether the `(pair<<1)|end` latch relayout for
    the centre crossing is still worth doing on its own.
-2. `task-t87ad8462` — H1 watcher: act-path has never fired on real growth
-   (trigger = K breakpoint 72k rows or `routed==0`).
-3. `task-tabbd47c5` — soft zone bias vs hard zone filter, never compared head-to-head.
-4. `task-t5ba6ae63` — `GET /v1/state/tags` does not exist yet (verified).
-5. `task-t4fbea5cf` — per-zone mini vector DB (idea only).
+2. ~~`task-t87ad8462`~~ **DONE 6a3134c** — act path hardened (a real NameError
+   was waiting on the first H2 firing), gate visible in `/health` (`stamp.gate`),
+   watcher ALERT + exit 1, 10 checks.
+3. ~~`task-tabbd47c5`~~ **DONE 43ccb64** — bias = soft zone nudge; hard filter
+   keeps 60.3 % of the global top-5, soft 0.05 keeps 74.3 % at 86.3 % in-zone.
+4. ~~`task-t5ba6ae63`~~ **DONE 250ea5d** — `GET /v1/state/tags`, 13 checks.
+5. `task-t4fbea5cf` — per-zone mini vector DB, **unblocked with a measured
+   budget** (soft/hard both still score ~16.7k rows).  THIS IS NEXT.
 6. `task-tb17d8541` — 7 old items; 1/7 verified done (`test_wang_latch` wired).
 7. `task-t73aa3e3f` — 3 owner decisions (vec format, store bloat, daemon off).
 8. `task-td7fa1248` / `task-t5289298c` — frustum rescope, unowned now.
 9. No card yet: STRESS #9–#15 (stale cache on same-second rewrite, 2047-char
    truncation, topk coercion, telemetry).
-10. No card yet (mine): roster dedup (`examined 30,632` vs `scored 12,918`,
-    ~3× headroom) and a real cold-page test.
+10. ~~roster dedup + cold-page~~ **CLOSED b977d03** — dedup measured no gain
+    (8.68 vs 8.82 ms, gate passed, reverted); cold is "warm measured, cold
+    bounded by arithmetic" with the roster now file-backed/mmap
+    (`docs/ROSTER-COLD-2026-10-26.md`, 9 checks).
 
 ## 7. Start here
 
