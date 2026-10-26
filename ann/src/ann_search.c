@@ -608,6 +608,10 @@ static int g_fog_replayed = 0;
  * parity (kept only so the A/B can measure what the parity choice cost),
  * 0 = own bucket only. Env ANN_PAIR selects; default is centroid. */
 static int g_pair_mode = 2;
+/* The warm path may never score less than this percent of what the cold walk
+ * would score (measured 2026-10-26 — see the gate in lz_mem_search). 100 = the
+ * cut can never fire; 0 = unbounded (the pre-2026-10-26 behaviour). */
+static int g_warm_keep_pct = 90;
 typedef struct { int open; int shut; int lit; int replayed; } LZFog;
 static int g_warm_on = 0;       /* tombstone warm path (env ANN_TOMBSTONE_WARM) */
 static void lz_fog_init(void) {
@@ -629,6 +633,12 @@ static void lz_fog_init(void) {
           if (!strcmp(pe, "own"))         g_pair_mode = 0;
           else if (!strcmp(pe, "parity")) g_pair_mode = 1;
           else                            g_pair_mode = 2;
+      } }
+    /* warm-cut bound: percent of the cold walk the warm path must keep */
+    { const char *ke = getenv("ANN_WARM_KEEP");
+      if (ke && ke[0]) {
+          int v = atoi(ke);
+          if (v >= 0 && v <= 100) g_warm_keep_pct = v;
       } }
 }
 static inline uint32_t lz_fog_id(int bucket) {
@@ -2048,7 +2058,28 @@ static int lz_mem_search(const float *qv, int qd,
                      *     reordering warm-first would only change WHICH entries
                      *     are scored (a recall risk) for no speed win — so
                      *     leave the cold walk untouched. */
-                    if (cov > 0 && cov < budget) {
+                    /* THE CUT MUST BE BOUNDED — measured 2026-10-26.
+                     * `cov < budget` alone was calibrated when a bucket was
+                     * 24-30% of the index (K=8): cov was ~= nent, so the cut
+                     * was 0.4% and recall could not move. At K=64 a bucket is
+                     * ~3% of the index, so the same guard passes on cuts of
+                     * 20-80% of the route — and the cut IS the recall loss.
+                     * 60-query A/B on the live 63.8k index, per-query kept
+                     * fraction (warm_scored / cold_scored):
+                     *   kept 0.00-0.20  n=1  R@5 1.000 -> 0.000
+                     *   kept 0.60-0.80  n=3  R@5 0.867 -> 0.733 (top-k 1/3)
+                     *   kept 0.80-0.90  n=4  R@5 0.900 -> 0.900 (top-k 3/4)
+                     *   kept 0.90-0.95  n=2  R@5 1.000 -> 1.000 (top-k 2/2)
+                     * So the warm path may never score less than
+                     * ANN_WARM_KEEP percent (default 90) of what the cold walk
+                     * would score. The saving under this bound is <=10% of the
+                     * route on the queries that fire — i.e. the warm path is a
+                     * safety-bounded no-op, not a speed lever (WARM-PATH.md).
+                     * 100 = the cut can never fire; 0 = unbounded. */
+                    int cold_n = (budget < nent) ? budget : nent;
+                    if (cov > 0 && cov < cold_n &&
+                        (g_warm_keep_pct <= 0 ||
+                         (long)cov * 100 >= (long)cold_n * g_warm_keep_pct)) {
                         uint32_t *o2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
                         if (o2) {
                             int w = 0;
@@ -3979,13 +4010,13 @@ static int handle_canary(sock_t cli) {
 
     char b[2048]; int bl = 0;
     bl += snprintf(b + bl, sizeof(b) - bl,
-        "{\"status\":\"ok\",\"canary\":{\"on\":%d,\"warm_path\":%d},\"queries\":{"
+        "{\"status\":\"ok\",\"canary\":{\"on\":%d,\"warm_path\":%d,\"warm_keep\":%d},\"queries\":{"
         "\"n\":%ld,\"cache_hit\":%ld,\"cache_miss\":%ld,\"warm_taken\":%ld,"
         "\"align\":{\"cold\":%ld,\"no_shut\":%ld,\"all_shut\":%ld,\"no_fit\":%ld},"
         "\"buckets_visited\":%ld,\"buckets_shut\":%ld,\"skipped_rows\":%ld,"
         "\"note_events\":%ld,\"scored_sum\":%ld,\"trunc\":%ld,"
         "\"budget\":%ld,\"k_used\":%d},\"bucket_skew\":{",
-        g_cy_on, g_warm_on, g_cy.queries, g_cy.cache_hit, g_cy.cache_miss,
+        g_cy_on, g_warm_on, g_warm_keep_pct, g_cy.queries, g_cy.cache_hit, g_cy.cache_miss,
         g_cy.warm_taken, g_cy.align_cold, g_cy.align_no_shut,
         g_cy.align_all_shut, g_cy.align_no_fit,
         g_cy.buckets_visited, g_cy.buckets_shut, g_cy.buckets_skipped,

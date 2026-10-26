@@ -195,6 +195,10 @@ def main():
                     help="ann_search binary to spawn (default: build/ann_search.exe)")
     ap.add_argument("--budget", type=int, default=0,
                     help="LZ_SEARCH_BUDGET for the scratch servers; 0 = server default")
+    ap.add_argument("--min-keep", type=float, default=0.90,
+                    help="gate: a warm fire may not keep less than this fraction of "
+                         "the cold walk (must match the server's ANN_WARM_KEEP, "
+                         "default 90 -> 0.90)")
     args = ap.parse_args()
 
     ks = [int(x) for x in args.ks.split(",") if x.strip()]
@@ -297,6 +301,31 @@ def main():
     print("repeat routes to the buckets the previous run just shut, so the SHUT set")
     print("equals the walked set and there is nothing to skip; the gain appears on")
     print("queries whose route OVERLAPS previously-walked buckets (the B set).")
+
+    # ── cut-bound gate (added 2026-10-26) ─────────────────────────────────
+    # The 2026-10-14 numbers were taken when a bucket was 24-30% of the index,
+    # so the warm cut was 0.4% and recall could not move. At K=64 a bucket is
+    # ~3%: the same cut reached 20-80% of the route and recall fell with it
+    # (R@5 .9333 -> .9100 on the A set). The server now refuses a cut that
+    # would keep less than ANN_WARM_KEEP percent (default 90) of the cold
+    # walk; this asserts the bound from the outside, on every fire.
+    print()
+    failed = 0
+    for tag, cold, warm in (("A", offA, onA_cold),
+                            *[(f"B{sigma}", offB[sigma], onB[sigma]) for sigma in sigmas]):
+        fires = [(c[0], w[0]) for c, w in zip(cold, warm)
+                 if w[1] == "warm+p" and c[0] > 0 and w[0] > 0]
+        if not fires:
+            print(f"  GATE {tag:<5} warm fired 0/{len(cold)} - bound not exercised")
+            continue
+        worst = min(w / c for c, w in fires)
+        ok = worst >= args.min_keep
+        if not ok:
+            failed += 1
+        print(f"  GATE {tag:<5} warm fired {len(fires)}/{len(cold)}  min kept={worst:.3f}"
+              f"  (bound {args.min_keep:.2f})  {'PASS' if ok else 'FAIL'}")
+    print(f"  GATE cut-bound: {'PASS' if failed == 0 else 'FAIL'}")
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

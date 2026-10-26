@@ -12,15 +12,22 @@
    and the scan stops after them (`route.mode = "warm"`).
 3. The walk then shuts the latch as before (monotone) and appends to the P3 log.
 
-**Gate (fixed 2026-10-14).** The warm reorder only runs when it actually skips
-work: `cov < budget`. `cov` is the number of entries the SHUT buckets cover, and
-a single bucket covers 24–30% of the index (B1), so `budget = cov` could *raise*
-the cap above `LZ_SEARCH_BUDGET` — a repeat of `geofs mdim` scored **47027 vs the
-24000 cold cap** on the 59756-row index. The warm path must do **less** work,
-never more. The bug was latent: D5 made 24000 a hard cutoff on 2026-10-11, while
-this doc was written 2026-10-08 when the budget still auto-raised to N (so
-`cov < nent` was always true then). When `cov >= budget` there is nothing to
-skip, so the cold walk is left untouched.
+**Gate (fixed 2026-10-14, bounded 2026-10-26).** The warm reorder only runs when
+it actually skips work: `cov < budget`. `cov` is the number of entries the SHUT
+buckets cover, and at K=8 a single bucket covered 24–30% of the index (B1), so
+`budget = cov` could *raise* the cap above `LZ_SEARCH_BUDGET` — a repeat of
+`geofs mdim` scored **47027 vs the 24000 cold cap** on the 59756-row index. The
+warm path must do **less** work, never more. The bug was latent: D5 made 24000 a
+hard cutoff on 2026-10-11, while this doc was written 2026-10-08 when the budget
+still auto-raised to N (so `cov < nent` was always true then). When
+`cov >= budget` there is nothing to skip, so the cold walk is left untouched.
+
+`cov < budget` alone is **not enough** at K=64 — it stops the warm path doing
+*more* work but permits doing far *less*, which is a recall loss. `ANN_WARM_KEEP`
+(default 90) now bounds the cut: the warm path may never score less than 90% of
+what the cold walk would score. See the 2026-10-26 section below — under that
+bound it fired 0/200 at the live configuration and can only fire when the
+still-open remainder of the route is ≤10%.
 
 This is the **hot/cold axis** only. It never prunes a route that was not walked
 before — a novel query has no SHUT bucket and keeps its full behaviour.
@@ -67,6 +74,53 @@ over all N. `--budget 60000` (above N, so the warm set is a genuine subset):
 At the production default (`LZ_SEARCH_BUDGET=24000`) both the OFF and ON runs
 score exactly 24000 and every recall figure is identical — the warm path is a
 correct no-op there.
+
+### 2026-10-26 — the cut IS the recall loss at K=64 (bound added)
+
+Re-measured at the production budget on the live 63,804-row index (K=64,
+`LZ_ROUTE_BUCKETS=5`), scratch servers, numpy oracle, 60 queries:
+
+| pass | items_scored | mode | R@1 | R@5 | R@10 |
+|---|---|---|---|---|---|
+| OFF novel | 11,218.8 | anchor+p 60/60 | .9833 | .9333 | .9250 |
+| ON novel | 10,847.1 | anchor+p 52, **warm+p 8** | **.9667** | **.9100** | **.9050** |
+| ON exact repeat | 11,218.8 | anchor+p 60/60 | .9833 | .9333 | .9250 |
+| ON overlap σ.05 | 11,107.0 | anchor+p 60/60 | .9000 | .8933 | .8833 |
+
+C1 (novel recall unchanged) **FAILED**. Per-query kept fraction
+(`warm_scored / cold_scored`) explains it:
+
+| kept fraction | n | R@5 cold | R@5 warm | top-k identical |
+|---|---|---|---|---|
+| 0.00-0.20 | 1 | 1.000 | **0.000** | 0/1 |
+| 0.60-0.80 | 3 | 0.867 | 0.733 | 1/3 |
+| 0.80-0.90 | 4 | 0.900 | 0.900 | 3/4 |
+| 0.90-0.95 | 2 | 1.000 | 1.000 | 2/2 |
+
+Why it changed: `cov < budget` was calibrated when a bucket was 24-30% of the
+index (K=8). The 2026-10-14 receipt above kept **99.6%** of the route, so the
+cut was 0.4%. At K=64 a bucket is ~3%, so the same guard passes on cuts of
+20-80% of the route, and `budget = cov` then scores ONLY the shut subset
+(`src/ann_search.c:2051-2070`).
+
+**Fix — `ANN_WARM_KEEP` (default 90):** the warm path may never score less than
+90% of what the cold walk would score. Measured after the fix (200 queries):
+C1 identical, C2 overlap identical, warm fired **0/200**.
+
+That is arithmetic, not a regression: with `topb = 5` a *partial* shut set
+covers at most 4/5 of the route when the buckets are even, so the bound is
+reachable only when the one still-open bucket is tiny (live skew has buckets
+from 104 to 5,327 rows); the all-shut case is refused (`ann_search.c:2030`)
+because it has nothing to skip. Measured at the live configuration: **0 fires
+in 200 queries**. Under a recall-safe bound the warm path can only fire when
+the part it leaves unscored is ≤10% of the route — a bounded no-op, not a speed
+lever.
+
+**Retracted claim:** "the warm path saves work on related queries". It saved
+work only while the saving was 0.4% (invisible) and lost recall the moment the
+saving was real. What survives is the tombstone × graft amplifier, which
+re-ranks inside the SAME scored set and never touches the cut.
+
 
 ## P3 route-log compaction (2026-10-14)
 
