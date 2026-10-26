@@ -28,6 +28,8 @@ WORDS = None
 
 
 def pct(xs, p):
+    if not xs:
+        return 0.0
     s = sorted(xs)
     i = min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))
     return s[i]

@@ -60,6 +60,30 @@ Cause: `lz_labels_derive()` installs its own bucket-major permutation into
 from `g_ord_cache`, never from `NULL`. Fixed 2026-10-26; the fingerprint then
 reports 60/60.
 
+## Latency — what it actually buys (measured 2026-10-26, after a PC restart)
+
+`bench_roster_scaling.py`, live index 63,812, prune on (`anchor+p`), 100 queries,
+fresh server per arm, same bucket count on both sides:
+
+| buckets | roster OFF p50 | roster ON p50 | speedup | scored (both) |
+|---|---|---|---|---|
+| 5 (today's live) | 10.95 ms | **7.17 ms** | **1.53×** | 10,824 |
+| 16 | 23.91 ms | **14.23 ms** | **1.68×** | 24,348 |
+
+The gain grows with the routed-bucket count, exactly as the arithmetic says:
+without a roster the gather is `rnb × n` looks, with one it is `Σ|members|`.
+
+**Retraction.** An earlier arm (`bench_query_speed.py`, prune off, 2 reps,
+default buckets) reported p50 11.91 → 11.91 ms and I read that as "the roster is
+free but buys nothing". That arm was not the live configuration: with the prune
+off the walk scores every routed row and the gather is a sequential sweep the
+prefetcher hides. With the live settings (prune on, 5 buckets) the same change
+is 1.53×. Same code, different regime — the number to quote is the table above.
+
+The cold-page arm (`EmptyWorkingSet`) did **not** run — `OpenProcess`/
+`EmptyWorkingSet` returned false, so those columns are zeros, not measurements.
+A cold test still needs a real page-cache flush.
+
 ## Not in scope
 
 - the 3-axis latch (144 = 4×6×6): a bijection 144→144 renames cells; it keeps
