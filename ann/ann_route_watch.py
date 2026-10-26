@@ -62,8 +62,8 @@ STORE = os.environ.get("MEMCORE_STORE_DB", str(MEMCORE_DIR / "fact_store.v2.sqli
 SYNC_STATE = str(MEMCORE_DIR / ".ann_sync_state.json")
 SYNC_LOCK = str(MEMCORE_DIR / ".ann_sync.lock")
 
-STATE = str(HERE / ".ann_route_watch_state.json")
-LOG = str(HERE / ".ann_route_watch.log")
+STATE = os.environ.get("ANN_WATCH_STATE") or str(HERE / ".ann_route_watch_state.json")
+LOG = os.environ.get("ANN_WATCH_LOG") or str(HERE / ".ann_route_watch.log")
 
 COOLDOWN_S = int(os.environ.get("ANN_WATCH_COOLDOWN_S", "1800"))  # 30 min
 TIMEOUT_S = int(os.environ.get("ANN_WATCH_TIMEOUT_S", "30"))
@@ -170,6 +170,45 @@ def sync_locked():
         return False
 
 
+def _stamp_alerts(h, st):
+    """ALERT (never silently widen) when the stamp overlay is not what it says.
+
+    Two ways the route can be quietly wrong while routed==1 and the status is
+    "ok":
+      gate != ok   the positional sidecar was REFUSED (its prefix proof does not
+                   match this buffer), so labels fell back to the jsonl / none
+      unplaced>0   some rows carry no live stamp at all
+    Neither is auto-healed here: a restamp fixes labels but only after proving
+    the anchor table belongs to these rows, and a wrong repair is worse than a
+    loud one. The log line is the alert; it repeats only when the signature
+    changes (a 5-minute scheduler must not turn into a spammer).
+    """
+    stamp = h.get("stamp") or {}
+    gate = stamp.get("gate")
+    live = int(stamp.get("live", h.get("stamps_live") or 0))
+    entries = int(h.get("entries") or 0)
+    unplaced = int(stamp.get("unplaced", max(0, entries - live)))
+    if gate in (None, "ok") and unplaced == 0:
+        st.pop("last_alert", None)
+        return False
+    sig = "%s:%d:%d:%d" % (gate, stamp.get("gate_code", 0),
+                           stamp.get("side_rows", 0), unplaced)
+    if st.get("last_alert") == sig:
+        return True
+    st["last_alert"] = sig
+    save_state(st)
+    if gate not in (None, "ok"):
+        log("route_watch: ALERT stamp gate=%s (code %s) — the sidecar was "
+            "REFUSED, labels are not the tree's: entries=%d live=%d "
+            "side_rows=%s" % (gate, stamp.get("gate_code"), entries, live,
+                              stamp.get("side_rows")))
+    if unplaced:
+        log("route_watch: ALERT %d of %d rows carry NO live stamp (routed=%s) "
+            "— the pruned walk scores only stamped rows"
+            % (unplaced, entries, h.get("routed")))
+    return True
+
+
 def _heal_dead_route(h, st, sync_st, sig, readonly):
     """H2 (2026-10-20): the route is DEAD — the table is valid but the rows
     carry no routing stamps (the index was rebuilt). Heal with the
@@ -233,6 +272,14 @@ def main():
         return 2
     entries = int(h.get("entries") or 0)
     routed = int(h.get("routed") or 0)
+    # loaded before ANY branch: the dead-route heal below used st/sync_st/sig,
+    # which were only bound further down — so the H2 path raised NameError the
+    # first time it ever fired (found 2026-10-26; /ann_route_watch.log had no
+    # H2 line because the process died before logging).
+    sig = store_sig()
+    st = load_json(STATE)
+    sync_st = load_json(SYNC_STATE)
+    alerted = _stamp_alerts(h, st)
     # DEAD ROUTE (2026-10-20): the anchor table and the order file are
     # valid (routed=1) but the ROWS carry no routing stamps, because the
     # index was rebuilt by scripts/build_index.py (rows written without
@@ -251,12 +298,9 @@ def main():
     if route_dead:
         return _heal_dead_route(h, st, sync_st, sig, readonly)
     if routed == 1:
-        return 0  # healthy route: silent no-op
+        return 1 if alerted else 0  # healthy route; an alert still fails loud
 
     # --- H1 firing: entries>0 but unrouted --------------------------------
-    sig = store_sig()
-    st = load_json(STATE)
-    sync_st = load_json(SYNC_STATE)
 
     if readonly:
         log("route_watch[CHECK]: H1 FIRING — entries=%d routed=0 "

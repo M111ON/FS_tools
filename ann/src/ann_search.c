@@ -751,7 +751,7 @@ static void lz_tags_ensure(LZEntry *ents, int nent);
 static void lz_tags_free(void);
 static void lz_tags_load(LZEntry *ents, int nent);
 static int  lz_stamp_overlay(LZEntry *a, int n);
-static int  lz_stamp_prefix_ok(const LZEntry *a, int n);
+static int  lz_stamp_prefix_ok(const LZEntry *a, int n, int *why);
 static void lz_index_free(LZEntry *a, int n);
 static CRITICAL_SECTION g_lock;
 /* The request lock is RECURSIVE (a Windows critical section), so the depth
@@ -776,6 +776,17 @@ static const char *lz_json_val(const char *line, const char *key) {
  * Declared before lz_index_load (which writes it) and before handle_health
  * (which reads it). */
 static int g_stamp_live = 0;
+/* THE GATE'S VERDICT, made visible (2026-10-26). The positional sidecar is
+ * applied only when the regrow state proves the buffer's prefix is the same
+ * rows. Refusing was silent: the route fell back to the rows' own jsonl labels
+ * (or none) and only stamps_live hinted at it. Values:
+ *   0 = applied (or no sidecar at all — nothing to refuse)
+ *   1 = REFUSED: the state file's prefix marker does not match this buffer
+ *   2 = REFUSED: the state file is missing/unusable (no proof available)
+ * 1 and 2 change the answer's labels, so /health reports them and the watcher
+ * alerts instead of letting the route degrade quietly. */
+static int g_stamp_gate = 0;
+static long g_stamp_side_rows = 0;   /* rows the sidecar claims to cover */
 /* the stamp sidecar's identity (the background loader watches it: the
  * incremental regrow writes ONLY the sidecar, so the index file can stay
  * untouched while the routing table changes) */
@@ -858,6 +869,7 @@ static int lz_stamp_overlay(LZEntry *a, int n) {
     snprintf(sp, sizeof(sp), "%s.stamp", PATH_INDEX);
     struct stat ss;
     g_stamp_mtime = 0; g_stamp_size = 0;
+    g_stamp_gate = 0; g_stamp_side_rows = 0;
     if (stat(sp, &ss) == 0) {
         g_stamp_mtime = (long)ss.st_mtime;
         g_stamp_size = (long)ss.st_size;
@@ -869,7 +881,9 @@ static int lz_stamp_overlay(LZEntry *a, int n) {
          * st.last_sid proves the prefix is intact. Without the gate, a
          * sidecar from another index version would be laid over the wrong
          * rows and the route would silently degrade (the S9 lesson). */
-        if (!lz_stamp_prefix_ok(a, n)) {
+        int why = 0;
+        if (!lz_stamp_prefix_ok(a, n, &why)) {
+            g_stamp_gate = why ? why : 1;
             int live = 0;
             for (int i = 0; i < n; i++) if (a[i].anchor >= 0) live++;
             return live;
@@ -877,6 +891,7 @@ static int lz_stamp_overlay(LZEntry *a, int n) {
         if (ss.st_size >= 8) {
             long side_rows = (long)ss.st_size / 8;
             if (side_rows > (long)n) side_rows = (long)n;
+            g_stamp_side_rows = side_rows;
             FILE *sf = fopen(sp, "rb");
             if (sf) {
                 for (int i = 0; i < (int)side_rows; i++) {
@@ -3232,15 +3247,20 @@ static void regrow_state_load(RegrowState *st) {
  * A buffer that fails it gets NO sidecar labels: the route then reads as
  * dead and the walk fails loud (full scan) instead of routing by stamps
  * that belong to another index version. */
-static int lz_stamp_prefix_ok(const LZEntry *a, int n) {
-    if (!a || n <= 0) return 0;
+static int lz_stamp_prefix_ok(const LZEntry *a, int n, int *why) {
+    if (why) *why = 0;
+    if (!a || n <= 0) { if (why) *why = 2; return 0; }
     RegrowState st;
     regrow_state_load(&st);
-    if (st.n_prev <= 0 || st.n_prev > n) return 0;
-    if (!st.last_sid[0]) return 0;
+    /* 2 = the state file cannot prove anything (missing/empty); 1 = it
+     * proves a DIFFERENT prefix, the dangerous case: a sidecar from
+     * another index version would label the wrong rows. */
+    if (st.n_prev <= 0 || st.n_prev > n) { if (why) *why = 2; return 0; }
+    if (!st.last_sid[0]) { if (why) *why = 2; return 0; }
     const char *sid = a[st.n_prev - 1].sid;
-    if (!sid[0]) return 0;
-    return strcmp(sid, st.last_sid) == 0;
+    if (!sid[0]) { if (why) *why = 2; return 0; }
+    if (strcmp(sid, st.last_sid) != 0) { if (why) *why = 1; return 0; }
+    return 1;
 }
 
 static void regrow_state_save(const RegrowState *st, double full_ms) {
@@ -4133,6 +4153,7 @@ static int handle_health(sock_t cli) {
         "\"labels\":\"%s\",\"order_stale\":%ld,\"heal_ok\":%ld,\"heal_fail\":%ld,"
         "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
+        "\"stamp\":{\"live\":%d,\"unplaced\":%d,\"side_rows\":%ld,\"gate\":\"%s\",\"gate_code\":%d},"
         "\"totem\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d},"
         "\"roster\":{\"on\":%d,\"doors\":%d,\"rows\":%d}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
@@ -4140,6 +4161,10 @@ static int handle_health(sock_t cli) {
         g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
         g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
+        g_stamp_live, (nent > g_stamp_live) ? (nent - g_stamp_live) : 0,
+        g_stamp_side_rows,
+        (g_stamp_gate == 1) ? "prefix_mismatch" :
+        (g_stamp_gate == 2) ? "no_state" : "ok", g_stamp_gate,
         g_totem_replayed, sh, (unsigned)WL_FREE, g_pair_n,
         lz_roster_enabled(), g_roster_doors, g_roster_rows);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
