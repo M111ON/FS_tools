@@ -84,6 +84,40 @@ The cold-page arm (`EmptyWorkingSet`) did **not** run — `OpenProcess`/
 `EmptyWorkingSet` returned false, so those columns are zeros, not measurements.
 A cold test still needs a real page-cache flush.
 
+Follow-up (2026-10-26): `EmptyWorkingSet` itself does work from this shell
+(`OpenProcess` + `EmptyWorkingSet` on the live pid → `True`), but that is **not
+cold**: the pages land on the OS standby list and the next pass reads them from
+RAM. Trimming a working set measures the fault-in machinery, not disk. Without
+a standby-list purge (RAMMap `-Et` / `EmptyStandbyList`) or a reboot, a cold
+number cannot be produced honestly on this box — so there is still no cold
+number to quote.
+
+## Duplicate looks — measured and rejected (2026-10-26)
+
+`examined / scored = 2.29` looks like 2.3× headroom, so the obvious next step is
+"each row hangs on two doors; skip its second-door look". Implemented and
+gated: the roster entry carried the row's other door inline
+(`other_door << 32 | row`) and the walk skipped a row when that other door had
+already been emitted (`walked` bitmask, checked before touching `pseen`/`ents`).
+
+| arm (same fresh-server pair, 100 queries, live settings) | p50 |
+|---|---|
+| plain roster (4 B/entry) | **8.68 ms** |
+| tagged roster (8 B/entry) | 8.82 ms |
+
+Same top-k, same `walk_hash`, same `items_scored` (gate clean) — and no gain.
+The reason the arithmetic misleads: a "duplicate look" is not extra work. The
+row is scored **once per door it belongs to** and that is the answer's order
+(the walk is door-major); the only thing a tag can save is the `pseen[]` test,
+which is already in cache and cheaper than reading a second 8-byte entry. The
+2.29× is membership × routed doors, not waste.
+
+Reverted (source back to the plain roster); `examined` stays as the honest
+counter for the gather, not a target to shrink. Measurement hook left behind:
+`ANN_BENCH_EXE` in `bench_rows_examined.py` lets an A/B pair run two binaries
+against the same index.
+
+
 ## Not in scope
 
 - the 3-axis latch (144 = 4×6×6): a bijection 144→144 renames cells; it keeps

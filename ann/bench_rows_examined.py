@@ -17,7 +17,7 @@ import urllib.request
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(DIR, "data", "memcore")
-EXE = os.path.join(DIR, "build", "ann_search.exe")
+EXE = os.environ.get("ANN_BENCH_EXE") or os.path.join(DIR, "build", "ann_search.exe")
 
 
 def wait_health(port, timeout=240.0):

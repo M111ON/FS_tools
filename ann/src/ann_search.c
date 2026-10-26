@@ -1634,6 +1634,7 @@ static int lz_is_kind(const char *file, const char *kind) {
  * Both bypass the route layer exactly like the file scope does: the group is
  * derived from the rows themselves, so it cannot drift from the index. */
 #define LZ_MAX_TAGS 64
+#define LZ_LUT_ZONE_CAP 256
 static char g_tag_name[LZ_MAX_TAGS][64];
 static int  g_tag_n = 0;
 static int *g_ent_tag = NULL;      /* [nent] tag id per row, -1 = unlabeled */
@@ -4215,6 +4216,163 @@ static int handle_canary(sock_t cli) {
     return 0;
 }
 
+/* ── GET /v1/state/tags (Phase 2 discovery surface) ────────────────────
+ * Read-only answer to "which zones exist and how big are they", so an agent
+ * can scope a search without opening tag_lut.json or walking the index.
+ *
+ * Two sources, each kept where it is the truth:
+ *   rows   = the sid-keyed sidecar the search path resolves scopes with
+ *            (same ann_tags.tsv, same lz_tags_load arrays)
+ *   retired = the frozen LUT's zones block (a retired tag has zero rows, so
+ *            the sidecar cannot even name it)
+ * Numbers are computed from g_ent_tag/g_ent_zone, so they are the walk's own
+ * per-zone sizes by construction — not a recount of the TSV text. */
+typedef struct {
+    int zone;
+    char tag[64];
+    int retired;
+} LzLutZone;
+
+/* read the LUT's zones block: lines of the machine-written json, one key per
+ * line ("0": { / "tag": ... / "rows": ... / "retired": ...). Returns count or
+ * 0 when the LUT is missing or its shape changed; the endpoint then reports
+ * sidecar-only and the caller can see it never claimed LUT coverage. */
+static int lz_lut_zones(LzLutZone *out, int cap) {
+    char path[600];
+    const char *tp = g_tag_path[0] ? g_tag_path : NULL;
+    if (!tp) { lz_tag_path(path, sizeof(path)); tp = path; }
+    const char *slash = strrchr(tp, '/');
+    const char *bslash = strrchr(tp, '\\');
+    const char *cut = (slash && (!bslash || slash > bslash)) ? slash : bslash;
+    if (cut) snprintf(path, sizeof(path), "%.*stag_lut.json", (int)(cut - tp + 1), tp);
+    else snprintf(path, sizeof(path), "tag_lut.json");
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int n = 0, in_zones = 0;
+    int cur_zone = -1, cur_ret = 0;
+    char cur_tag[64] = "";
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t sl = strlen(s);
+        while (sl && (s[sl - 1] == '\n' || s[sl - 1] == '\r' || s[sl - 1] == ' ')) s[--sl] = '\0';
+        if (!in_zones) {
+            if (strncmp(s, "\"zones\"", 7) == 0) in_zones = 1;
+            continue;
+        }
+        if (strncmp(s, "\"tags\"", 6) == 0) break;   /* zones block ended */
+        const char *k;
+        if ((k = strstr(s, "\"tag\":")) != NULL) {
+            const char *q = strchr(k, ':') + 1;
+            while (*q == ' ') q++;
+            if (*q == '"') {
+                q++;
+                size_t tl = 0;
+                while (q[tl] && q[tl] != '"' && tl < sizeof(cur_tag) - 1) { cur_tag[tl] = q[tl]; tl++; }
+                cur_tag[tl] = '\0';
+            }
+        } else if ((k = strstr(s, "\"retired\":")) != NULL) {
+            cur_ret = (strstr(k, "true") != NULL);
+        } else if (s[0] == '"' && !cur_tag[0]) {
+            cur_zone = atoi(s + 1);   /* the zone key line: "0": { */
+        } else if (s[0] == '}') {
+            if (cur_tag[0] && n < cap) {
+                out[n].zone = cur_zone;
+                snprintf(out[n].tag, sizeof(out[n].tag), "%s", cur_tag);
+                out[n].retired = cur_ret;
+                n++;
+            }
+            cur_tag[0] = '\0'; cur_zone = -1; cur_ret = 0;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+static int handle_tags(sock_t cli) {
+    LZEntry *ents = NULL; int nent = 0;
+    lz_index_cached(&ents, &nent);
+    if (!ents || nent <= 0) {
+        const char *e = "{\"status\":\"error\",\"error\":\"no_index\"}";
+        lz_http_send(cli, "503 Service Unavailable", "application/json", e, (int)strlen(e));
+        sock_close(cli);
+        return 0;
+    }
+    lz_tags_ensure(ents, nent);
+    int *tagcnt = (int *)calloc((size_t)(g_tag_n ? g_tag_n : 1), sizeof(int));
+    int *tagzone = (int *)malloc((size_t)(g_tag_n ? g_tag_n : 1) * sizeof(int));
+    if (!tagcnt || !tagzone) {
+        free(tagcnt); free(tagzone);
+        const char *e = "{\"status\":\"error\",\"error\":\"oom\"}";
+        lz_http_send(cli, "500 Internal Server Error", "application/json", e, (int)strlen(e));
+        sock_close(cli);
+        return 0;
+    }
+    for (int i = 0; i < g_tag_n; i++) tagzone[i] = -1;
+    /* zone ids are small and frozen; count them straight off g_ent_zone so the
+     * number is the same one lz_scope_resolve walks for zone:<id>. */
+    int zcap = LZ_LUT_ZONE_CAP;
+    int *zonecnt = (int *)calloc((size_t)zcap, sizeof(int));
+    if (!zonecnt) { free(tagcnt); free(tagzone); const char *e = "{\"status\":\"error\",\"error\":\"oom\"}"; lz_http_send(cli, "500 Internal Server Error", "application/json", e, (int)strlen(e)); sock_close(cli); return 0; }
+    for (int i = 0; i < nent; i++) {
+        int t = g_ent_tag[i], z = g_ent_zone[i];
+        if (t >= 0 && t < g_tag_n) {
+            tagcnt[t]++;
+            if (tagzone[t] < 0 && z >= 0) tagzone[t] = z;
+        }
+        if (z >= 0 && z < zcap) zonecnt[z]++;
+    }
+
+    LzLutZone lut[LZ_LUT_ZONE_CAP];
+    int nlut = lz_lut_zones(lut, LZ_LUT_ZONE_CAP);
+
+    char b[8192]; int bl = 0;
+    int tagged = (nent > g_tag_unlabeled) ? (nent - g_tag_unlabeled) : 0;
+    char esc[600];
+    lz_json_escape(esc, sizeof(esc), g_tag_path[0] ? g_tag_path : "(none)");
+    bl += snprintf(b + bl, sizeof(b) - bl,
+        "{\"status\":\"ok\",\"index\":\"%s\",\"entries\":%d,\"tagged\":%d,"
+        "\"unlabeled\":%d,\"lut_zones\":%d,\"zones\":[",
+        esc, nent, tagged, g_tag_unlabeled, nlut);
+    int emitted = 0;
+    for (int zi = 0; zi < nlut && bl < (int)sizeof(b) - 200; zi++) {
+        int tid = -1;
+        for (int i = 0; i < g_tag_n; i++)
+            if (strcmp(g_tag_name[i], lut[zi].tag) == 0) { tid = i; break; }
+        int z = lut[zi].zone >= 0 ? lut[zi].zone : (tid >= 0 ? tagzone[tid] : -1);
+        int rows = (tid >= 0) ? tagcnt[tid] : ((z >= 0 && z < zcap) ? zonecnt[z] : 0);
+        if (lut[zi].retired && rows != 0) continue;   /* LUT says gone, sidecar disagrees: report live */
+        char tesc[160];
+        lz_json_escape(tesc, sizeof(tesc), lut[zi].tag);
+        bl += snprintf(b + bl, sizeof(b) - bl,
+            "%s{\"zone\":%d,\"tag\":\"%s\",\"rows\":%d,\"retired\":%s}",
+            emitted ? "," : "", z, tesc, rows, (rows == 0) ? "true" : "false");
+        emitted++;
+    }
+    /* a tag the sidecar knows but the LUT does not (new tag baked without a
+     * LUT refresh): still answer it, flagged by lut_zones coverage above */
+    for (int i = 0; i < g_tag_n && bl < (int)sizeof(b) - 200; i++) {
+        if (tagcnt[i] <= 0) continue;
+        int seen = 0;
+        for (int zi = 0; zi < nlut; zi++)
+            if (strcmp(lut[zi].tag, g_tag_name[i]) == 0) { seen = 1; break; }
+        if (seen) continue;
+        char tesc[160];
+        lz_json_escape(tesc, sizeof(tesc), g_tag_name[i]);
+        bl += snprintf(b + bl, sizeof(b) - bl,
+            "%s{\"zone\":%d,\"tag\":\"%s\",\"rows\":%d,\"retired\":false}",
+            emitted ? "," : "", tagzone[i], tesc, tagcnt[i]);
+        emitted++;
+    }
+    bl += snprintf(b + bl, sizeof(b) - bl,
+        "],\"zones_n\":%d}", emitted);
+    free(zonecnt); free(tagcnt); free(tagzone);
+    lz_http_send(cli, "200 OK", "application/json", b, bl);
+    sock_close(cli);
+    return 0;
+}
+
 /* parse a JSON float array field ("vec":[f,f,...]); returns count or 0.
  * Lets a caller send its OWN query vector instead of having the sidecar embed
  * the text, so ranking uses the caller's model. */
@@ -4603,6 +4761,8 @@ static void dispatch(sock_t cli, char *rq) {
         handle_health(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/canary") == 0) {
         handle_canary(cli);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state/tags") == 0) {
+        handle_tags(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/restamp") == 0) {
         /* RESTAMP (2026-10-20): repair the ROUTING TABLE without touching
          * the vectors. The full regrow path rewrites the 233 MB jsonl and
