@@ -13,3 +13,6 @@ data/graft/
 .keepalive.log
 .server.log
 .server.err
+
+# runtime: anchor state written by the service
+.anchor_state.json
