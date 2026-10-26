@@ -1397,7 +1397,57 @@ static uint32_t **g_roster = NULL;   /* [door] -> row indices, walk order */
 static int *g_roster_n = NULL;       /* [door] -> count                 */
 static int g_roster_doors = 0;
 static int g_roster_rows = 0;        /* total memberships (<= 2 * n)    */
+static long g_roster_bytes = 0;      /* payload bytes (rows * 4)        */
 static int g_roster_on = -1;         /* env ANN_ROSTER, default ON      */
+
+/* FILE-BACKED ROSTER (2026-10-26). The roster is a pure function of
+ * (anchors, ord, n) and it is ~0.5 MB (127k memberships x 4 B). Keeping it only
+ * in heap made a cold start pay a 2*n rebuild and made the pages un-evictable
+ * without losing the work. Written once next to the anchors and mmap'd read-only
+ * on every later boot: the kernel owns the pages, a cold fault is a 4 KB read
+ * (~5 ms even on a 100 MB/s disk for the whole file), and no rebuild happens.
+ * The arithmetic bound is the point: 0.49 MiB vs the 258 MB index jsonl, i.e.
+ * the roster can never be the cold cost, whatever the disk. */
+static void  *g_roster_map = NULL;
+static HANDLE g_roster_fh = INVALID_HANDLE_VALUE;
+static HANDLE g_roster_fm = NULL;
+static int    g_roster_mapped = 0;   /* 1 = pointers live inside the map  */
+static int    g_roster_src = 0;      /* 0 none, 1 mapped, 2 built         */
+
+#define ROSTER_MAGIC 0x52545352u     /* 'RSTR' */
+#define ROSTER_VER   1u
+
+static const char *lz_roster_path(void) {
+    static char buf[1024];
+    const char *e = getenv("ANN_ROSTER_PATH");
+    if (e && e[0]) return e;
+    const char *a = PATH_ANCH;
+    size_t n = strlen(a);
+    if (n > 4 && strcmp(a + n - 4, ".bin") == 0)
+        snprintf(buf, sizeof(buf), "%.*s-roster.bin", (int)(n - 4), a);
+    else
+        snprintf(buf, sizeof(buf), "%s-roster.bin", a);
+    return buf;
+}
+
+static uint32_t lz_fnv32(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint32_t h = 2166136261u;
+    while (n--) { h ^= *b++; h *= 16777619u; }
+    return h;
+}
+
+/* the anchors file is a 12 KB table: hashing it whole is a rounding error and
+ * it is the honest tie — a retrained table must invalidate the roster. */
+static uint32_t lz_anch_fnv(void) {
+    FILE *f = fopen(PATH_ANCH, "rb");
+    if (!f) return 0;
+    uint32_t h = 2166136261u;
+    unsigned char c;
+    while (fread(&c, 1, 1, f) == 1) { h ^= c; h *= 16777619u; }
+    fclose(f);
+    return h;
+}
 
 static int lz_roster_enabled(void) {
     if (g_roster_on < 0) {
@@ -1408,12 +1458,95 @@ static int lz_roster_enabled(void) {
 }
 
 static void lz_roster_free(void) {
-    if (g_roster) {
+    if (g_roster_mapped) {
+        if (g_roster_map) UnmapViewOfFile(g_roster_map);
+        if (g_roster_fm) CloseHandle(g_roster_fm);
+        if (g_roster_fh != INVALID_HANDLE_VALUE) CloseHandle(g_roster_fh);
+    } else if (g_roster) {
         for (int d = 0; d < g_roster_doors; d++) free(g_roster[d]);
-        free(g_roster); g_roster = NULL;
     }
+    g_roster_map = NULL; g_roster_fm = NULL;
+    g_roster_fh = INVALID_HANDLE_VALUE;
+    g_roster_mapped = 0; g_roster_src = 0;
+    free(g_roster); g_roster = NULL;
     free(g_roster_n); g_roster_n = NULL;
-    g_roster_doors = 0; g_roster_rows = 0;
+    g_roster_doors = 0; g_roster_rows = 0; g_roster_bytes = 0;
+}
+
+/* map a roster written by lz_roster_save(); 1 = live */
+static int lz_roster_map_file(int n, uint32_t ord_hash, uint32_t anch_hash, int K) {
+    const char *path = lz_roster_path();
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    HANDLE fm = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!fm) { CloseHandle(fh); return 0; }
+    const unsigned char *base = (const unsigned char *)MapViewOfFile(fm, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { CloseHandle(fm); CloseHandle(fh); return 0; }
+    uint32_t hdr[7];
+    memcpy(hdr, base, sizeof(hdr));
+    size_t need = sizeof(hdr) + (size_t)K * 4u;
+    if (hdr[0] != ROSTER_MAGIC || hdr[1] != ROSTER_VER ||
+        (int)hdr[2] != K || (int)hdr[3] != n ||
+        hdr[5] != ord_hash || hdr[6] != anch_hash) {
+        UnmapViewOfFile(base); CloseHandle(fm); CloseHandle(fh);
+        return 0;
+    }
+    uint32_t rows = hdr[4];
+    if (need + (size_t)rows * 4u > (size_t)0xffffffffu) {
+        UnmapViewOfFile(base); CloseHandle(fm); CloseHandle(fh);
+        return 0;
+    }
+    uint32_t **R = (uint32_t **)calloc((size_t)K, sizeof(uint32_t *));
+    int *cnt = (int *)calloc((size_t)K, sizeof(int));
+    if (!R || !cnt) {
+        free(R); free(cnt);
+        UnmapViewOfFile(base); CloseHandle(fm); CloseHandle(fh);
+        return 0;
+    }
+    const uint32_t *lens = (const uint32_t *)(base + sizeof(hdr));
+    const uint32_t *payload = (const uint32_t *)(base + need);
+    uint32_t off = 0;
+    for (int d = 0; d < K; d++) {
+        cnt[d] = (int)lens[d];
+        R[d] = (uint32_t *)(payload + off);
+        off += lens[d];
+    }
+    if ((long)off != (long)rows) {
+        free(R); free(cnt);
+        UnmapViewOfFile(base); CloseHandle(fm); CloseHandle(fh);
+        return 0;
+    }
+    g_roster = R; g_roster_n = cnt; g_roster_doors = K;
+    g_roster_rows = (int)rows;
+    g_roster_bytes = (long)rows * 4L;
+    g_roster_map = (void *)base; g_roster_fm = fm; g_roster_fh = fh;
+    g_roster_mapped = 1; g_roster_src = 1;
+    return 1;
+}
+
+/* write the live heap roster so the next boot maps instead of rebuilding */
+static void lz_roster_save(int n, uint32_t ord_hash, uint32_t anch_hash, int K) {
+    if (!g_roster || !g_roster_n || g_roster_mapped) return;
+    const char *path = lz_roster_path();
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    uint32_t hdr[7] = { ROSTER_MAGIC, ROSTER_VER, (uint32_t)K, (uint32_t)n,
+                        (uint32_t)g_roster_rows, ord_hash, anch_hash };
+    int bad = fwrite(hdr, sizeof(hdr), 1, f) != 1;
+    for (int d = 0; d < K && !bad; d++) {
+        uint32_t len = (uint32_t)g_roster_n[d];
+        bad = fwrite(&len, 4, 1, f) != 1;
+    }
+    for (int d = 0; d < K && !bad; d++)
+        if (g_roster_n[d] > 0)
+            bad = fwrite(g_roster[d], 4, (size_t)g_roster_n[d], f) != (size_t)g_roster_n[d];
+    fclose(f);
+    if (bad) { remove(tmp); return; }
+    remove(path);
+    if (rename(tmp, path) != 0) remove(tmp);
 }
 
 /* ord == NULL means the walk uses identity order. NOTE: in derive mode
@@ -1455,22 +1588,40 @@ static int lz_roster_build(LZEntry *ents, int n, const uint32_t *ord, int K) {
     free(fill);
     g_roster = R; g_roster_n = cnt; g_roster_doors = K;
     g_roster_rows = (int)total;
+    g_roster_bytes = total * 4L;
+    g_roster_mapped = 0; g_roster_src = 2;
+    return 1;
+}
+
+/* map if a matching file exists, else build AND write it. The hash pair is
+ * taken here so every caller cannot forget one half of the tie. */
+static int lz_roster_ensure(LZEntry *ents, int n, const uint32_t *ord, int K) {
+    uint32_t oh = ord ? lz_fnv32(ord, (size_t)n * 4u) : 0u;
+    uint32_t ah = lz_anch_fnv();
+    if (lz_roster_map_file(n, oh, ah, K)) return 1;
+    if (!lz_roster_build(ents, n, ord, K)) return 0;
+    lz_roster_save(n, oh, ah, K);
     return 1;
 }
 
 /* build with a receipt: the roster is O(n) with one malloc per door, done once
- * per route-cache rebuild — /health and the diag line must show its cost. */
+ * per route-cache rebuild — /health and the diag line must show its cost. A
+ * mapped roster is not rebuilt at all, and says so. */
 static int lz_roster_build_timed(LZEntry *ents, int n, const uint32_t *ord, int K) {
     LARGE_INTEGER f, a, b;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&a);
-    int ok = lz_roster_build(ents, n, ord, K);
+    int ok = lz_roster_ensure(ents, n, ord, K);
     QueryPerformanceCounter(&b);
     double ms = f.QuadPart ? (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart : -1.0;
-    lz_diag("[roster] %s doors=%d rows=%d n=%d build=%.1fms\n",
-            ok ? "built" : "FAILED", g_roster_doors, g_roster_rows, n, ms);
-    cy_emit("{\"event\":\"roster-build\",\"ok\":%d,\"doors\":%d,\"rows\":%d,"
-            "\"n\":%d,\"ms\":%.1f}", ok, g_roster_doors, g_roster_rows, n, ms);
+    lz_diag("[roster] %s src=%s doors=%d rows=%d bytes=%ld n=%d cost=%.1fms\n",
+            ok ? "ready" : "FAILED",
+            g_roster_src == 1 ? "mmap" : (g_roster_src == 2 ? "built" : "none"),
+            g_roster_doors, g_roster_rows, g_roster_bytes, n, ms);
+    cy_emit("{\"event\":\"roster-build\",\"ok\":%d,\"src\":\"%s\",\"doors\":%d,"
+            "\"rows\":%d,\"bytes\":%ld,\"n\":%d,\"ms\":%.1f}",
+            ok, g_roster_src == 1 ? "mmap" : (g_roster_src == 2 ? "built" : "none"),
+            g_roster_doors, g_roster_rows, g_roster_bytes, n, ms);
     return ok;
 }
 
@@ -4181,7 +4332,8 @@ static int handle_health(sock_t cli) {
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
         "\"stamp\":{\"live\":%d,\"unplaced\":%d,\"side_rows\":%ld,\"gate\":\"%s\",\"gate_code\":%d},"
         "\"totem\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d},"
-        "\"roster\":{\"on\":%d,\"doors\":%d,\"rows\":%d}}",
+        "\"roster\":{\"on\":%d,\"doors\":%d,\"rows\":%d,\"bytes\":%ld,"
+        "\"src\":\"%s\"}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, g_anch_k, embed_ok ? "ok" : "down",
         g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
@@ -4192,7 +4344,8 @@ static int handle_health(sock_t cli) {
         (g_stamp_gate == 1) ? "prefix_mismatch" :
         (g_stamp_gate == 2) ? "no_state" : "ok", g_stamp_gate,
         g_totem_replayed, sh, (unsigned)WL_FREE, g_pair_n,
-        lz_roster_enabled(), g_roster_doors, g_roster_rows);
+        lz_roster_enabled(), g_roster_doors, g_roster_rows, g_roster_bytes,
+        g_roster_src == 1 ? "mmap" : (g_roster_src == 2 ? "built" : "none"));
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;

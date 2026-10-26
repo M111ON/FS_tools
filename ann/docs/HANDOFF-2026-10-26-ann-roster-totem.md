@@ -74,8 +74,14 @@ table above, never that arm. `ROSTER.md` holds both numbers plus the retraction.
 box) the routed walk is only **1.4×**; the index is 98 MB and fits in RAM, so
 brute force is already fast. The roster's value is the *shape* of the cost
 (`Σ|members|` instead of `rnb × n`), which is what makes more buckets affordable.
-The cold-page arm did **not** run (`EmptyWorkingSet` returned false) — those
-columns are zeros, not measurements.
+The cold-page arm did **not** give a measurement: `EmptyWorkingSet` reported
+success but the file's pages stayed on the standby list, so the "cold" column
+just re-read RAM. Verdict (owner, 2026-10-26): **warm measured, cold bounded by
+arithmetic** — the roster payload is `rows x 4 B` = 0.49 MiB for 127,694
+memberships against a 258 MB index jsonl, so it can never be the cold cost. The
+roster is now file-backed (mmap, `src:built|mmap` in `/health`), so a cold start
+faults pages instead of rebuilding; no reboot measurement is needed. Details and
+the 9-check gate: `docs/ROSTER-COLD-2026-10-26.md`.
 
 ## 4. Correctness receipts
 
