@@ -757,6 +757,14 @@ static unsigned _fnv(const char *s);
 static const char *regrow_state_path(void);
 static void lz_diag(const char *fmt, ...);
 static void lz_tags_ensure(LZEntry *ents, int nent);
+static void lz_zone_rows_free(void);
+static void lz_zone_rows_build(int nent);
+/* ANN_ZONE_ROWS=0 restores the two-pass filter, so the prebuilt index can be
+ * A/B'd against the code it replaced on the SAME binary (a stored old exe is
+ * not portable across checkouts). */
+static int lz_zone_rows_on(void);
+static int  lz_zone_rows(int zone, const uint32_t **rows);
+
 static void lz_tags_free(void);
 static void lz_tags_load(LZEntry *ents, int nent);
 static int  lz_stamp_overlay(LZEntry *a, int n);
@@ -1862,6 +1870,7 @@ static int lz_tag_sid_pos(const char *sid) {
 static void lz_tags_free(void) {
     free(g_ent_tag); g_ent_tag = NULL;
     free(g_ent_zone); g_ent_zone = NULL;
+    lz_zone_rows_free();
     g_ent_tag_n = 0;
     free(g_tag_sid_hash); g_tag_sid_hash = NULL; g_tag_sid_cap = 0;
     g_tag_ents_ref = NULL;
@@ -1916,6 +1925,79 @@ static void lz_tags_load(LZEntry *ents, int nent) {
     fclose(f);
     g_tag_unlabeled = 0;
     for (int i = 0; i < nent; i++) if (g_ent_tag[i] < 0) g_tag_unlabeled++;
+    lz_zone_rows_build(nent);
+}
+
+/* ── ZONE ROWS (2026-10-26, card t4fbea5cf slice 1) ─────────────────────
+ * The zone every row belongs to is already in the tags sidecar (frozen ids,
+ * never renumbered), so a zone scope does not need to re-scan the index to find
+ * its members: one pass at tag load builds zone -> ascending row indices, and
+ * every later zone query jumps straight to them. Rows are in the SAME
+ * ascending order the filter produced, so the walk list is byte-identical —
+ * that is the gate (walk_hash), because a set-equal walk can still be
+ * reordered and hide behind equal top-k.
+ *
+ * Size: n x 4 B (255 KB live). It is a pure function of the sidecar, so it is
+ * rebuilt with the tags and never persisted. */
+static uint32_t *g_zr_rows = NULL;
+static int *g_zr_off = NULL;
+static int *g_zr_cnt = NULL;
+static int g_zr_zone_n = 0;
+static int g_zr_total = 0;
+
+static int lz_zone_rows_on(void) {
+    const char *e = getenv("ANN_ZONE_ROWS");
+    return (e && e[0] == '0') ? 0 : 1;
+}
+
+static void lz_zone_rows_free(void) {
+    free(g_zr_rows); g_zr_rows = NULL;
+    free(g_zr_off); g_zr_off = NULL;
+    free(g_zr_cnt); g_zr_cnt = NULL;
+    g_zr_zone_n = 0; g_zr_total = 0;
+}
+
+static void lz_zone_rows_build(int nent) {
+    lz_zone_rows_free();
+    if (!g_ent_zone || nent <= 0) return;
+    int nz = 0;
+    for (int i = 0; i < nent; i++) {
+        int z = g_ent_zone[i];
+        if (z >= 0 && z < 4096 && z + 1 > nz) nz = z + 1;
+    }
+    if (nz <= 0) return;
+    int *cnt = (int *)calloc((size_t)nz, sizeof(int));
+    int *off = (int *)calloc((size_t)(nz + 1), sizeof(int));
+    if (!cnt || !off) { free(cnt); free(off); return; }
+    for (int i = 0; i < nent; i++) {
+        int z = g_ent_zone[i];
+        if (z >= 0 && z < nz) cnt[z]++;
+    }
+    int total = 0;
+    for (int z = 0; z < nz; z++) { off[z] = total; total += cnt[z]; }
+    off[nz] = total;
+    uint32_t *rows = total > 0 ? (uint32_t *)malloc((size_t)total * sizeof(uint32_t)) : NULL;
+    if (total > 0 && !rows) { free(cnt); free(off); return; }
+    int *fill = (int *)calloc((size_t)nz, sizeof(int));
+    if (total > 0 && !fill) { free(rows); free(cnt); free(off); return; }
+    for (int i = 0; i < nent; i++) {
+        int z = g_ent_zone[i];
+        if (z >= 0 && z < nz) rows[off[z] + fill[z]++] = (uint32_t)i;
+    }
+    free(fill); free(cnt);
+    g_zr_rows = rows; g_zr_off = off; g_zr_cnt = (int *)malloc((size_t)nz * sizeof(int));
+    if (!g_zr_cnt) { free(rows); free(off); g_zr_rows = NULL; g_zr_off = NULL; return; }
+    for (int z = 0; z < nz; z++) g_zr_cnt[z] = off[z + 1] - off[z];
+    g_zr_zone_n = nz; g_zr_total = total;
+}
+
+/* zone -> its rows in ascending order; returns the count (0 = unknown zone) */
+static int lz_zone_rows(int zone, const uint32_t **rows) {
+    if (rows) *rows = NULL;
+    if (!g_zr_rows || !g_zr_cnt || zone < 0 || zone >= g_zr_zone_n) return 0;
+    if (g_zr_cnt[zone] <= 0) return 0;
+    if (rows) *rows = g_zr_rows + g_zr_off[zone];
+    return g_zr_cnt[zone];
 }
 
 /* reload only when the sidecar or the index actually moved */
@@ -2185,6 +2267,23 @@ static int lz_mem_search(const float *qv, int qd,
             if (r == 4 && soft_bias_req > 0) {
                 g_soft_zone = scope_zone;
                 snprintf(rm, sizeof(rm), "%s", "soft+zone");
+            } else if (r == 4 && lz_zone_rows_on() && lz_zone_rows(scope_zone, NULL) > 0) {
+                /* ZONE ROWS: the members are already indexed, in the same
+                 * ascending order the filter produced, so the walk list and
+                 * the walk_hash are unchanged — only the two full passes are
+                 * gone. */
+                const uint32_t *zr = NULL;
+                int zcnt = lz_zone_rows(scope_zone, &zr);
+                uint32_t *arr = (uint32_t *)malloc((size_t)(zcnt ? zcnt : 1) * sizeof(uint32_t));
+                if (arr && zcnt > 0) {
+                    memcpy(arr, zr, (size_t)zcnt * sizeof(uint32_t));
+                    ord_own = arr; ord = arr; scope_n = zcnt;
+                    budget = zcnt;
+                    snprintf(rm, sizeof(rm), "%s", "scope+zone");
+                } else {
+                    free(arr);
+                    scope_bad = 1;
+                }
             } else if (r > 0) {
                 int cnt = 0;
                 for (int i = 0; i < nent; i++)
@@ -4753,8 +4852,10 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
                 "%s%d", rb ? "," : "", route_bk[rb]);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,\"examined\":%lld,\"roster\":%d,\"walk_hash\":%u,",
-            block_reads, items_scored, nent, us_per_item, budget, truncated, fallback, examined, roster_used, walk_hash);
+            "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,\"examined\":%lld,\"roster\":%d,\"roster_ready\":%d,\"roster_doors\":%d,\"route_k\":%d,\"roster_rows\":%d,\"walk_hash\":%u,",
+            block_reads, items_scored, nent, us_per_item, budget, truncated, fallback, examined, roster_used,
+            (g_roster && g_roster_n && g_roster_doors == g_anch_k) ? 1 : 0,
+            g_roster_doors, g_anch_k, g_roster_rows, walk_hash);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"totem\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
             totem.lit, totem.open, totem.shut, totem.replayed, (unsigned)WL_FREE, g_pair_n);
