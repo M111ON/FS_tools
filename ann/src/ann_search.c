@@ -741,6 +741,15 @@ static unsigned char *g_warm_flag = NULL;  /* [nent] 1 if entry is in a warm buc
 static int g_warm_flag_n = 0;
 static int g_warm_ord = 0;                 /* set by lz_mem_search: a warm path ran */
 static int g_amp_applied = 0;              /* entries whose bias was boosted (telemetry) */
+/* SOFT ZONE BIAS (2026-10-26, card tabbd47c5): `scope:"zone:N"` is a HARD
+ * filter — it replaces the walk, so an answer outside the zone is unreachable
+ * by construction. The soft arm keeps the route and only ADDS `bias` to the
+ * score of rows in that zone (the same contract graft's cluster bias has), so
+ * the global answer stays reachable and the ranking is nudged toward the zone.
+ * Request-set, request-scoped: g_soft_bias comes from the body, g_soft_zone is
+ * filled in by the scope resolver during the walk and cleared at walk start. */
+static float g_soft_bias = 0;   /* 0 = off */
+static int   g_soft_zone = -1;  /* zone id whose rows get the nudge */
 static int g_backward = 0;                 /* ANN_GRAFT_BACKWARD: expand candidates via in-edges */
 static int g_graft_buckets = 0;            /* ANN_GRAFT_BUCKETS: add graph-endorsed buckets to the anchor route */
 
@@ -1861,6 +1870,11 @@ static int lz_mem_search(const float *qv, int qd,
                          LZTotem *totem_out, int *fallback_out,
                          long long *examined_out, int *roster_out,
                          unsigned *walk_hash_out) {
+    /* per-walk: take the request's bias, clear the global so a later caller
+     * (batch, another thread) can never inherit it */
+    float soft_bias_req = g_soft_bias;
+    g_soft_bias = 0.0f;
+    g_soft_zone = -1;   /* the scope resolver sets it, the walk clears it */
     if (examined_out) *examined_out = 0;
     if (roster_out) *roster_out = 0;
     if (walk_hash_out) *walk_hash_out = 0;
@@ -2012,7 +2026,15 @@ static int lz_mem_search(const float *qv, int qd,
             int scope_tag = -1, scope_zone = -1;
             int r = lz_scope_resolve(ents, nent, scope, topk, spat, sizeof(spat),
                                      NULL, NULL, &scope_tag, &scope_zone);
-            if (r > 0) {
+            /* SOFT ZONE: the caller asked for a nudge, not a filter. Only a
+             * zone has enough rows for this to be meaningful (a file/kind
+             * group with 40 rows would just be a wider filter). The walk is
+             * left alone, so every row stays reachable and work is unchanged;
+             * what moves is the ranking. */
+            if (r == 4 && soft_bias_req > 0) {
+                g_soft_zone = scope_zone;
+                snprintf(rm, sizeof(rm), "%s", "soft+zone");
+            } else if (r > 0) {
                 int cnt = 0;
                 for (int i = 0; i < nent; i++)
                     if ((r == 1 && strcmp(ents[i].file, spat) == 0) ||
@@ -2062,7 +2084,9 @@ static int lz_mem_search(const float *qv, int qd,
          * A FRESH index (no anchors yet, so no route) is NOT dead — it
          * simply has not been regrowed. */
         if (route_ok) dead_route = stamps_route_dead(nent);
-        if (dead_route && !scope_n && !scope_bad) {
+        /* a soft-zone request keeps its label: the route being dead does not
+         * change which rows the request may reach (it never filtered) */
+        if (dead_route && !scope_n && !scope_bad && g_soft_zone < 0) {
             rm[0] = 'd'; rm[1] = 'e'; rm[2] = 'a'; rm[3] = 'd';
             rm[4] = '-'; rm[5] = 'r'; rm[6] = 'o'; rm[7] = 'u';
             rm[8] = 't'; rm[9] = 'e'; rm[10] = '\0';
@@ -2411,6 +2435,8 @@ static int lz_mem_search(const float *qv, int qd,
                 /* count only entries whose bias was actually multiplied */
                 if (warm && g_amp_boost && b != 0.0f) g_amp_applied++;
             }
+            if (g_soft_zone >= 0 && g_ent_zone && g_ent_zone[ei] == g_soft_zone)
+                sc += (double)soft_bias_req;
             scored++;
             for (int ti = 0; ti < topk; ti++) {
                 if (sc > top_sc[ti]) {
@@ -4481,6 +4507,16 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             scp++;
             lz_json_unescape(scope_buf, (int)sizeof(scope_buf), scp);
         }
+    }
+    /* SOFT ZONE BIAS (card tabbd47c5): `bias` turns scope:"zone:N" from a
+     * filter into a nudge. Bounded so a caller cannot reorder the whole answer
+     * (cosine gaps between real neighbours are 0.01-0.05; 0.5 would drown
+     * them). 0 = off, which is exactly the old hard-filter behaviour. */
+    {
+        const char *bp = lz_json_val(bd3, "bias");
+        g_soft_bias = bp ? (float)atof(bp) : 0.0f;
+        if (g_soft_bias < 0.0f) g_soft_bias = 0.0f;
+        if (g_soft_bias > 0.5f) g_soft_bias = 0.5f;
     }
     if (stopk < 1) stopk = 1;
     if (stopk > ANN_MAXK) {
