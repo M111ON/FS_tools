@@ -250,7 +250,7 @@ def spawn(paths, log, port, exe, warm, pair, budget, buckets, extra=None):
         "ANN_ORDER_PATH": order,
         "ANN_ROUTE_LOG": log,
         "ANN_PORT": str(port),
-        "ANN_TOMBSTONE_WARM": "1" if warm else "0",
+        "ANN_TOTEM_WARM": "1" if warm else "0",
         "ANN_PAIR": pair,
         "LZ_SEARCH_BUDGET": str(budget),
         "LZ_ROUTE_BUCKETS": str(buckets),
@@ -309,7 +309,7 @@ def run_pass(port, vecs, K):
             "fall": int(rt.get("fallback", 0)),
             "mode": rt.get("mode", "?"),
             "buckets": rt.get("buckets", []),
-            "pair": (rt.get("fog") or {}).get("pair", -1),
+            "pair": (rt.get("totem") or {}).get("pair", -1),
             "ms": ms,
             "sids": [x.get("sid") for x in (o.get("hits") or [])],
         })
@@ -426,7 +426,7 @@ def main():
                 os.remove(log)
             port = free_port()
             p, h = spawn(paths, log, port, args.exe, warm, pair, args.budget, args.buckets)
-            pair_n = (h.get("fog") or {}).get("pair", -1)
+            pair_n = (h.get("totem") or {}).get("pair", -1)
             try:
                 rows = run_pass(port, SEQ, K)
             finally:

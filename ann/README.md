@@ -11,6 +11,15 @@ GET  /health
 No GGUF, no llama, no model in-process. The embedder is an external sidecar
 (llama-server `/embedding`, `multilingual-e5-small`, 384-dim) reached over HTTP.
 
+## Naming (2026-10-26)
+
+The record that a door was walked is a **totem** — a marker planted at the door
+meaning "this way was walked". It is NOT a deletion marker. The word
+`tombstone` is retired (it read as "this data is deleted" and caused the same
+misreading in several sessions). The store is the **totem latch**
+(`g_totem`, `lz_totem_*`, `/health` → `totem`, env `ANN_TOTEM_WARM`); the latch
+primitive keeps its own state words, **open / shut** (`wl_is_open`).
+
 ## Layout
 
 ```
@@ -62,7 +71,7 @@ curl -s -X POST -H "Content-Type: application/json" \
 | `ANN_INDEX_PATH` | `data/ann_index.jsonl` | vector index |
 | `ANN_ANCH_PATH` | `data/ann_anchors.bin` | trained centroids |
 | `ANN_ORDER_PATH` | `data/ann_index.order` | bucket-major placement perm |
-| `ANN_ROUTE_LOG` | `data/lz_route.log` | tombstone (P3) log — **must be a native Windows path** |
+| `ANN_ROUTE_LOG` | `data/lz_route.log` | totem (P3) log — **must be a native Windows path** |
 | `ANN_PORT` | `8096` | listen port (or `--serve N`) |
 | `LZ_ROUTE_BUCKETS` | auto (`topk+4`) | buckets walked |
 | `LZ_SEARCH_BUDGET` | index size | candidate budget |
@@ -77,7 +86,7 @@ curl -s -X POST -H "Content-Type: application/json" \
  "route":{"mode":"anchor","buckets":[2,4,3,7,1,0,6],
           "block_reads":1,"items_scored":2881,"items_total":2881,
           "us_per_item":31.99,"budget":2881,"truncated":1,"fallback":0,
-          "fog":{"lit":7,"open":10359,"shut":7,"replayed":25,"free":10366}}}
+          "totem":{"lit":7,"open":10359,"shut":7,"replayed":25,"free":10366}}}
 ```
 
 `topk` is fail-loud: `> ANN_MAXK` (32) returns `400 topk_out_of_range`, never a
@@ -170,7 +179,7 @@ ANN_GRAFT=1 ANN_GRAFT_LAMBDA=0.02 ./build/ann_search.exe --serve 8096
 | `ANN_GRAFT_LAMBDA` | `0.05` | bias strength (0 = off) |
 | `ANN_GRAFT_MAXN` | `4` | max file keys per entry |
 | `ANN_GRAFT_DIR` | `data/graft` | tables dir |
-| `ANN_AMP_BOOST` | `0` | tombstone × graft amplifier: multiply the bias of warm-bucket entries (needs `ANN_GRAFT=1` + `ANN_TOMBSTONE_WARM=1`) |
+| `ANN_AMP_BOOST` | `0` | totem × graft amplifier: multiply the bias of warm-bucket entries (needs `ANN_GRAFT=1` + `ANN_TOTEM_WARM=1`) |
 | `ANN_AMP_K` | `2.0` | warm-bucket weight multiplier |
 | `ANN_GRAFT_CAND` | index size | cap on graph-proposed candidates in the train-free route |
 | `ANN_GRAFT_BACKWARD` | `0` | expand graph candidates via in-edges (files that point at the query's file) |
@@ -187,23 +196,23 @@ k) lives in `data/graft/bias.json` — change it there and re-run, no rebuild.
 share in top-10 rose 0.395 → 0.83 at λ=0.05, but the top-10 order also
 changed ~44% — λ=0.02 is the conservative point (+22% cluster, 22% reorder).
 
-**Tombstone is the amplifier — now wired and measured.** This bias is the
-*structural* axis (which code a query is about — static, baked). The fog latch /
-tombstone is the *hot/cold* axis (which routes were just walked — changes per
+**Totem is the amplifier — now wired and measured.** This bias is the
+*structural* axis (which code a query is about — static, baked). The totem latch /
+totem is the *hot/cold* axis (which routes were just walked — changes per
 query). They now **compose**: with `ANN_AMP_BOOST=1`, an entry that sits in a
-bucket the tombstone kept warm has its graft bias **multiplied by `ANN_AMP_K`**
+bucket the totem kept warm has its graft bias **multiplied by `ANN_AMP_K`**
 (default 2.0). The boost multiplies the bias only — never the cosine score — so
 with either axis off it is a strict no-op and recall is untouched.
 
-Measured (57k memcore index, `ANN_GRAFT=1 ANN_TOMBSTONE_WARM=1 LZ_ROUTE_BUCKETS=5`,
+Measured (57k memcore index, `ANN_GRAFT=1 ANN_TOTEM_WARM=1 LZ_ROUTE_BUCKETS=5`,
 warm pass): a warm route scores the same items, but the multiplier promotes the
 warm cluster — `route.amp.applied` = 87 entries, and warm entries climb into the
 top-5 on 3/5 path-bearing queries (e.g. `cf764fd707`, `404ad7b548`). Off by
 default; keep the two switches independent.
 
-## Tombstone warm path (hot/cold axis) — OPTIONAL, OFF by default
+## Totem warm path (hot/cold axis) — OPTIONAL, OFF by default
 
-`ANN_TOMBSTONE_WARM=1` makes the walk read the fog latch before walking: buckets
+`ANN_TOTEM_WARM=1` makes the walk read the totem latch before walking: buckets
 already SHUT (walked by an earlier query) are scored first, then the scan stops
 after them. An overlapping query scores fewer items with the **same top-k**; a
 novel query is unchanged. Inert at `topk>=3` on the 57k index (the route already
@@ -295,7 +304,7 @@ remaining Thai holes, control/whitespace → space. It is the C twin of
 Measured: raw `ระบบนี้ทำงานยังไง` → sidecar **500**; sanitized → **200**. English
 top-1 unchanged (`51b0fc3f…`), so no ranking regression.
 
-Next levers live upstream and are ported on demand: tombstone warm path, maze
+Next levers live upstream and are ported on demand: totem warm path, maze
 refine layer. Do not raise `ANCHR_MAXK` expecting pruning — measured negative.
 
 ## Batch endpoint: `POST /v1/state/search-batch` (2026-10-20)

@@ -174,11 +174,11 @@ def _start_ann():
                LZ_EMBED_HOST="127.0.0.1", LZ_EMBED_PORT=str(EMBED_PORT),
                ANN_INDEX_PATH=idx, ANN_ANCH_PATH=anch,
                ANN_ORDER_PATH=order, ANN_ROUTE_LOG=log,
-               # tombstone warm path (env ANN_TOMBSTONE_WARM, default 0 in the
+               # totem warm path (env ANN_TOTEM_WARM, default 0 in the
                # server): fires ONLY when the route covers less than the
                # budget (WARM-PATH.md hot/cold rule). Default ON here —
                # the cover-vs-budget rule still gates it per query.
-               ANN_TOMBSTONE_WARM=os.environ.get("ANN_TOMBSTONE_WARM", "1"),
+               ANN_TOTEM_WARM=os.environ.get("ANN_TOTEM_WARM", "1"),
                # float kernel (env ANN_FLOAT_KERNEL, default OFF in the
                # server): pure-float 4-acc lz_dotf + per-entry reciprocal
                # premul. Measured on this box: 353.9 -> 242.4 ns/dot on 24k x
@@ -199,7 +199,7 @@ def _start_ann():
                 LZ_SEARCH_BUDGET=os.environ.get("LZ_SEARCH_BUDGET", "24000"),
                 ANN_WALK_PRUNE=os.environ.get("ANN_WALK_PRUNE", "1"),
                 ANN_WALK_FLOOR=os.environ.get("ANN_WALK_FLOOR", "0.5"),
-                # TOMBSTONE DOOR (env ANN_DOOR, default OFF = the pre-door
+                # TOTEM DOOR (env ANN_DOOR, default OFF = the pre-door
                 # behaviour, byte-identical). Measured live on 2026-10-20
                 # (300 real queries vs a numpy oracle, forced below-floor):
                 # recall@5 1.0000 both arms, 300/300 paired equal — so it is

@@ -77,7 +77,7 @@ r = √3 = the ⌀2 semicircle intersections. `core/isometric_map.h:106` `IM_CRO
    whether the 3-pair collapse is legal). `tools/pattern_probe.c:163`
    `FACE_ID(a,d) = a*6+d` + the 6-bit face mask is the starting point.
 4. **3-pair id-space decision** — 72 vs 144 ids per anchor, and whether the
-   **1-bit fingerprint** (which end of the hourglass was walked = tombstone) is kept.
+   **1-bit fingerprint** (which end of the hourglass was walked = totem) is kept.
    Pool math that forces the choice: wang6 + 3 gen = **5,440 anchors**; 6 faces and
    anchor = **32,640 > 10,368** pool ⇒ unaffordable; 1 bit and anchor =
    **5,440 ≤ 10,368** ⇒ affordable.

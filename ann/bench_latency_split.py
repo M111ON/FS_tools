@@ -37,7 +37,7 @@ def call(port, body, timeout=120):
     return (time.perf_counter() - t0) * 1000.0, d
 
 
-QUERIES = ["tesspack format", "tombstone warm path", "hex address", "wang latch",
+QUERIES = ["tesspack format", "totem warm path", "hex address", "wang latch",
            "hyperbolic scale", "GGUF bake", "SIFT recall", "frustum composite"]
 
 

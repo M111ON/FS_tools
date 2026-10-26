@@ -1,4 +1,4 @@
-# HANDOFF-2026-10-20-ann-isolate.md — Apple-Tree ANN isolation (A: perm-sidecar, B: tombstone door)
+# HANDOFF-2026-10-20-ann-isolate.md — Apple-Tree ANN isolation (A: perm-sidecar, B: totem door)
 
 **Root:** `I:/tools/ann` (git root `I:/tools`, branch `main`, remote `origin=https://github.com/M111ON/FS_tools.git`)
 **HEAD:** `d48bc08` — pushed to `origin/main` this session (9 commits: `a63e9b5..d48bc08`)
@@ -11,7 +11,7 @@
 
 ### Architecture decision (user-approved via clarify)
 - **Root = `I:/tools/ann` ONLY.** `DWGLS-native-fs` stays the address-layer library (20736/CAPO/frustum/metatron headers); the live search server is the ann fork. No bidirectional porting; thin include shims only if later needed.
-- Adopted the user's Apple-Tree architecture: **apple (payload row) never moves; branch (anchor/perm sidecar) moves; tombstone = door to its bucket's members; graft = fail-loud fallback.**
+- Adopted the user's Apple-Tree architecture: **apple (payload row) never moves; branch (anchor/perm sidecar) moves; totem = door to its bucket's members; graft = fail-loud fallback.**
 
 ### [A] perm-sidecar isolate — commit `00d60c5`
 - **Problem:** incremental regrow rewrote `ann_index.jsonl` (~222 MB text, `fprintf %.6g`) on every append → 62–78 s of pure I/O on the hot path, plus the historical 70+ s full regrow the user flagged.
@@ -19,9 +19,9 @@
 - Full path unchanged (may rewrite jsonl — declared in the code comment).
 - **Measured:** unchanged fast path **1 ms** (from 62–78 s); append regrow mode=`incremental`, jsonl stat delta **0 bytes** on the regrow itself; anchor/ord/perm files unchanged in format (`ORDR`/`RCNA` headers untouched — H2 pair binding intact).
 
-### [B] tombstone DOOR — commit `d48bc08`
-- **Problem:** below-floor fallback (ANN_WALK_PRUNE top score < floor) went straight to a full scan; the shut-tombstone buckets (already-paid walks) were not used as an entry point.
-- **Change (env `ANN_DOOR=1`, default OFF = byte-identical):** when the walked set scores below floor and the query's routed buckets contain a **SHUT** tombstone, the walk order is rebuilt bucket-major **door-first** (members of the shut bucket, then the other routed buckets, then everything else — recall cannot drop, only ordering moves). Mode label reports **`door`**.
+### [B] totem DOOR — commit `d48bc08`
+- **Problem:** below-floor fallback (ANN_WALK_PRUNE top score < floor) went straight to a full scan; the shut-totem buckets (already-paid walks) were not used as an entry point.
+- **Change (env `ANN_DOOR=1`, default OFF = byte-identical):** when the walked set scores below floor and the query's routed buckets contain a **SHUT** totem, the walk order is rebuilt bucket-major **door-first** (members of the shut bucket, then the other routed buckets, then everything else — recall cannot drop, only ordering moves). Mode label reports **`door`**.
 - One-shot: after a door pass, `full2=1` so a repeat below floor falls through to the existing full scan (graft/full2 remains the fail-loud final fallback; graft soft-bias unchanged).
 - **Gotcha found and encoded (probed 2026-10-20 with ANN_DOOR_TRACE):** bucket 0 maps to wl-id 0 = `WL_RESERVED_LO`; `wl_traverse` refuses reserved ids, so **bucket 0 can never shut** — the door picks the FIRST routed bucket that is actually shut, not blind `rb[0]`.
 - Debug: `ANN_DOOR_TRACE=1` prints up to 8 `[fallback-trace]`/`[door-trace]` lines to stderr.
@@ -29,7 +29,7 @@
 
 ### Tests added
 - `tests/test_perm_isolate.py` — P1 fresh full / P2 append incremental + **jsonl size & mtime untouched by the regrow** / P3 sidecar size `n*8` / P4 unchanged fast path / P5 anchor-mode search + routed health. Port-independent, scratch server on `ANN_PORT=8097` ONLY.
-- `tests/test_door_path.py` — D1 OFF=pruned-family label, D3 forced-fallback lands `door` (second call of the same query: first call shuts the tombstone, second takes the door), top-5 overlap vs OFF, D4 fallback telemetry. Scratch port 8097 only.
+- `tests/test_door_path.py` — D1 OFF=pruned-family label, D3 forced-fallback lands `door` (second call of the same query: first call shuts the totem, second takes the door), top-5 overlap vs OFF, D4 fallback telemetry. Scratch port 8097 only.
 - `tests/test_vec_format.py` — **pre-existing failure fixed** (not caused by [A]/[B]; proven by stash-run): pin `abs(o_bin-1.0) < 1e-9` contradicted the file's own docstring ("top-10 overlap vs the store oracle 99.93%"); the strict pin was killed by 5e-7 near-ties inside top-10 sets (stable 0.99967–0.99970). Now pinned `< 1e-3` with an explanatory comment; the exactness contract remains on `float32 ranking == text ranking` (1e-9).
 
 ### Fixes kept from earlier today (in this push)
@@ -45,11 +45,11 @@
 POST /v1/state/search          {"query": str, "k": n}  (or {"vec":[...]} to skip the sidecar embedder)
 POST /v1/state/search-batch    {"queries": [...], "k": n}     ← additive, telemetry.took_ms/embed_ms
 POST /v1/state/regrow          {}  (unchanged fast) | {"force":1} (full)
-GET  /health                   status/embed/entries/routed/fog
+GET  /health                   status/embed/entries/routed/totem
 ```
 Env (all additive; defaults = previous behavior):
 `ANN_PORT`, `ANN_INDEX_PATH`, `ANN_ANCH_PATH`, `ANN_ORDER_PATH`, `ANN_ROUTE_LOG`,
-`ANN_TOMBSTONE_WARM=1`, `ANN_FLOAT_KERNEL=1`, `ANN_WALK_PRUNE=1`,
+`ANN_TOTEM_WARM=1`, `ANN_FLOAT_KERNEL=1`, `ANN_WALK_PRUNE=1`,
 `**ANN_DOOR=1**` (new, default OFF), `ANN_DOOR_TRACE=1` (stderr debug),
 `LZ_SEARCH_BUDGET`/`_FRAC`, `LZ_ROUTE_BUCKETS`, `ANN_GRAFT*`.
 
@@ -80,7 +80,7 @@ Files on disk (data/memcore/):
 ## 5. DECISIONS MADE (and why)
 
 - Door does NOT hard-require graft. Graft stays a soft score bias + the walk's graph proposals; per the user, graft is the *fail-loud* fallback when door/route both cold — implemented as: door reorders (recall-safe), full2 scan (the existing confidence-fallback machinery) is the last resort; a door that finds no shut bucket leaves the code path so `anchor+full` still fires. NO silent path was added.
-- `bucket 0` is structurally unhittable by tombstones (reserved id) — door skips it by rule, matching the walk's own refusal.
+- `bucket 0` is structurally unhittable by totems (reserved id) — door skips it by rule, matching the walk's own refusal.
 - Full jsonl rewrite still exists only via the FULL regrow path (may later become `/v1/admin/compact`; not built — no caller wanted it yet).
 
 ## 6. OPEN ITEMS (not hidden — owned)

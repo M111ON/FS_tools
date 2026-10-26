@@ -5,7 +5,7 @@
  * WHAT THIS IS
  *   A minimal HTTP server that answers POST /v1/state/search over a
  *   build/ann_index.jsonl vector index, using the anchor-bucket route +
- *   geo_wang_latch tombstone from DWGLS. It is the SEARCH half of
+ *   geo_wang_latch totem from DWGLS. It is the SEARCH half of
  *   tools/gguf_lazy_serve.c, extracted whole and cut free of every GGUF /
  *   llama / model-load dependency. No llama.h, no ggml, no backend DLLs, no
  *   .gguf file: the embedder is an EXTERNAL sidecar reached over HTTP.
@@ -594,16 +594,16 @@ static float *lz_embed_batch(const char * const *qs, int nq, float *out,
     return out;
 }
 
-/* ── fog latch over the anchor-bucket space (from L219-256) ──
+/* ── totem latch over the anchor-bucket space (from L219-256) ──
  * The ROUTE WALKED is what shuts the latch. Buckets collapse to a wang-latch
  * cell = (pair << 1) | end (wl_cell_of) — 144 cells whose low bit is the
  * hourglass end, so the centre crossing is one XOR (wl_cell_cross). Reload
  * from the P3 route log on boot. */
-static wl_latch_t g_fog;
-static int g_fog_ready = 0;
-static wl_log_t g_fog_log;
-static int g_fog_log_open = 0;
-static int g_fog_replayed = 0;
+static wl_latch_t g_totem;
+static int g_totem_ready = 0;
+static wl_log_t g_totem_log;
+static int g_totem_log_open = 0;
+static int g_totem_replayed = 0;
 /* partner policy: 2 = centroid table (default, G2.6), 1 = legacy cell^1
  * parity (kept only so the A/B can measure what the parity choice cost),
  * 0 = own bucket only. Env ANN_PAIR selects; default is centroid. */
@@ -612,20 +612,20 @@ static int g_pair_mode = 2;
  * would score (measured 2026-10-26 — see the gate in lz_mem_search). 100 = the
  * cut can never fire; 0 = unbounded (the pre-2026-10-26 behaviour). */
 static int g_warm_keep_pct = 90;
-typedef struct { int open; int shut; int lit; int replayed; } LZFog;
-static int g_warm_on = 0;       /* tombstone warm path (env ANN_TOMBSTONE_WARM) */
-static void lz_fog_init(void) {
-    memset(&g_fog, 0, sizeof(g_fog));
-    wl_reset(&g_fog);
+typedef struct { int open; int shut; int lit; int replayed; } LZTotem;
+static int g_warm_on = 0;       /* totem warm path (env ANN_TOTEM_WARM) */
+static void lz_totem_init(void) {
+    memset(&g_totem, 0, sizeof(g_totem));
+    wl_reset(&g_totem);
     const char *lp = PATH_LOG;
     long replayed = 0;
-    if (lp && lp[0]) replayed = wl_replay_log_file(&g_fog, lp);
-    g_fog_replayed = (int)(replayed > 0 ? replayed : 0);
+    if (lp && lp[0]) replayed = wl_replay_log_file(&g_totem, lp);
+    g_totem_replayed = (int)(replayed > 0 ? replayed : 0);
     if (lp && lp[0]) {
-        g_fog_log_open = (wl_log_open(&g_fog_log, lp) == 0);
+        g_totem_log_open = (wl_log_open(&g_totem_log, lp) == 0);
     }
-    g_fog_ready = 1;
-    const char *we = getenv("ANN_TOMBSTONE_WARM");
+    g_totem_ready = 1;
+    const char *we = getenv("ANN_TOTEM_WARM");
     g_warm_on = (we && atoi(we)) ? 1 : 0;
     /* partner policy: "centroid" (default) | "parity" | "own" */
     { const char *pe = getenv("ANN_PAIR");
@@ -641,7 +641,7 @@ static void lz_fog_init(void) {
           if (v >= 0 && v <= 100) g_warm_keep_pct = v;
       } }
 }
-static inline uint32_t lz_fog_id(int bucket) {
+static inline uint32_t lz_totem_id(int bucket) {
     /* choice 1, not 0: wl_id(cell,0) for cell 0 is WL_RESERVED_LO, which the
      * latch refuses — bucket 0 could never shut (see wl_bucket_id). */
     return wl_bucket_id(bucket);
@@ -658,12 +658,12 @@ static inline uint32_t lz_fog_id(int bucket) {
 static int g_pair[ANCHR_MAXK];
 static int g_pair_n = 0;
 static int lz_pair_of(int bucket);
-static inline int lz_fog_shut(int bucket) {
-    if (!wl_is_open(&g_fog, lz_fog_id(bucket))) return 1;
+static inline int lz_totem_shut(int bucket) {
+    if (!wl_is_open(&g_totem, lz_totem_id(bucket))) return 1;
     int p = -1;
     if (g_pair_mode == 1)      p = (int)wl_cell_cross(wl_cell_of(bucket));
     else if (g_pair_mode == 2) p = lz_pair_of(bucket);
-    return (p >= 0 && p != bucket && !wl_is_open(&g_fog, lz_fog_id(p))) ? 1 : 0;
+    return (p >= 0 && p != bucket && !wl_is_open(&g_totem, lz_totem_id(p))) ? 1 : 0;
 }
 
 /* ── anchor-bucket routing over the index ── */
@@ -687,7 +687,7 @@ static int g_topb = LZ_OVERLAP_TOPB;
 #define LZ_SEARCH_BUDGET_FRAC_DEF 0.40
 #define ANN_MAXK 32   /* standalone topk bound (original serve: 8) */
 
-/* partner table body (declared above lz_fog_shut; see the comment there) */
+/* partner table body (declared above lz_totem_shut; see the comment there) */
 static int lz_pair_of(int bucket) {
     if (bucket < 0 || bucket >= g_pair_n || bucket >= ANCHR_MAXK) return -1;
     return g_pair[bucket];
@@ -727,14 +727,14 @@ static int g_qkeys[16], g_qn = 0;          /* query-side file keys, per request 
 static int g_graft_ready = 0;              /* bias tables loaded (or off) */
 static void graft_ensure_init(void);       /* loads the tables once */
 
-/* ── tombstone × graft amplifier ──────────────────────────────────────
- * The tombstone (fog latch) is the hot/cold axis: it knows which entries sit
+/* ── totem × graft amplifier ──────────────────────────────────────
+ * The totem (totem latch) is the hot/cold axis: it knows which entries sit
  * in a bucket this query just walked warm. The graft bias is the structural
  * axis: a static weight toward the query's file cluster. Composed, a WARM
- * entry — one whose bucket the tombstone already shut — may carry a STRONGER
+ * entry — one whose bucket the totem already shut — may carry a STRONGER
  * structural weight, because a route we keep hot is the route we trust.
  * The boost MULTIPLIES the graft bias only (never the cosine score), so with
- * the tombstone off or the graft bias off it is a strict no-op. */
+ * the totem off or the graft bias off it is a strict no-op. */
 static int  g_amp_boost = 0;               /* ANN_AMP_BOOST (default 0 = off) */
 static float g_amp_k = 2.0f;               /* ANN_AMP_K, warm-bucket weight multiplier */
 static unsigned char *g_warm_flag = NULL;  /* [nent] 1 if entry is in a warm bucket */
@@ -1044,7 +1044,7 @@ typedef struct {
     long buckets_visited, buckets_shut, buckets_skipped, note_events;
     long scored_sum, nent_last, budget_last, trunc;
     long note_bytes, note_records;
-    double boot_ms, boot_fog_ms, reassign_ms;
+    double boot_ms, boot_totem_ms, reassign_ms;
     long reassign_rows;
     int k_last;
 } LZCanary;
@@ -1738,7 +1738,7 @@ static int lz_mem_search(const float *qv, int qd,
                          char route_mode[16], int route_bk[], int *route_nb_out,
                          int *block_reads_out, int *items_scored_out, int *nent_out,
                          int *budget_out, int *truncated_out, double *us_per_item_out,
-                         LZFog *fog_out, int *fallback_out) {
+                         LZTotem *totem_out, int *fallback_out) {
     if (top_sc) for (int ti = 0; ti < ANN_MAXK; ti++) top_sc[ti] = -2;
     if (top_sid) for (int ti = 0; ti < ANN_MAXK; ti++) top_sid[ti][0] = '\0';
     if (top_file) for (int ti = 0; ti < ANN_MAXK; ti++) top_file[ti][0] = '\0';
@@ -1873,7 +1873,7 @@ static int lz_mem_search(const float *qv, int qd,
          * the scope answers a NARROWER question on purpose (recall@5 vs the
          * global oracle is 0.44 fine / 0.70 kind against the route's 0.91):
          * this is a scope selector, never a substitute for global search.
-         * It never touches the route: no buckets, no tombstone latch, no
+         * It never touches the route: no buckets, no totem latch, no
          * order sidecar — the group is derived from the rows themselves, so
          * it cannot drift from the index (the positional-sidecar hazard the
          * 2026-10-20 fixes had to chase). A scope that resolves to nothing
@@ -1942,7 +1942,7 @@ static int lz_mem_search(const float *qv, int qd,
         if (scope_n > 0 || scope_bad) {
             /* the scoped walk (or the fail-loud empty walk) is final: the
              * route layer is skipped entirely, so no bucket is routed, no
-             * tombstone latch is shut and the order sidecar is not read. */
+             * totem latch is shut and the order sidecar is not read. */
         } else if (route_ok && !dead_route) {
             C = g_anch_cache; ord = g_ord_cache; K = g_anch_k;
             int topb;
@@ -1957,7 +1957,7 @@ static int lz_mem_search(const float *qv, int qd,
             rnb = anch_route(qv, C, K, qd, topb, rb);
             routed = 1;
             snprintf(rm, sizeof(rm), "%s", "anchor");
-            if (!g_fog_ready) lz_fog_init();
+            if (!g_totem_ready) lz_totem_init();
 
             /* graph + anchor: the trained route picks buckets by vector
              * geometry; the file graph knows the query's STRUCTURAL cluster.
@@ -2018,7 +2018,7 @@ static int lz_mem_search(const float *qv, int qd,
                 }
             }
 
-            /* ── tombstone warm path (env ANN_TOMBSTONE_WARM=1) ──────────
+            /* ── totem warm path (env ANN_TOTEM_WARM=1) ──────────
              * Read the latch BEFORE walking: a bucket walked by an earlier
              * query is SHUT. Order the walk so entries in SHUT buckets are
              * scored first, then stop after them (budget = their count). This
@@ -2028,12 +2028,12 @@ static int lz_mem_search(const float *qv, int qd,
              * (no reduction); the gain appears when a query's route OVERLAPS
              * previously-walked buckets. Measured — see WARM-PATH.md.
              * The warm set is also handed to the graft bias (below) as the
-             * "tombstone × graft" amplifier. */
+             * "totem × graft" amplifier. */
             if (g_warm_on && rnb > 0) {
                 int shut[LZ_ANCH_MAXK];
                 int nshut = 0;
                 for (int i = 0; i < rnb; i++) {
-                    shut[i] = lz_fog_shut(rb[i]);
+                    shut[i] = lz_totem_shut(rb[i]);
                     if (shut[i]) nshut++;
                 }
                 cy_nb_shut = nshut;
@@ -2112,21 +2112,21 @@ static int lz_mem_search(const float *qv, int qd,
              * walk is a no-op, not a log record — otherwise the P3 log grows
              * without bound on repeat queries. */
             for (int rbi = 0; rbi < rnb; rbi++) {
-                uint32_t fid = lz_fog_id(rb[rbi]);
-                if (wl_is_open(&g_fog, fid)) {
-                    wl_traverse_log(&g_fog, fid,
-                                    g_fog_log_open ? &g_fog_log : NULL);
+                uint32_t fid = lz_totem_id(rb[rbi]);
+                if (wl_is_open(&g_totem, fid)) {
+                    wl_traverse_log(&g_totem, fid,
+                                    g_totem_log_open ? &g_totem_log : NULL);
                     cy_notes++;
                 }
             }
-            if (g_fog_log_open && g_fog_log.fp) fflush(g_fog_log.fp);
+            if (g_totem_log_open && g_totem_log.fp) fflush(g_totem_log.fp);
         } else {
             /* no trained anchor route (or dim mismatch): the file-relationship
              * graph draws a rough map. If the query names files the graph knows,
              * score only the entries the graph proposes (guided subset) instead
              * of the whole index. Falls back to a full scan when the graph
              * cannot propose — so a novel query keeps exact behaviour. This is
-             * the "train-free" route: structure proposes, the tombstone pins. */
+             * the "train-free" route: structure proposes, the totem pins. */
             int gcap = nent;
             { const char *gc = getenv("ANN_GRAFT_CAND");
               if (gc && atoi(gc) > 0) gcap = atoi(gc); }
@@ -2220,8 +2220,8 @@ static int lz_mem_search(const float *qv, int qd,
             /* Confident Guideline: a soft cluster bias (never a filter). It only
              * ADDS to the score, so recall cannot drop; ranking is nudged toward
              * structurally-related entries. Off unless ANN_GRAFT=1.
-             * Tombstone × graft amplifier: if this entry sits in a bucket the
-             * tombstone kept warm, its structural weight is multiplied. */
+             * Totem × graft amplifier: if this entry sits in a bucket the
+             * totem kept warm, its structural weight is multiplied. */
             if (g_graft_on) {
                 int warm = (g_warm_ord && g_warm_flag && ei < g_warm_flag_n) ? g_warm_flag[ei] : 0;
                 float b = graft_bias(&ents[ei], g_qkeys, g_qn, warm);
@@ -2262,11 +2262,11 @@ static int lz_mem_search(const float *qv, int qd,
         /* confidence fallback: pruned top below floor -> full scan once */
         if (walk_prune && !full2 && !scope_n && !scope_bad &&
             walk_floor > 0.0 && top_sc[0] < walk_floor) {
-            /* ── TOMBSTONE DOOR (env ANN_DOOR=1, 2026-10-20) ─────────────
-             * The user's architecture: a tombstone that is SHUT is a pinned
+            /* ── TOTEM DOOR (env ANN_DOOR=1, 2026-10-20) ─────────────
+             * The user's architecture: a totem that is SHUT is a pinned
              * door to its bucket's members ("apple fruit mini db"). When the
              * walk scores below the floor AND the query's top bucket is a
-             * KNOWN shut tombstone, jump straight to that bucket's members
+             * KNOWN shut totem, jump straight to that bucket's members
              * first (walk order = bucket-major built from ord) and only
              * spill to the full scan if the door scores below the floor
              * too. GRAFT stays the fail-loud final fallback (the existing
@@ -2285,16 +2285,16 @@ static int lz_mem_search(const float *qv, int qd,
             if (door && routed && rnb > 0 && ord) {
                 free(pmem); pmem = NULL;
                 free(pseen); pseen = NULL;
-                /* pick the FIRST routed bucket whose tombstone is actually
-                 * SHUT (own tombstone only — the door follows the bucket the
+                /* pick the FIRST routed bucket whose totem is actually
+                 * SHUT (own totem only — the door follows the bucket the
                  * latch shut, not its centroid partner). Bucket 0 used to map
                  * to wl id 0 = WL_RESERVED_LO and could never shut (probed
-                 * 2026-10-20); lz_fog_id now uses choice 1 (wl_bucket_id), so
+                 * 2026-10-20); lz_totem_id now uses choice 1 (wl_bucket_id), so
                  * every bucket is minor-latchable. */
                 int dbk = -1;
                 for (int ri = 0; ri < rnb; ri++) {
-                    uint32_t fi = lz_fog_id(rb[ri]);
-                    if (!wl_is_open(&g_fog, fi)) { dbk = rb[ri]; break; }
+                    uint32_t fi = lz_totem_id(rb[ri]);
+                    if (!wl_is_open(&g_totem, fi)) { dbk = rb[ri]; break; }
                 }
                 if (dbk >= 0) {                          /* a shut door found */
                     pmem2 = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
@@ -2502,17 +2502,17 @@ static int lz_mem_search(const float *qv, int qd,
     if (truncated_out) *truncated_out = truncated;
     if (fallback_out) *fallback_out = fallback;
     if (us_per_item_out) *us_per_item_out = us_per_item;
-    if (fog_out) {
-        if (!g_fog_ready) lz_fog_init();
+    if (totem_out) {
+        if (!g_totem_ready) lz_totem_init();
         int sh = 0;
         for (unsigned wi = 0; wi < WL_WORDS; wi++) {
-            uint64_t w = g_fog.w[wi];
+            uint64_t w = g_totem.w[wi];
             while (w) { sh += (int)(w & 1ull); w >>= 1; }
         }
-        fog_out->open = (int)WL_FREE - sh;
-        fog_out->shut = sh;
-        fog_out->lit = rnb;
-        fog_out->replayed = g_fog_replayed;
+        totem_out->open = (int)WL_FREE - sh;
+        totem_out->shut = sh;
+        totem_out->lit = rnb;
+        totem_out->replayed = g_totem_replayed;
     }
     if (qv) {
         const char *align = (rnb <= 0) ? "no-route"
@@ -2590,7 +2590,7 @@ static LZEntry *g_ents_ref = NULL;
  * entries to score. Per file key we gather the entries that carry it (CSR
  * below) plus the entries carrying a NEIGHBOUR file, and return the top
  * by structural score. This is "the graph draws a rough map" so the walk is
- * a guided subset, not an O(N) scan — the tombstone then pins the routes
+ * a guided subset, not an O(N) scan — the totem then pins the routes
  * actually walked. */
 static int *g_file_ent_off = NULL;    /* size g_file_nf+1: entries per file id */
 static int *g_file_ent_ids = NULL;    /* entry positions, grouped by file id */
@@ -2890,7 +2890,7 @@ static void graft_ensure_init(void) {
 /* soft bias for one entry: sum over the entry's file keys of the neighborhood
  * score of any key shared with the query's keys. Returns 0 when off/absent.
  * When `warm` and the amplifier is on, the result is scaled by g_amp_k — the
- * tombstone strengthens the structural weight of a route it keeps hot. */
+ * totem strengthens the structural weight of a route it keeps hot. */
 static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm) {
     if (!g_graft_on || !g_graft_ready || e->gn <= 0 || qn <= 0) return 0.0f;
     float best = 0.0f;
@@ -2906,7 +2906,7 @@ static float graft_bias(const LZEntry *e, const int *qkeys, int qn, int warm) {
             }
         }
     }
-    if (warm && g_amp_boost) best *= g_amp_k;   /* tombstone × graft amplifier */
+    if (warm && g_amp_boost) best *= g_amp_k;   /* totem × graft amplifier */
     return best;
 }
 
@@ -3912,10 +3912,10 @@ static int handle_health(sock_t cli) {
     LZEntry *ents = NULL; int nent = 0;
     lz_index_cached(&ents, &nent);
     int routed = lz_route_cached(nent);
-    if (!g_fog_ready) lz_fog_init();
+    if (!g_totem_ready) lz_totem_init();
     int sh = 0;
     for (unsigned wi = 0; wi < WL_WORDS; wi++) {
-        uint64_t w = g_fog.w[wi];
+        uint64_t w = g_totem.w[wi];
         while (w) { sh += (int)(w & 1ull); w >>= 1; }
     }
     /* every search depends on the embed sidecar, so a green /health that does
@@ -3959,13 +3959,13 @@ static int handle_health(sock_t cli) {
         "\"labels\":\"%s\",\"order_stale\":%ld,\"heal_ok\":%ld,\"heal_fail\":%ld,"
         "\"loader\":{\"mode\":\"%s\",\"index_age_s\":%.1f},"
         "\"tags\":{\"path\":\"%s\",\"kinds\":%d,\"tagged\":%d,\"unlabeled\":%d},"
-        "\"fog\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d}}",
+        "\"totem\":{\"replayed\":%d,\"shut\":%d,\"free\":%u,\"pair\":%d}}",
         (embed_ok && nent > 0) ? "ok" : "degraded",
         esc, nent, routed, stamps_live, route_dead, ANN_MAXK, g_anch_k, embed_ok ? "ok" : "down",
         g_labels_src, g_ord_stale, g_heal_ok, g_heal_fail,
         g_loader_running ? "bg" : "inline", age_s,
         tescp, g_tag_n, tagged_rows, g_tag_unlabeled,
-        g_fog_replayed, sh, (unsigned)WL_FREE, g_pair_n);
+        g_totem_replayed, sh, (unsigned)WL_FREE, g_pair_n);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
@@ -4031,10 +4031,10 @@ static int handle_canary(sock_t cli) {
     lz_json_escape(esc_note, sizeof(esc_note), PATH_LOG ? PATH_LOG : "");
     bl += snprintf(b + bl, sizeof(b) - bl,
         "]},\"note\":{\"path\":\"%s\",\"bytes\":%ld,\"records\":%ld},"
-        "\"boot\":{\"index_ms\":%.1f,\"fog_ms\":%.1f},"
+        "\"boot\":{\"index_ms\":%.1f,\"totem_ms\":%.1f},"
         "\"option_b\":{\"rows\":%ld,\"ms\":%.1f}}",
         esc_note, g_cy.note_bytes, g_cy.note_records,
-        g_cy.boot_ms, g_cy.boot_fog_ms, g_cy.reassign_rows, g_cy.reassign_ms);
+        g_cy.boot_ms, g_cy.boot_totem_ms, g_cy.reassign_rows, g_cy.reassign_ms);
     lz_http_send(cli, "200 OK", "application/json", b, bl);
     sock_close(cli);
     return 0;
@@ -4180,12 +4180,12 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         int route_bk[LZ_ANCH_MAXK], route_nb = 0, block_reads = 0;
         int items_scored = 0, nent = 0, budget = 0, truncated = 0, fallback = 0;
         double us_per_item = 0;
-        LZFog fog = { (int)WL_FREE, 0, 0, 0 };
+        LZTotem totem = { (int)WL_FREE, 0, 0, 0 };
         lz_mem_search(qv, qd, sid_filter, scope_buf, stopk,
             top_sid, top_file, top_np, top_sc,
             route_mode, route_bk, &route_nb,
             &block_reads, &items_scored, &nent,
-            &budget, &truncated, &us_per_item, &fog, &fallback);
+            &budget, &truncated, &us_per_item, &totem, &fallback);
         srlen = snprintf(sresp, sizeof(sresp), "{\"status\":\"ok\",\"hits\":[");
         for (int ti = 0; ti < stopk && top_sc[ti] > -2; ti++) {
             char esid[256], efile[1024];
@@ -4205,8 +4205,8 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             "],\"block_reads\":%d,\"items_scored\":%d,\"items_total\":%d,\"us_per_item\":%.2f,\"budget\":%d,\"truncated\":%d,\"fallback\":%d,",
             block_reads, items_scored, nent, us_per_item, budget, truncated, fallback);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
-            "\"fog\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
-            fog.lit, fog.open, fog.shut, fog.replayed, (unsigned)WL_FREE, g_pair_n);
+            "\"totem\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
+            totem.lit, totem.open, totem.shut, totem.replayed, (unsigned)WL_FREE, g_pair_n);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"amp\":{\"on\":%d,\"k\":%.2f,\"applied\":%d}}}",
             (g_amp_boost && g_graft_on) ? 1 : 0, (double)g_amp_k, g_amp_applied);
@@ -4413,7 +4413,7 @@ static int handle_search_batch(sock_t cli, const char *rq) {
  * The server was single-threaded with no socket timeout, so one idle or
  * half-open connection froze the whole service (including /health). Now each
  * connection runs on its own thread with a recv/send timeout, and the search
- * core (shared index/anchor/fog caches) is guarded by a critical section so
+ * core (shared index/anchor/totem caches) is guarded by a critical section so
  * the caches stay consistent — the same serialization as before, but a slow
  * client can no longer hold the accept loop. */
 
@@ -4582,8 +4582,8 @@ int main(int argc, char **argv) {
     { const char *le = getenv("ANN_LABELS");
       if (le) g_labels_derive = (strcmp(le, "stamp") != 0); }
     double cy_t0 = lz_now_ms();
-    lz_fog_init();
-    g_cy.boot_fog_ms = lz_now_ms() - cy_t0;
+    lz_totem_init();
+    g_cy.boot_totem_ms = lz_now_ms() - cy_t0;
     { LZEntry *e; int n; int c = lz_index_cached(&e, &n);
       g_loaded_at_ms = lz_now_ms();
       g_cy.boot_ms = g_loaded_at_ms - cy_t0;
@@ -4606,13 +4606,13 @@ int main(int argc, char **argv) {
       if (g_cy_on) {
           long sh = 0;
           for (unsigned wi = 0; wi < WL_WORDS; wi++) {
-              uint64_t w = g_fog.w[wi];
+              uint64_t w = g_totem.w[wi];
               while (w) { sh += (long)(w & 1ull); w >>= 1; }
           }
           cy_emit("{\"event\":\"boot\",\"entries\":%d,\"cache\":%d,"
-                  "\"fog_ms\":%.1f,\"index_ms\":%.1f,\"fog_replayed\":%d,"
-                  "\"fog_shut\":%ld,\"note_bytes\":%ld,\"note_records\":%ld}",
-                  n, c, g_cy.boot_fog_ms, g_cy.boot_ms, g_fog_replayed,
+                  "\"totem_ms\":%.1f,\"index_ms\":%.1f,\"totem_replayed\":%d,"
+                  "\"totem_shut\":%ld,\"note_bytes\":%ld,\"note_records\":%ld}",
+                  n, c, g_cy.boot_totem_ms, g_cy.boot_ms, g_totem_replayed,
                   sh, g_cy.note_bytes, g_cy.note_records);
       }
       /* Option-B gate (opt-in): what does re-deriving every label cost?
@@ -4625,8 +4625,8 @@ int main(int argc, char **argv) {
       g_loader_thread = CreateThread(NULL, 0, index_loader_thread, NULL, 0, NULL);
       fprintf(stderr, "[ann_search] index=%s entries=%d cache=%d maxk=%d loader=bg\n",
               PATH_INDEX, n, c, ANN_MAXK);
-      fprintf(stderr, "[ann_search] anchors=%s order=%s foglog=%s replayed=%d\n",
-              PATH_ANCH, PATH_ORDER, PATH_LOG, g_fog_replayed); }
+      fprintf(stderr, "[ann_search] anchors=%s order=%s totemlog=%s replayed=%d\n",
+              PATH_ANCH, PATH_ORDER, PATH_LOG, g_totem_replayed); }
 
     sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == SOCK_INVALID) { fprintf(stderr, "socket fail\n"); return 1; }

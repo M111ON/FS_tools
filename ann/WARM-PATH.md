@@ -1,11 +1,11 @@
-# Tombstone warm path — what it does, and the honest numbers (2026-10-08)
+# Totem warm path — what it does, and the honest numbers (2026-10-08)
 
 ## What was built
 
-`ann_search.c`, inside `lz_mem_search`, gated by `ANN_TOMBSTONE_WARM` (**default 0**):
+`ann_search.c`, inside `lz_mem_search`, gated by `ANN_TOTEM_WARM` (**default 0**):
 
 1. **Read the latch BEFORE walking.** Each routed bucket is checked with
-   `wl_is_open(&g_fog, lz_fog_id(bucket))`. A bucket walked by an earlier query
+   `wl_is_open(&g_totem, lz_totem_id(bucket))`. A bucket walked by an earlier query
    is SHUT; a never-walked one is OPEN.
 2. **Score the SHUT buckets first, then stop.** The walk order is reordered so
    entries covered by SHUT buckets come first, `budget` is set to their count,
@@ -118,13 +118,13 @@ lever.
 
 **Retracted claim:** "the warm path saves work on related queries". It saved
 work only while the saving was 0.4% (invisible) and lost recall the moment the
-saving was real. What survives is the tombstone × graft amplifier, which
+saving was real. What survives is the totem × graft amplifier, which
 re-ranks inside the SAME scored set and never touches the cut.
 
 
 ## P3 route-log compaction (2026-10-14)
 
-The tombstone's truth is the P3 log, and the latch is MONOTONE within an epoch,
+The totem's truth is the P3 log, and the latch is MONOTONE within an epoch,
 so the log is append-only. Before the transition-only fix (2026-10-11) it
 recorded the SAME slot on every walk: the live log held **5,661 records for 7
 distinct slots (99% redundant)** and every boot replayed all of it. The fix
@@ -142,7 +142,7 @@ Measured on the live log, then deployed:
 | records | 5661 | **7** |
 | bytes | 181,155 | **227** |
 | shut ids | 72,144,216,288,360,432,504 | identical |
-| live `fog.replayed` | 5661 | **7** |
+| live `totem.replayed` | 5661 | **7** |
 
 `tests/p3_compact_verify.c` (the real `wl_replay_log_file` the server uses)
 reports `LATCH IDENTICAL: YES`; `tests/p3_append_test.c` proves the compacted
@@ -184,7 +184,7 @@ Stop the server first (it holds the log open for append).
 python bench_warm_recall.py --queries 60 --ks 1,5,10 --sigmas 0.05 --budget 60000
 
 # or by hand: warm ON, topk=1, related queries
-ANN_TOMBSTONE_WARM=1 ANN_ROUTE_LOG=data/memcore/lz_route.log \
+ANN_TOTEM_WARM=1 ANN_ROUTE_LOG=data/memcore/lz_route.log \
   ./build/ann_search.exe --serve 8096
 curl -s -X POST -H "Content-Type: application/json" \
   -d '{"query":"geofs mdim","topk":1}' http://127.0.0.1:8096/v1/state/search
@@ -201,10 +201,10 @@ two overlapping queries reduce, warm top-k == OFF top-k, OFF repeat identical.
 Two axes, both env-gated and composable:
 
 - **structural** (`ANN_GRAFT`): which code a query is about — static, baked.
-- **hot/cold** (`ANN_TOMBSTONE_WARM`): which routes were just walked — per query.
+- **hot/cold** (`ANN_TOTEM_WARM`): which routes were just walked — per query.
 
-The tombstone is the amplifier, and the two are now **composed in code**: with
-`ANN_AMP_BOOST=1`, an entry sitting in a bucket the tombstone kept warm has its
+The totem is the amplifier, and the two are now **composed in code**: with
+`ANN_AMP_BOOST=1`, an entry sitting in a bucket the totem kept warm has its
 graft bias multiplied by `ANN_AMP_K` (default 2.0). The multiplier applies to the
 bias only (never the cosine score), so it is a strict no-op unless *both* axes are
 on. Response field `route.amp = {on, k, applied}` reports it.
@@ -221,13 +221,13 @@ is a genuine subset and the warm path (and the amplifier) are live at `topk=5`:
 | `topk=5`, default topb=9→8 | warm (inert) | 56570 / 57076 | — |
 | `topk=5`, `LZ_ROUTE_BUCKETS=5` | warm | 48210 / 57076 | **87** |
 
-Measured amplifier effect (`ANN_GRAFT=1 ANN_TOMBSTONE_WARM=1 LZ_ROUTE_BUCKETS=5`,
+Measured amplifier effect (`ANN_GRAFT=1 ANN_TOTEM_WARM=1 LZ_ROUTE_BUCKETS=5`,
 fresh route log, warm pass) — identical scored set, re-ranked toward the warm
 cluster:
 
 | query | OFF top-5 | ON top-5 |
 |---|---|---|
-| `core/geo_wang_latch.h tombstone warm route` | ebf0bbc0bb, 97296c1abc, 131f34e983, 800a03cad6, 579f5156b0 | ebf0bbc0bb, 97296c1abc, 131f34e983, **cf764fd707**, **404ad7b548** |
+| `core/geo_wang_latch.h totem warm route` | ebf0bbc0bb, 97296c1abc, 131f34e983, 800a03cad6, 579f5156b0 | ebf0bbc0bb, 97296c1abc, 131f34e983, **cf764fd707**, **404ad7b548** |
 | `core/geo_id_route_log.h p3 log crc` | 4c44d797bb, f162046894, 664262fa40, 00348f39d5, 7c0cd6480d | 4c44d797bb, f162046894, 664262fa40, **6f6b78a06f**, **fbc67f9a2a** |
 
 Warm entries climb into the top-5 on **3/5** path-bearing queries; the warm

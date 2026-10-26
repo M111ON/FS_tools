@@ -49,7 +49,7 @@ and the answer quality barely moves: the cosine gap (global best − in-zone bes
 
 Rules (deliberate, and each one cost a bug to learn):
 
-- A scoped query **bypasses the route layer entirely** — no buckets, no tombstone, no order sidecar. The candidate set is derived from the rows themselves, so it **cannot drift** from the index. There is no positional sidecar for the scope path at all.
+- A scoped query **bypasses the route layer entirely** — no buckets, no totem, no order sidecar. The candidate set is derived from the rows themselves, so it **cannot drift** from the index. There is no positional sidecar for the scope path at all.
 - `file` scope widens to `kind` when the group is too thin to fill top-k (`mode:"scope+kind"`).
 - `tag:` / `zone:` are a **closed group** — never widened; too thin → HTTP 400 `scope_too_narrow` / `scope_not_found`.
 

@@ -90,7 +90,7 @@ Shipped rule: `K = clamp(round_up4(ceil(n/3000)), 8, 48)`, env override
 1. **Let the watcher fire.** Trigger is a K breakpoint (72k rows) or `routed==0`.
    Confirm it heals and that `/health` tells the truth throughout — the act-path
    is wired and plan-checked but has never run on real growth.
-2. **Note-as-authority is only half wired**: live reports `fog.replayed=0`. The
+2. **Note-as-authority is only half wired**: live reports `totem.replayed=0`. The
    P3 route log the service reads is empty while the note lives elsewhere. Either
    point `ANN_ROUTE_LOG` at the real note or make boot replay explicit.
 3. **Latch 3-axis geometry** (phase 2 remainder): skew data now exists
@@ -98,7 +98,7 @@ Shipped rule: `K = clamp(round_up4(ceil(n/3000)), 8, 48)`, env override
    picking the consumer.
 4. **Owner decisions still open** (`task-ta90e5e78`): note-vs-sidecar conflict
    policy, note file shape, 32 B/record width, phase-2 scope. Do not assume.
-5. `fog_live` / `replayed` / `heal` keys were printed by an older build —
+5. `totem_live` / `replayed` / `heal` keys were printed by an older build —
    `/health` now carries `labels`, `k`, `order_stale`, `stamp_stale`. Update any
    script that scrapes the old keys.
 

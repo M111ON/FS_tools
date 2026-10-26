@@ -1,8 +1,8 @@
 # HANDOFF-2026-10-21-ann-tree-side.md — ผลไม้กับต้น แยกชั้นแล้ว
 
 > **Root:** `I:/tools/ann` (git root `I:/tools`, branch `main`, remote `origin=https://github.com/M111ON/FS_tools.git`)
-> **Prior handoff:** `docs/HANDOFF-2026-10-20-ann-isolate.md` (A: perm-sidecar, B: tombstone door)
-> **Live ตอนปิดงาน:** `:8096` healthy · entries **62,423** · `routed:1` · `stamps_live 62,423/62,423` · `route_dead:0` · `embed ok` · fog `{replayed:7, shut:7}`
+> **Prior handoff:** `docs/HANDOFF-2026-10-20-ann-isolate.md` (A: perm-sidecar, B: totem door)
+> **Live ตอนปิดงาน:** `:8096` healthy · entries **62,423** · `routed:1` · `stamps_live 62,423/62,423` · `route_dead:0` · `embed ok` · totem `{replayed:7, shut:7}`
 > **Upstream pointer:** `I:/DWGLS-native-fs/docs/HANDOFF-2026-10-21-ann-tree-side-upstream.md`
 
 ---
@@ -11,7 +11,7 @@
 
 รอบนี้ไม่ได้แก้ "ประสิทธิภาพ" — มันแก้ **ชั้น**: ป้ายกิ่ง (routing labels) เป็นของ **ต้น** ไม่ใช่ของ **ผลไม้** (vector rows) ตามที่ owner ยืนยันเอง (session 2026-10-10, `DWGLS-native-fs/docs/HANDOFF-2026-10-10-session.md` §5):
 
-> **regrow แตะ vector ไม่ได้** · **capo ย้ายกิ่งไม่มีผลกับของ** (ผลไม้ย้ายที่ได้เหมือนเดิม) · **ผลไม้ของ quadtree ต้นจะหัก ผลไม้ก็ยังเหมือนเดิม เอาไปวางที่ใหม่ได้** · **ปัก tombstone ได้แค่หน้าประตู**
+> **regrow แตะ vector ไม่ได้** · **capo ย้ายกิ่งไม่มีผลกับของ** (ผลไม้ย้ายที่ได้เหมือนเดิม) · **ผลไม้ของ quadtree ต้นจะหัก ผลไม้ก็ยังเหมือนเดิม เอาไปวางที่ใหม่ได้** · **ปัก totem ได้แค่หน้าประตู**
 
 ระหว่างทำ พบว่า **live เสียเงียบมาหลายชั่วโมง**: search ได้ `items_scored: 4` จาก 62,204 แถว ขณะที่ `/health` รายงาน `routed:1` — สุขภาพปลอม
 

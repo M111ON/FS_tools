@@ -58,7 +58,7 @@ oracle over the full 57,076-vector index for recall; scratch-instance runs of
 | 10 | Query **silently truncated at 2047 chars**; sidecar 500 at >512 tokens surfaces as generic error | **Medium** |
 | 11 | `topk` parsing: silent coercion of `0`/negatives/garbage; first-substring-wins enables **topk override** | **Medium** |
 | 12 | "Budget/truncated" telemetry is misleading (always `truncated:1` on a full scan) | **Low** |
-| 13 | Fog latch is write-only; route log grows unbounded and is never compacted | **Low** |
+| 13 | Totem latch is write-only; route log grows unbounded and is never compacted | **Low** |
 | 14 | `test_anchor_determinism` fails (carried upstream bug, reproducible here) | **Low (known)** |
 | 15 | HTTP hygiene: no HEAD, no keep-alive, no version negotiation, malformed JSON accepted | **Low** |
 
@@ -214,7 +214,7 @@ search); a single held connection stalls all of them.
 
 ## 5. MEDIUM — `/health` is green with a dead embed sidecar (false health)
 
-`handle_health` (L554-577) only reports index/route/fog state. It never probes the embed
+`handle_health` (L554-577) only reports index/route/totem state. It never probes the embed
 sidecar, yet every search depends on it. With the sidecar down, `/health` still returns
 `status:ok`, so the supervisor (`ann_keepalive.py`) sees a healthy service while search is
 100 % broken.
@@ -421,10 +421,10 @@ behaviour — and thus the exactness guarantee — depends on `topk`.
 
 ---
 
-## 13. LOW — Fog latch is write-only; route log grows unbounded
+## 13. LOW — Totem latch is write-only; route log grows unbounded
 
 In `ann_search.c` the latch is only ever **written** (`wl_traverse_log`, L392). `wl_is_open`
-is never called (grep: no reader). The "tombstone" state therefore never influences
+is never called (grep: no reader). The "totem" state therefore never influences
 routing — it is pure telemetry, yet it is persisted on every query.
 
 ```
@@ -435,13 +435,13 @@ ROUTE LOG GROWTH (unbounded append per query)
 
 At the observed rate (`data/memcore/lz_route.log` grew to ~20 KB in normal use) a busy
 client grows the file without bound; nothing ever appends a `CLEAR` or compacts it. Also,
-`lz_fog_id(bucket)` = `wl_id(bucket%144, 0)` = `(bucket%144)*72`, so **bucket 0 maps to
+`lz_totem_id(bucket)` = `wl_id(bucket%144, 0)` = `(bucket%144)*72`, so **bucket 0 maps to
 reserved id 0** and can never be latched:
 
 ```
 walking 8 buckets (topk=8) with 40 distinct queries:
   buckets ever walked: [0,1,2,3,4,5,6,7]
-  max fog.shut observed: 7   (8 buckets walked; bucket 0 can never shut)
+  max totem.shut observed: 7   (8 buckets walked; bucket 0 can never shut)
 ```
 
 ---
@@ -513,7 +513,7 @@ but not caused by this fork.
 | `infra2.py` | §8 SO_REUSEADDR double-bind |
 | `cache_test2.py` | §9 stale index cache |
 | `topk_table.py`, `semantics.py` | §12 budget/truncated telemetry |
-| `fog_test.py` | §13 latch bucket-0 dead + log growth |
+| `totem_test.py` | §13 latch bucket-0 dead + log growth |
 | `repro.sh`, `final_repro.py` | quick live one-liners |
 
 *End of report.*

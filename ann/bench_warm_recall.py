@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Warm-path measurement - the gate the ANN warm-path card (task-tdb4e839d) asks for.
 
-Question: the tombstone warm path (env ANN_TOMBSTONE_WARM, default OFF) reorders
+Question: the totem warm path (env ANN_TOTEM_WARM, default OFF) reorders
 the walk so entries in already-SHUT buckets are scored first and the scan stops
 after them (budget = their count). Two claims must be MEASURED, not asserted:
 
@@ -94,7 +94,7 @@ def spawn(idx, anch, order, log, port, warm, exe=EXE, budget=0, extra_env=None):
         "ANN_WALK_PRUNE": os.environ.get("ANN_WALK_PRUNE", "1"),
         "ANN_WALK_FLOOR": os.environ.get("ANN_WALK_FLOOR", "0.5"),
         "LZ_ROUTE_BUCKETS": os.environ.get("LZ_ROUTE_BUCKETS", "5"),
-        "ANN_TOMBSTONE_WARM": "1" if warm else "0",
+        "ANN_TOTEM_WARM": "1" if warm else "0",
         "ANN_PORT": str(port),
     }
     if budget > 0:

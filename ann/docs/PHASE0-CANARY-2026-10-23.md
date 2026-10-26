@@ -17,7 +17,7 @@ to a temp copy so the live writer's log was never touched.
 |---|---|
 | entries | 62,851 |
 | index parse (`index_ms`) | 37,508 – 38,084 ms |
-| note replay (`fog_ms`) | 0.3 ms |
+| note replay (`totem_ms`) | 0.3 ms |
 | note size | 227 B = 7 records |
 | sidecar `.stamp` | 502,808 B |
 | order `.order` | 251,424 B |
@@ -43,7 +43,7 @@ rows it is ~3 s, still under the parse.
 
 ## Warm path — measured dead
 
-35 queries, `ANN_TOMBSTONE_WARM=1`:
+35 queries, `ANN_TOTEM_WARM=1`:
 
 ```
 warm_taken  = 0
@@ -56,7 +56,7 @@ Every routed query saw shut buckets (`shut ≈ 6/7`) but `cov >= budget`, so
 than the cold walk. Structural reason (`ann_search.c:588-591`):
 
 ```c
-static inline uint32_t lz_fog_id(int bucket) {
+static inline uint32_t lz_totem_id(int bucket) {
     int c = bucket % 144;
     ...
     return wl_id((uint32_t)c, 0u);
@@ -67,8 +67,8 @@ static inline uint32_t lz_fog_id(int bucket) {
 hold **8 distinct cells** and saturates after the first walk. The walk then
 always routes into shut cells and there is nothing to skip.
 
-**Consequence for the plan:** `ANN_TOMBSTONE_WARM` is inert in steady state,
-not merely conservative. Making the tombstone route anything requires a key
+**Consequence for the plan:** `ANN_TOTEM_WARM` is inert in steady state,
+not merely conservative. Making the totem route anything requires a key
 finer than `bucket % 144` (that is N4/N6 territory), and the 144-cell
 geometry has no consumer today.
 

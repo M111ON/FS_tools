@@ -21,7 +21,7 @@ The upstream working tree was clean at fork time (`git status --porcelain` empty
 |---|---|
 | HTTP helpers (`lz_http_recv/send`, `lz_json_int`, `lz_json_escape`, `lz_http_post`) | L44–116, L205–216 |
 | `lz_embed` (embed sidecar client) | L179–204 |
-| fog latch globals + `lz_fog_init` + `lz_fog_id` | L219–263 |
+| totem latch globals + `lz_totem_init` + `lz_totem_id` | L219–263 |
 | `LZEntry`, `lz_json_val`, `lz_entry_parse`, `lz_index_load/free`, index cache | L281–385 |
 | anchors/order route cache | L391–427 |
 | `lz_mem_search` (the shared selection core) | L435–586 |
@@ -105,5 +105,5 @@ fork's history is auditable; see the RESOLVED section above for the real cause.
 `data/kv_index.jsonl`, `data/kv_index.order`, `data/kv_anchors.bin` were copied
 from upstream `build/` at fork time (2881 entries). They are **data**, not code:
 rebuild them with the upstream `build/reindex_docs.py` (embeds via the sidecar
-on :18095) if the corpus changes. `data/lz_route.log` (tombstone log) is created
+on :18095) if the corpus changes. `data/lz_route.log` (totem log) is created
 at runtime and is git-ignored.

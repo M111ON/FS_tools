@@ -115,7 +115,7 @@ static inline uint32_t wl_bucket_id(int bucket) {
 
 /* ──── P3 append sink (the FINGERPRINT) ───────────────────────────────
  * The bitset above is a DERIVED cache: it dies with the process. To make a
- * tombstone survive restart, every traverse must ALSO append its fingerprint
+ * totem survive restart, every traverse must ALSO append its fingerprint
  * to the P3 route log, and boot replays the log into a fresh latch. That is
  * the whole "must train first": the latch is learned by walking, and the
  * walk is what gets written down.
@@ -124,7 +124,7 @@ static inline uint32_t wl_bucket_id(int bucket) {
  * is a separate call so a caller that does not want persistence pays nothing.
  *
  * File shape: IR_LOG_HEADER (2 B magic) + 1 version byte + 32-B records —
- * exactly what lz_fog_init() already replays (it skips buf+3).
+ * exactly what lz_totem_init() already replays (it skips buf+3).
  */
 typedef struct {
     FILE    *fp;

@@ -3,7 +3,7 @@
 ## The doctrine this implements
 
 > "ระบบนี้ต้องเทรนก่อนครั้งนึง เพื่อเปิด path … กรณีที่เราทำแบบนั้นไม่ได้ graph
-> เข้ามาช่วยทำแผนที่คร่าวๆ ให้เป็นแนวทาง ระบบจะแม่นและเร็วขึ้นหลังจากปัก tombstone"
+> เข้ามาช่วยทำแผนที่คร่าวๆ ให้เป็นแนวทาง ระบบจะแม่นและเร็วขึ้นหลังจากปัก totem"
 
 Two failure modes of "you must train first":
 
@@ -15,7 +15,7 @@ Two failure modes of "you must train first":
 The **graph route** replaces that full scan with a guided subset drawn from the
 file-relationship graph (`data/graft/`): the graph already knows which entries
 mention which files and how files relate, so it can *propose candidates* with no
-training at all. The tombstone then pins the routes actually walked.
+training at all. The totem then pins the routes actually walked.
 
 ## What was built
 
@@ -51,7 +51,7 @@ Env-gated by `ANN_GRAFT=1`; **off by default**, strict no-op when off.
 
 | query | graph mode | scored (graph) | scored (brute) | R@10 vs brute |
 |---|---|---|---|---|
-| `core/geo_wang_latch.h tombstone warm route` | graph | 20 | 57076 | **0.00** |
+| `core/geo_wang_latch.h totem warm route` | graph | 20 | 57076 | **0.00** |
 | `tools/gguf_lazy_serve.c anchor route buckets` | graph | 266 | 57076 | 0.60 |
 | `core/anchor_route.h centroids nearest bucket` | graph | 180 | 57076 | 0.60 |
 | `core/geo_id_route_log.h p3 log crc` | graph | 11 | 57076 | **0.00** |
@@ -77,7 +77,7 @@ Env-gated by `ANN_GRAFT=1`; **off by default**, strict no-op when off.
    file, returns `mode:"brute"` and is exact (R@10 = 1.00). Novel recall is
    untouched by design.
 4. **This is a front tier.** It belongs in front of the exact path for
-   file-centric traffic (fast, rough), with the tombstone making repeats cheap —
+   file-centric traffic (fast, rough), with the totem making repeats cheap —
    not as a replacement for the anchor route or exact search.
 
 ## Backward / reciprocal ("magnetic") score — what can be computed backwards
@@ -116,7 +116,7 @@ of the forward walk and it is where a leaf/header's context lives:
 
 | query | sc_F | sc_B | R@10_F | R@10_B |
 |---|---|---|---|---|
-| `core/geo_wang_latch.h tombstone warm route` | 20 | 101 | 0.00 | 0.00 |
+| `core/geo_wang_latch.h totem warm route` | 20 | 101 | 0.00 | 0.00 |
 | `tools/gguf_lazy_serve.c anchor route buckets` | 266 | 266 | 0.60 | 0.60 |
 | `core/anchor_route.h centroids nearest bucket` | 180 | 370 | 0.60 | 0.60 |
 | `core/geo_id_route_log.h p3 log crc` | 11 | 21 | 0.00 | **0.10** |

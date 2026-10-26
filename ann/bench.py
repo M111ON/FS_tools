@@ -310,7 +310,7 @@ def main():
     queries = [
         "tesspack format spec",
         "anchor route nearest bucket",
-        "tombstone warm path",
+        "totem warm path",
         "graph route recall",
         "how does the embed sidecar work",
     ]

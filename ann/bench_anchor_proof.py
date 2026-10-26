@@ -165,7 +165,7 @@ def main():
     ap.add_argument("--order", default=os.path.join(ANN, "data", "sample", "ann_index.order"))
     ap.add_argument("--scratch", default=r"I:\tmp\ann_bench")
     ap.add_argument("--queries", default="tesspack format spec|anchor route|"
-                                         "tombstone warm path|graph route recall|"
+                                         "totem warm path|graph route recall|"
                                          "how do anchors work")
     args = ap.parse_args()
 
