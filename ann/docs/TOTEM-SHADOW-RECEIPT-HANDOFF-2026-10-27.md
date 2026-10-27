@@ -61,6 +61,40 @@ must not reject candidates.
 - Production ANN output: unchanged
 - Hard reject: disabled
 
+## SIFT1M structural gate
+
+The existing SIFT1M artifacts were used as a structural, not semantic, producer
+fixture. The full sidecar contains `1,000,000` rows:
+
+```text
+file: ann/data/memcore/sift1m_receipts.jsonl
+sha256: 37d2e2b8c70f28f7a2c3194c42ab7c96be0295acbd6531fd0bb129712db1588d
+size: 102,555,519 bytes
+```
+
+With 100 real SIFT queries and top-k 10:
+
+```text
+checked: 1000
+valid_receipts: 1000
+missing_receipts: 0
+coverage: 1.0000
+recall@10: 0.9220
+```
+
+The exact 10k universe also passed with `200/200` valid receipts and zero
+missing. Negative tests detect stale generation, wrong frustum, and wrong Wang
+edge. SIFT assignments are derived structural test coordinates; they are not
+semantic route truth and must not be used to claim relation or multi-view recall.
+
+## Final scope verdict
+
+Structural receipt generation, join, deterministic hashing, shadow reporting,
+and scale test: **PASS**. Semantic producer metadata and candidate-level live
+hard gating remain blocked until the upstream producer supplies real
+`sid -> totem_receipt` metadata. Keep hard reject disabled; continue observing
+missing receipts on the memcore live index.
+
 ## Next handoff
 
 When producer metadata exists: build the receipt sidecar, verify SID/index
