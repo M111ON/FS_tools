@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANN dashboard — read-only</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #161b22; --line: #293341; --text: #d7dee8;
+    --muted: #8b9bb0; --good: #4cc38a; --warn: #e3b341; --bad: #f2777a;
+    --accent: #6cb6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  button { background: #1f2937; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { border-color: var(--good); color: var(--good); }
+  main { padding: 16px 20px 60px; }
+  nav.tabs { display: flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
+  nav.tabs button.active { background: #24313f; border-color: var(--accent); color: var(--accent); }
+  .banner { margin-bottom: 14px; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid var(--bad); background: #2a1416; color: #ffd5d7; white-space: pre-wrap; }
+  .banner.warn { border-color: var(--warn); background: #2a2413; color: #ffe9b0; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  section.panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px; overflow: auto; }
+  section.panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--accent); font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; }
+  .kv b { color: var(--muted); font-weight: 500; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--line); font-size: 11px; }
+  .ok { color: var(--good); border-color: var(--good); }
+  .warnp { color: var(--warn); border-color: var(--warn); }
+  .bad { color: var(--bad); border-color: var(--bad); }
+  .muted { color: var(--muted); }
+  .controls { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 12px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select { background: #0b0f14; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; min-width: 90px; }
+  .trunc { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--muted); font-style: italic; }
+  footer { margin-top: 24px; padding: 6px 20px;
+    background: var(--panel); border-top: 1px solid var(--line); color: var(--muted);
+    font-size: 12px; display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ANN dashboard</h1>
+  <span class="tag">read-only · no mutation</span>
+  <span class="tag" id="ann-target"></span>
+  <span class="spacer"></span>
+  <button id="refresh">Refresh</button>
+  <button id="poll">Poll 10s: off</button>
+</header>
+
+<main>
+  <div id="banners"></div>
+  <nav class="tabs">
+    <button data-tab="health" class="active">Health</button>
+    <button data-tab="index">Index</button>
+    <button data-tab="candidate">Candidate</button>
+    <button data-tab="shadow">Shadow</button>
+  </nav>
+
+  <div id="tab-health" class="tab">
+    <div class="grid">
+      <section class="panel"><h2>Health</h2><div id="health-kv" class="kv"></div></section>
+      <section class="panel"><h2>Receipts</h2><div id="health-receipts" class="kv"></div></section>
+      <section class="panel"><h2>Warnings</h2><div id="health-warnings"></div></section>
+    </div>
+  </div>
+
+  <div id="tab-index" class="tab" hidden>
+    <div class="grid">
+      <section class="panel"><h2>Index epoch</h2><div id="index-kv" class="kv"></div></section>
+      <section class="panel"><h2>Zones</h2><div id="index-zones"></div></section>
+      <section class="panel"><h2>Bucket occupancy (top doors)</h2><div id="index-buckets"></div></section>
+      <section class="panel"><h2>Occupancy histogram</h2><div id="index-hist"></div></section>
+      <section class="panel"><h2>Tag bake</h2><div id="index-bake" class="kv"></div></section>
+      <section class="panel"><h2>Route (live health)</h2><div id="index-route" class="kv"></div></section>
+    </div>
+  </div>
+
+  <div id="tab-candidate" class="tab" hidden>
+    <section class="panel">
+      <h2>Query</h2>
+      <div class="controls">
+        <label>vector source
+          <select id="src">
+            <option value="index">index row</option>
+            <option value="zeros">fixture: zeros</option>
+            <option value="unit">fixture: unit</option>
+          </select>
+        </label>
+        <label>row <input id="row" type="number" min="0" value="0"></label>
+        <label>top-k <input id="topk" type="number" min="1" max="64" value="5"></label>
+        <label>scope <input id="scope" placeholder="zone:0 / tag:naming / empty"></label>
+        <button id="run">Run query</button>
+      </div>
+      <div id="candidate-note" class="muted"></div>
+    </section>
+    <div class="grid" style="margin-top:14px">
+      <section class="panel"><h2>Route receipt</h2><div id="candidate-route" class="kv"></div></section>
+      <section class="panel"><h2>Candidate receipts</h2><div id="candidate-receipts" class="kv"></div></section>
+    </div>
+    <section class="panel" style="margin-top:14px"><h2>Top-k</h2><div id="candidate-hits"></div></section>
+  </div>
+
+  <div id="tab-shadow" class="tab" hidden>
+    <div class="grid">
+      <section class="panel"><h2>Report summary</h2><div id="shadow-kv" class="kv"></div></section>
+      <section class="panel"><h2>Route violations / malformed</h2><div id="shadow-findings"></div></section>
+    </div>
+    <section class="panel" style="margin-top:14px"><h2>Append-only timeline (last 50)</h2><div id="shadow-timeline"></div></section>
+  </div>
+</main>
+
+<footer>
+  <span id="foot-health">health: —</span>
+  <span id="foot-index">index: —</span>
+  <span id="foot-fetched">fetched: —</span>
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { poll: null };
+
+function esc(value) {
+  if (value === null || value === undefined) return "—";
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function num(value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value !== "number") return esc(value);
+  return value.toLocaleString("en-US");
+}
+function kv(el, pairs) {
+  el.innerHTML = pairs.map(([k, v]) => `<b>${esc(k)}</b><span>${v}</span>`).join("");
+}
+function pill(text, cls) { return `<span class="pill ${cls || ""}">${esc(text)}</span>`; }
+function table(headers, rows, emptyText) {
+  if (!rows.length) return `<div class="empty">${esc(emptyText || "no rows")}</div>`;
+  const head = headers.map((h) => `<th>${esc(h)}</th>`).join("");
+  const body = rows.map((cells) => "<tr>" + cells.map((cell) =>
+    typeof cell === "object" ? `<td class="${cell.cls || ""}">${cell.html}</td>` : `<td>${esc(cell)}</td>`
+  ).join("") + "</tr>").join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+function banner(text, warn) {
+  const el = document.createElement("div");
+  el.className = "banner" + (warn ? " warn" : "");
+  el.textContent = text;
+  $("banners").appendChild(el);
+}
+function clearBanners() { $("banners").innerHTML = ""; }
+function nowStamp() { return new Date().toISOString(); }
+
+async function getJSON(url, options) {
+  const response = await fetch(url, options);
+  let payload = null;
+  try { payload = await response.json(); }
+  catch (error) { throw new Error(`${url}: non-JSON response (HTTP ${response.status})`); }
+  if (!response.ok || payload.ok === false) {
+    const detail = payload.error ? `${payload.error.kind}: ${payload.error.message}` : `HTTP ${response.status}`;
+    throw new Error(`${url}: ${detail}`);
+  }
+  return payload;
+}
+
+// ---------------------------------------------------------------- health
+function renderHealth(payload) {
+  const stamp = payload.stamp || {};
+  const roster = payload.roster || {};
+  const totem = payload.totem || {};
+  const loader = payload.loader || {};
+  const tags = payload.tags || {};
+  kv($("health-kv"), [
+    ["state", pill(payload.state || "—", payload.state === "live" ? "ok" : payload.state === "degraded" ? "warnp" : "bad")],
+    ["reported status", esc(payload.reported_status)],
+    ["entries", num(payload.entries)],
+    ["routed", pill(num(payload.routed), payload.routed === 1 ? "ok" : "bad")],
+    ["stamps live", num(payload.stamps_live)],
+    ["route dead", pill(num(payload.route_dead), payload.route_dead ? "bad" : "ok")],
+    ["labels", esc(payload.labels)],
+    ["k / maxk", `${num(payload.k)} / ${num(payload.maxk)}`],
+    ["loader", `${esc(loader.mode)} · age ${num(loader.index_age_s)}s`],
+    ["stamp gate", pill(esc(stamp.gate), stamp.gate === "ok" ? "ok" : "bad")],
+    ["stamp unplaced", num(stamp.unplaced)],
+    ["totem lit/shut/free", `${num(totem.lit)} / ${num(totem.shut)} / ${num(totem.free)}`],
+    ["totem replayed/pair", `${num(totem.replayed)} / ${num(totem.pair)}`],
+    ["roster", `${pill(roster.on ? "on" : "off", roster.on ? "ok" : "warnp")} ${num(roster.doors)} doors · ${num(roster.rows)} rows · ${num(roster.bytes)} B`],
+    ["roster source", esc(roster.src)],
+    ["tags", `${num(tags.tagged)} tagged · ${num(tags.unlabeled)} unlabeled · ${num(tags.kinds)} kinds`],
+  ]);
+  $("foot-health").textContent = `health: ${payload.state || "?"} · entries ${num(payload.entries)} · fetched ${payload.fetched_at || "?"}`;
+}
+
+function renderReceipts(payload) {
+  const configured = payload.configured;
+  kv($("health-receipts"), [
+    ["sidecar", configured ? esc(payload.path) : "(none configured)"],
+    ["label", configured ? (payload.label === "structural_test_data"
+      ? pill("structural test data", "warnp") : pill(payload.label, "ok")) : "—"],
+    ["rows", configured ? num(payload.rows) : "0"],
+    ["bound to epoch", configured ? pill(payload.bound ? "yes" : "no", payload.bound ? "ok" : "bad") : "—"],
+    ["binding reason", esc(payload.binding && payload.binding.reason)],
+    ["malformed rows", configured ? num((payload.malformed || []).length) : "0"],
+  ]);
+  if (configured && payload.label === "structural_test_data") {
+    const note = document.createElement("div");
+    note.className = "muted";
+    note.textContent = "SIFT1M receipts are structural test data only — not semantic truth.";
+    $("health-receipts").appendChild(note);
+  }
+}
+
+function renderWarnings(warnings) {
+  if (!warnings || !warnings.length) {
+    $("health-warnings").innerHTML = `<div class="empty">none — health is clean</div>`;
+    return;
+  }
+  $("health-warnings").innerHTML = warnings.map((w) =>
+    `<div>${pill(w.code, "warnp")} <span class="muted">${esc(JSON.stringify(w))}</span></div>`).join("");
+}
+
+// ----------------------------------------------------------------- index
+function renderIndex(payload) {
+  const index = payload.index || {};
+  const binding = payload.binding || {};
+  const epoch = payload.epoch || {};
+  kv($("index-kv"), [
+    ["index rows", num(index.rows)],
+    ["stamp rows", num(index.stamp_rows)],
+    ["order rows", num(index.order_rows)],
+    ["order delta", num(index.order_delta)],
+    ["order covers index", pill(index.order_covers_rows ? "yes" : "no", index.order_covers_rows ? "ok" : "bad")],
+    ["size", `${num((index.stat || {}).size)} B`],
+    ["mtime", esc((index.stat || {}).mtime)],
+    ["epoch binding", pill(binding.match ? "match" : "stale", binding.match ? "ok" : "bad")],
+    ["binding reason", esc(binding.reason)],
+    ["anchors n_prev", num(epoch.n_prev)],
+    ["anchors K", num(epoch.k)],
+    ["anchors cksum", esc(epoch.anchors_cksum)],
+    ["anchors bin", `${num(epoch.anchors_size_bytes)} B`],
+    ["roster sidecar", `${num(epoch.roster_sidecar_bytes)} B`],
+    ["last sid", esc(epoch.last_sid)],
+  ]);
+
+  const zones = payload.zones || {};
+  const zoneRows = (zones.zones || []).map((z) => [
+    z.zone, z.tag, { cls: "num", html: num(z.rows) },
+    z.retired ? { html: pill("retired", "warnp") } : { html: pill("live", "ok") },
+  ]);
+  const zoneTable = table(["zone", "tag", "rows", "state"], zoneRows, "no zones");
+  $("index-zones").innerHTML = zoneTable +
+    `<div class="muted" style="margin-top:8px">sum ${num(zones.sum_rows)} = entries ${num(zones.entries)} ` +
+    (zones.coverage_ok ? pill("coverage ok", "ok") : pill("coverage mismatch", "bad")) + `</div>`;
+
+  const occ = payload.bucket_occupancy || {};
+  const occRows = (occ.top || []).map((d) => [
+    d.door, { cls: "num", html: num(d.own) }, { cls: "num", html: num(d.pair) },
+    { cls: "num", html: num(d.memberships) },
+  ]);
+  $("index-buckets").innerHTML = table(
+    ["door", "own", "pair", "memberships"], occRows, "no stamps") +
+    `<div class="muted" style="margin-top:8px">${num(occ.rows)} rows · ${num(occ.doors)} doors · ` +
+    `${num(occ.memberships)} memberships · ${num(occ.negative_rows)} negative rows</div>`;
+
+  const histRows = (occ.histogram || []).map((h) => [
+    `≥ ${num(h.floor)}`, { cls: "num", html: num(h.doors) },
+  ]);
+  $("index-hist").innerHTML = table(["memberships", "doors"], histRows, "no histogram");
+
+  const bake = payload.tag_bake || {};
+  kv($("index-bake"), [
+    ["bake id", esc(bake.bake_id)],
+    ["baked at", esc(bake.baked_at)],
+    ["index rows", num(bake.index_rows)],
+    ["tagged rows", num(bake.tagged_rows)],
+    ["orphan rows", pill(num(bake.orphan_rows), bake.orphan_rows ? "warnp" : "ok")],
+    ["untagged rows", pill(num(bake.untagged_rows), bake.untagged_rows ? "warnp" : "ok")],
+    ["backward changed", num(bake.backward_changed_total)],
+  ]);
+
+  const health = payload.health || {};
+  const totem = health.totem || {};
+  const roster = health.roster || {};
+  kv($("index-route"), [
+    ["health state", pill(health.state || "—", health.state === "live" ? "ok" : "warnp")],
+    ["buckets live", num(payload.buckets_live)],
+    ["entries", num(payload.health_entries)],
+    ["totem lit/open/shut", `${num(totem.lit)} / ${num(totem.open)} / ${num(totem.shut)}`],
+    ["totem free/pair", `${num(totem.free)} / ${num(totem.pair)}`],
+    ["roster", `${roster.on ? "on" : "off"} · ${num(roster.doors)} doors`],
+  ]);
+  $("foot-index").textContent =
+    `index: ${num(index.rows)} rows · epoch ${binding.match ? "match" : "STALE"} · ${nowStamp()}`;
+}
+
+function renderRouteReceipt(route) {
+  if (!route || typeof route !== "object") {
+    $("candidate-route").innerHTML = `<div class="empty">no route receipt returned</div>`;
+    return;
+  }
+  const totem = route.totem || {};
+  const amp = route.amp || {};
+  kv($("candidate-route"), [
+    ["mode", esc(route.mode)],
+    ["buckets", esc((route.buckets || []).join(", "))],
+    ["totem lit", pill(num(totem.lit), "ok")],
+    ["totem open/shut", `${num(totem.open)} / ${num(totem.shut)}`],
+    ["totem replayed/free/pair", `${num(totem.replayed)} / ${num(totem.free)} / ${num(totem.pair)}`],
+    ["walk hash", esc(route.walk_hash)],
+    ["items scored / total", `${num(route.items_scored)} / ${num(route.items_total)}`],
+    ["budget", num(route.budget)],
+    ["truncated", pill(num(route.truncated), route.truncated ? "warnp" : "ok")],
+    ["fallback", pill(num(route.fallback), route.fallback ? "warnp" : "ok")],
+    ["examined", num(route.examined)],
+    ["roster", num(route.roster)],
+    ["block reads", num(route.block_reads)],
+    ["us / item", num(route.us_per_item)],
+    ["amp", `${amp.on ? "on" : "off"} · k ${num(amp.k)} · applied ${num(amp.applied)}`],
+  ]);
+}
+
+function renderCandidates(payload) {
+  const receipts = payload.candidate_receipts || {};
+  const counts = receipts.counts || {};
+  kv($("candidate-receipts"), [
+    ["sidecar", receipts.label === "structural_test_data"
+      ? pill("structural test data", "warnp")
+      : receipts.label === "none" ? esc("(none configured)") : esc(receipts.label)],
+    ["bound to epoch", pill(receipts.bound ? "yes" : "no", receipts.bound ? "ok" : "bad")],
+    ["hits", num(counts.hits)],
+    ["valid", pill(num(counts.valid), counts.valid ? "ok" : "")],
+    ["invalid", pill(num(counts.invalid), counts.invalid ? "bad" : "")],
+    ["stale", pill(num(counts.stale), counts.stale ? "warnp" : "")],
+    ["missing", pill(num(counts.missing), counts.missing ? "warnp" : "ok")],
+    ["present coverage", num(receipts.present_coverage)],
+  ]);
+  const rows = (receipts.findings || []).map((f) => [
+    { cls: "trunc", html: esc(f.sid) },
+    { cls: "trunc", html: esc(f.file) },
+    { cls: "num", html: typeof f.score === "number" ? f.score.toFixed(4) : "—" },
+    { html: pill(f.status, f.status === "valid" ? "ok" : f.status === "missing" ? "warnp" : "bad") },
+    esc((f.violations || []).join(", ") || (f.status === "missing" ? "producer receipt absent" : "")),
+  ]);
+  $("candidate-hits").innerHTML = table(
+    ["sid", "file", "score", "receipt", "violations"], rows, "no hits");
+  $("candidate-note").textContent =
+    `request: ${nowStamp()} · ann ${num((payload.timing || {}).ann_ms)} ms · top-k ${num((payload.request || {}).topk)} · ` +
+    `scope ${esc((payload.request || {}).scope) || "(global)"} · dim ${num((payload.request || {}).dim)}`;
+}
+
+// ---------------------------------------------------------------- shadow
+function renderShadow(payload) {
+  kv($("shadow-kv"), [
+    ["report", payload.report_present ? esc(payload.report_path) : "(missing)"],
+    ["reports", num(payload.reports)],
+    ["route violations", pill(num(payload.route_violation_count), payload.route_violation_count ? "bad" : "ok")],
+    ["candidate receipts", num(payload.candidate_receipts)],
+    ["missing receipts", pill(num(payload.candidate_receipts_missing), payload.candidate_receipts_missing ? "warnp" : "ok")],
+    ["returned hits", num(payload.returned_hits)],
+    ["coverage", num(payload.coverage)],
+    ["first event", esc(payload.first_event_time)],
+    ["last event", esc(payload.last_event_time)],
+    ["malformed rows", pill(num((payload.malformed || []).length), (payload.malformed || []).length ? "bad" : "ok")],
+  ]);
+  const findings = [];
+  (payload.route_violations || []).forEach((v) =>
+    findings.push([pill("route", "bad"), esc(v)]));
+  (payload.malformed || []).forEach((m) =>
+    findings.push([pill("malformed", "bad"), esc(`${m.line === null ? "" : "line " + m.line + ": "}${m.error}`)]));
+  $("shadow-findings").innerHTML = findings.length
+    ? findings.map(([a, b]) => `<div>${a} ${b}</div>`).join("")
+    : `<div class="empty">none</div>`;
+
+  const rows = (payload.timeline || []).slice().reverse().map((r) => [
+    esc(r.event_time),
+    { cls: "num", html: num(r.returned_hits) },
+    { cls: "num", html: num(r.candidate_receipts) },
+    { cls: "num", html: num(r.candidate_receipts_missing) },
+    esc(r.route_receipt),
+    { cls: "num", html: num((r.route_violations || []).length) },
+    { cls: "num", html: num(r.walk_hash) },
+    { cls: "num", html: num(r.items_scored) },
+  ]);
+  $("shadow-timeline").innerHTML = table(
+    ["event_time", "hits", "receipts", "missing", "route receipt", "violations", "walk hash", "items scored"],
+    rows, "no reports yet");
+}
+
+// ------------------------------------------------------------------ load
+async function loadAll() {
+  clearBanners();
+  const results = await Promise.allSettled([
+    getJSON("/api/health"), getJSON("/api/index"), getJSON("/api/shadow"),
+  ]);
+  const [health, index, shadow] = results;
+  if (health.status === "fulfilled") {
+    renderHealth(health.value);
+    renderReceipts(health.value.receipts || {});
+    renderWarnings(health.value.warnings || []);
+  } else {
+    banner(`health unavailable — ${health.reason.message}`, false);
+  }
+  if (index.status === "fulfilled") renderIndex(index.value);
+  else banner(`index view failed — ${index.reason.message}`, true);
+  if (shadow.status === "fulfilled") renderShadow(shadow.value);
+  else banner(`shadow view failed — ${shadow.reason.message}`, true);
+  $("foot-fetched").textContent = `fetched: ${nowStamp()}`;
+}
+
+async function runQuery() {
+  try {
+    const source = $("src").value;
+    let vector;
+    if (source === "index") {
+      const row = Number($("row").value || 0);
+      const payload = await getJSON(`/api/vector?row=${encodeURIComponent(row)}`);
+      vector = payload.vec;
+    } else {
+      vector = (await getJSON(`/api/vector?fixture=${source}`)).vec;
+    }
+    const topk = Number($("topk").value || 5);
+    if (!Number.isInteger(topk) || topk < 1 || topk > 64) throw new Error("top-k must be an integer in 1..64");
+    const payload = await getJSON("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vec: vector, topk, scope: $("scope").value || "" }),
+    });
+    clearBanners();
+    renderRouteReceipt((payload.response || {}).route);
+    renderCandidates(payload);
+  } catch (error) {
+    banner(`query failed — ${error.message}`, false);
+  }
+}
+
+function setTab(name) {
+  document.querySelectorAll("nav.tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab").forEach((el) =>
+    el.hidden = el.id !== `tab-${name}`);
+}
+
+document.querySelectorAll("nav.tabs button").forEach((button) =>
+  button.addEventListener("click", () => setTab(button.dataset.tab)));
+$("refresh").addEventListener("click", loadAll);
+$("run").addEventListener("click", runQuery);
+$("poll").addEventListener("click", () => {
+  if (state.poll) {
+    clearInterval(state.poll);
+    state.poll = null;
+    $("poll").textContent = "Poll 10s: off";
+    $("poll").classList.remove("on");
+  } else {
+    state.poll = setInterval(loadAll, 10000);
+    $("poll").textContent = "Poll 10s: on";
+    $("poll").classList.add("on");
+  }
+});
+$("ann-target").textContent = `ann ${location.host} → read-only`;
+loadAll();
+</script>
+</body>
+</html>

@@ -39,7 +39,8 @@ PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py",
             "tests/test_roster.py", "tests/test_state_tags.py",
             "tests/test_route_watch.py", "tests/test_soft_zone.py",
             "tests/test_roster_cold.py", "tests/test_zone_rows.py",
-            "tests/test_query_sanitize.py"]
+            "tests/test_query_sanitize.py",
+            "dashboard/tests/test_dashboard_core.py"]
 
 
 def run(name, cmd, cwd=HERE):
