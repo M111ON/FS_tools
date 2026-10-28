@@ -13,6 +13,7 @@ NOTE the vectors come from the index itself, so top-1 scores are ~1.0000 — tha
 known tautology (see memory #7697), not a recall claim. This bench measures the LOG only.
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -20,13 +21,21 @@ import urllib.request
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8097
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
 INDEX = r"I:\tools\ann\data\memcore\ann_index.jsonl"
+TOKEN = os.environ.get("ANN_ADMIN_TOKEN", "")
+
+
+def headers():
+    h = {"Content-Type": "application/json"}
+    if TOKEN:
+        h["X-Admin-Token"] = TOKEN
+    return h
 
 
 def post(body):
     req = urllib.request.Request(
         "http://127.0.0.1:%d/v1/state/search" % PORT,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers(),
     )
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -68,5 +77,6 @@ lat.sort()
 print("queries=%d  elapsed=%.1fs  mean=%.0fus  p50=%.0fus  p99=%.0fus"
       % (N, elapsed, sum(lat) / len(lat), lat[len(lat) // 2], lat[int(len(lat) * 0.99) - 1]))
 
-with urllib.request.urlopen("http://127.0.0.1:%d/v1/qlog/flush" % PORT, timeout=30) as r:
+with urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:%d/v1/qlog/flush" % PORT, headers=headers()), timeout=30) as r:
     print("flush:", r.read().decode())

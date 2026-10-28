@@ -4978,6 +4978,51 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
     if (g_qlog_n >= QLOG_RING || (now - g_qlog_last) >= 1000) qlog_flush();
 }
 
+/* ── admin guard ─────────────────────────────────────────────────────────
+ * /v1/qlog/flush is the only state-changing verb on a server that binds
+ * INADDR_ANY, so it carries a gate. Two accepted proofs, in order:
+ *   1. header  X-Admin-Token: <value>  matching env ANN_ADMIN_TOKEN  (when set)
+ *   2. env unset  AND  the peer is on 127.0.0.0/8 (a local tool, a bench)
+ * Everything else gets 403 with the reason — never a silent success, because a
+ * curator that believes it flushed when it did not reads a short log as loss.
+ * The compare walks all bytes instead of returning early; it is not a crypto
+ * primitive, but it does not leak the token length through timing either. */
+static int lz_peer_is_loopback(sock_t cli) {
+    struct sockaddr_in peer;
+    int plen = (int)sizeof(peer);
+    if (getpeername(cli, (struct sockaddr *)&peer, &plen) != 0) return 0;
+    unsigned char *b = (unsigned char *)&peer.sin_addr.s_addr;
+    return b[0] == 127;
+}
+static int lz_ci_prefix(const char *p, const char *name) {
+    for (; *name; p++, name++) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c != *name) return 0;
+    }
+    return 1;
+}
+static int lz_admin_token_ok(const char *rq, const char *want) {
+    for (const char *p = rq; *p; p++) {
+        if (*p != '\n') continue;
+        const char *h = p + 1;
+        if (!lz_ci_prefix(h, "x-admin-token:")) continue;
+        h += 14;
+        while (*h == ' ' || *h == '\t') h++;
+        size_t got = 0, wl = strlen(want);
+        int diff = 0;
+        while (h[got] && h[got] != '\r' && h[got] != '\n') {
+            char c = h[got];
+            if (got < wl) diff |= (c != want[got]);
+            else diff |= 1;
+            got++;
+        }
+        if (got != wl) diff |= 1;
+        if (!diff) return 1;
+    }
+    return 0;
+}
+
 static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int *out_len) {
     char *bd3 = strstr(rq, "\r\n\r\n");
     if (!bd3) { sock_close(cli); return 0; }
@@ -5386,13 +5431,29 @@ static void dispatch(sock_t cli, char *rq) {
         handle_canary(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/qlog/flush") == 0) {
         /* explicit flush: the buffer is normally written at 128 lines or 1 s, so a
-         * reader that must see "right now" (a gate, a test, a handoff) asks here. */
+         * reader that must see "right now" (a gate, a test, a handoff) asks here.
+         * Guarded: see lz_admin_token_ok() above. */
+        const char *want = getenv("ANN_ADMIN_TOKEN");
+        int allowed = (want && want[0]) ? lz_admin_token_ok(rq, want) : lz_peer_is_loopback(cli);
+        char qresp[256];
+        int qlen;
+        if (!allowed) {
+            qlen = snprintf(qresp, sizeof(qresp),
+                "{\"status\":\"error\",\"error\":\"forbidden\","
+                "\"detail\":\"%s\"}",
+                (want && want[0])
+                    ? "send header X-Admin-Token with ANN_ADMIN_TOKEN"
+                    : "remote caller: set ANN_ADMIN_TOKEN on the server and send X-Admin-Token");
+            lz_http_send(cli, "403 Forbidden", "application/json", qresp, qlen);
+            sock_close(cli);
+            return;
+        }
         int had = g_qlog_n;
         qlog_flush();
-        char qresp[160];
-        int qlen = snprintf(qresp, sizeof(qresp),
-            "{\"status\":\"ok\",\"mode\":\"qlog_flush\",\"flushed\":%d,\"dropped\":%d}",
-            had, g_qlog_dropped);
+        qlen = snprintf(qresp, sizeof(qresp),
+            "{\"status\":\"ok\",\"mode\":\"qlog_flush\",\"flushed\":%d,\"dropped\":%d,"
+            "\"auth\":\"%s\"}",
+            had, g_qlog_dropped, (want && want[0]) ? "token" : "loopback");
         lz_http_send(cli, "200 OK", "application/json", qresp, qlen);
         sock_close(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state/tags") == 0) {
@@ -5546,6 +5607,28 @@ int main(int argc, char **argv) {
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "wsa fail\n"); return 1; }
+    /* Single instance, cheaply: SO_EXCLUSIVEADDRUSE already makes a second bind
+     * fail loudly (verified — the duplicate loads 63,915 rows, then dies at bind),
+     * but that wastes a full index load and looks like "two servers are running"
+     * for ~30 s. One connect probe before loading settles it in ~1 ms. */
+    {
+        sock_t probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (probe != SOCK_INVALID) {
+            struct sockaddr_in pa;
+            memset(&pa, 0, sizeof(pa));
+            pa.sin_family = AF_INET;
+            pa.sin_port = htons((uint16_t)port);
+            pa.sin_addr.s_addr = htonl(0x7F000001);
+            int held = (connect(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0);
+            closesocket(probe);
+            if (held) {
+                fprintf(stderr, "[ann_search] port %d already accepting -> another instance "
+                                "holds it; exiting without loading the index\n", port);
+                WSACleanup();
+                return 0;
+            }
+        }
+    }
     InitializeCriticalSection(&g_lock);
     { const char *ce = getenv("ANN_CANARY");
       g_cy_on = (ce && atoi(ce)) ? 1 : 0;
