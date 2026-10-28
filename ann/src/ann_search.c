@@ -4831,6 +4831,153 @@ static int lz_json_float_array(const char *json, const char *key, float *out, in
 /* ── batch-query forward decls (implementation below, additive) ── */
 static int lv_search_json(const float *qv, int qd, int topk, char *out, int out_cap, int *out_len);
 static int handle_search_batch(sock_t cli, const char *rq);
+/* ── query log (append-only jsonl, buffered) ─────────────────────────────
+ * WHY THIS EXISTS: an answer that cannot be dated and addressed is
+ * unprovable a week later. Every request gets one line carrying its clock,
+ * its input hash, the index identity, what the walk actually touched, and —
+ * when the caller supplies it — the chat coordinate ("coord":"sid#ord").
+ * `coord` may be null but is never absent, so the gap is visible instead of
+ * silent (the 867 orphan memories in chat-index came from exactly this gap).
+ *
+ * COST: memcpy into a ring buffer inside the existing request lock; the file
+ * write happens on the same thread but at most once per second (or when the
+ * buffer fills), ~14 KB per flush. A crash loses at most QLOG_RING lines of
+ * observability — never a result.
+ *
+ * LAYOUT: data/query_log/ann_query-YYYYMMDD.jsonl (rotate at local midnight).
+ * Separate from data/memcore/ on purpose: the index is immutable and rebuilt
+ * atomically, the log is append-only and grows every day; one must never be
+ * able to damage the other.
+ */
+#define QLOG_RING 128
+static char g_qlog_line[QLOG_RING][768];
+static int g_qlog_n = 0;
+static DWORD g_qlog_last = 0;
+static int g_qlog_day = -1;
+static int g_qlog_on = -1;      /* -1 = not probed, 0 = off (env ANN_QUERY_LOG=0) */
+static int g_qlog_dropped = 0;  /* lines lost to a line that did not fit */
+static int g_qlog_batch = 0;    /* set by the batch path, reported per line */
+
+static int qlog_enabled(void) {
+    if (g_qlog_on < 0) {
+        const char *e = getenv("ANN_QUERY_LOG");
+        g_qlog_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_qlog_on;
+}
+
+/* Sibling of the index directory, never inside it: "data/memcore/ann_index.jsonl"
+ * -> "data/query_log". The index is immutable and swapped atomically; the log is
+ * append-only and grows daily — one must never be able to damage the other. */
+static void qlog_dir(char *dst, size_t cap) {
+    snprintf(dst, cap, "%s", PATH_INDEX);
+    for (char *q = dst; *q; q++) if (*q == '/') *q = '\\';
+    char *slash = strrchr(dst, '\\');
+    if (slash) *slash = '\0'; else snprintf(dst, cap, "data");
+    char *base = strrchr(dst, '\\');
+    const char *leaf = base ? base + 1 : dst;
+    if (strcmp(leaf, "memcore") == 0) {          /* data\memcore -> data */
+        if (base) *base = '\0'; else dst[0] = '\0';
+        if (!dst[0]) snprintf(dst, cap, "data");
+    }
+    size_t n = strlen(dst);
+    if (n < cap - 12) snprintf(dst + n, cap - n, "\\query_log");
+}
+
+static long long qlog_ms(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    long long t = ((long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (t - 116444736000000000LL) / 10000LL;   /* 100ns since 1601 -> ms since 1970 */
+}
+
+static void qlog_flush(void) {
+    if (!g_qlog_n) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char dir[512];
+    qlog_dir(dir, sizeof(dir));
+    CreateDirectoryA(dir, NULL);   /* idempotent; fails harmlessly if present */
+    char path[640];
+    snprintf(path, sizeof(path), "%s\\ann_query-%04d%02d%02d.jsonl",
+             dir, st.wYear, st.wMonth, st.wDay);
+    g_qlog_day = st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+    FILE *f = fopen(path, "ab");
+    if (!f) { g_qlog_dropped += g_qlog_n; g_qlog_n = 0; return; }
+    for (int i = 0; i < g_qlog_n; i++) {
+        fwrite(g_qlog_line[i], 1, strlen(g_qlog_line[i]), f);
+        fputc('\n', f);
+    }
+    fclose(f);
+    g_qlog_n = 0;
+    g_qlog_last = GetTickCount();
+}
+
+/* One line per completed search. `coord` is copied verbatim (may be empty ->
+ * null). Everything numeric here is what the walk reported, not a guess. */
+static void qlog_search(const char *coord, const char *qtext, const float *qv, int qd,
+                        int topk, int K, long idx_mtime, long idx_size, int nent,
+                        int items_scored, int budget, int truncated, int fallback,
+                        int roster_used, double lat_us, const char *mode,
+                        const char (*top_sid)[64], const double *top_sc,
+                        const int *top_np, int top_n, unsigned walk_hash,
+                        const char *scope, const char *sid_filter) {
+    if (!qlog_enabled()) return;
+    char esc_coord[160] = "";
+    char esc_scope[560] = "";
+    if (coord && coord[0]) lz_json_escape(esc_coord, sizeof(esc_coord), coord);
+    if (scope && scope[0]) lz_json_escape(esc_scope, sizeof(esc_scope), scope);
+    unsigned qh = 0;
+    const char *in_kind = "text";
+    if (qtext && qtext[0]) {
+        qh = _fnv(qtext);
+    } else if (qv && qd > 0) {
+        /* a caller-supplied vector has no text: hash the bytes, never report 0 */
+        const unsigned char *b = (const unsigned char *)qv;
+        unsigned h = 2166136261u;
+        for (size_t i = 0; i < (size_t)qd * sizeof(float); i++) { h ^= b[i]; h *= 16777619u; }
+        qh = h;
+        in_kind = "vec";
+    }
+    char tops[512];
+    int tn = 0;
+    tops[0] = '\0';
+    for (int i = 0; i < top_n && i < 5; i++) {
+        if (top_sc[i] <= -2) break;
+        if (tn > (int)sizeof(tops) - 220) break;   /* never let a sid outgrow the line */
+        char esid[160];
+        lz_json_escape(esid, sizeof(esid), top_sid[i]);
+        tn += snprintf(tops + tn, sizeof(tops) - tn,
+                       "%s{\"sid\":\"%s\",\"score\":%.4f,\"rank\":%d}",
+                       i ? "," : "", esid, top_sc[i], i + 1);
+    }
+    char line[768];
+    int n = snprintf(line, sizeof(line),
+        "{\"v\":1,\"ts_ms\":%lld,\"coord\":%s%s%s,\"input_kind\":\"%s\","
+        "\"input_hash\":\"fnv:%08x\","
+        "\"input_chars\":%d,\"dim\":%d,\"topk\":%d,\"K\":%d,"
+        "\"index_fp\":\"%ld-%ld\",\"n_cand\":%d,\"items_scored\":%d,\"budget\":%d,"
+        "\"truncated\":%d,\"fallback\":%d,\"roster\":%d,\"walk_hash\":%u,"
+        "\"top\":[%s],\"latency_us\":%.0f,\"mode\":\"%s\",\"batch\":%d,"
+        "\"scope\":%s%s%s,\"sid_filter\":%s%s%s,\"model_hash\":null}",
+        qlog_ms(),
+        esc_coord[0] ? "\"" : "", esc_coord[0] ? esc_coord : "null", esc_coord[0] ? "\"" : "",
+        in_kind, qh, qtext ? (int)strlen(qtext) : 0, qd, topk, K,
+        idx_mtime, idx_size, nent, items_scored, budget,
+        truncated, fallback, roster_used, walk_hash,
+        tops, lat_us,
+        mode ? mode : "search", g_qlog_batch,
+        esc_scope[0] ? "\"" : "", esc_scope[0] ? esc_scope : "null", esc_scope[0] ? "\"" : "",
+        (sid_filter && sid_filter[0]) ? "\"" : "", (sid_filter && sid_filter[0]) ? sid_filter : "null",
+        (sid_filter && sid_filter[0]) ? "\"" : "");
+    if (n < 0) return;
+    if (n >= (int)sizeof(line)) { g_qlog_dropped++; return; }   /* never truncate JSON */
+    memcpy(g_qlog_line[g_qlog_n], line, (size_t)n + 1);
+    g_qlog_n++;
+    DWORD now = GetTickCount();
+    if (g_qlog_n >= QLOG_RING || (now - g_qlog_last) >= 1000) qlog_flush();
+}
+
 static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int *out_len) {
     char *bd3 = strstr(rq, "\r\n\r\n");
     if (!bd3) { sock_close(cli); return 0; }
@@ -4839,6 +4986,10 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
     int stopk = 3;
     char sid_filter[64] = "";
     char scope_buf[256] = "";
+    char coord_buf[128] = "";
+    LARGE_INTEGER qlf, ql0;
+    QueryPerformanceFrequency(&qlf);
+    QueryPerformanceCounter(&ql0);
     const char *qp = strstr(bd3, "\"query\"");
     if (qp) {
         qp = strchr(qp + 7, ':');
@@ -4875,6 +5026,23 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
                 while (*sfp && *sfp != '"' && *sfp != ',' && *sfp != '}' && sfi < 63)
                     sid_filter[sfi++] = *sfp++;
                 sid_filter[sfi] = '\0';
+            }
+        }
+    }
+    /* optional chat coordinate ("coord":"ses_x#386"). The caller that knows where
+     * the words came from passes it; the log then answers "which query produced
+     * this number" a year later. Absent -> null in the line, never invented. */
+    {
+        const char *cbp = strstr(bd3, "\"coord\"");
+        if (cbp) {
+            cbp = strchr(cbp + 7, ':');
+            if (cbp) {
+                cbp++;
+                while (*cbp == ' ' || *cbp == '"') cbp++;
+                int ci = 0;
+                while (*cbp && *cbp != '"' && *cbp != ',' && *cbp != '}' && ci < 127)
+                    coord_buf[ci++] = *cbp++;
+                coord_buf[ci] = '\0';
             }
         }
     }
@@ -4966,6 +5134,15 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
             &block_reads, &items_scored, &nent,
             &budget, &truncated, &us_per_item, &totem, &fallback, &examined,
             &roster_used, &walk_hash);
+        {
+            LARGE_INTEGER ql1;
+            QueryPerformanceCounter(&ql1);
+            double lat_us = (double)(ql1.QuadPart - ql0.QuadPart) * 1e6 / (double)qlf.QuadPart;
+            qlog_search(coord_buf, sq, qv, qd, stopk, g_anch_k, g_idx_mtime, g_idx_size,
+                        nent, items_scored, budget, truncated, fallback, roster_used,
+                        lat_us, "search", top_sid, top_sc, top_np,
+                        stopk, walk_hash, scope_buf, sid_filter);
+        }
         srlen = snprintf(sresp, sizeof(sresp), "{\"status\":\"ok\",\"hits\":[");
         for (int ti = 0; ti < stopk && top_sc[ti] > -2; ti++) {
             char esid[256], efile[1024];
@@ -5050,6 +5227,7 @@ static int lv_search_json(const float *qv, int qd, int topk, char *out, int out_
  * {"telemetry":{"n","embed_ms","took_ms"}}. Cap N<=32 — malformed / empty /
  * oversized / bad-k -> 400 with an "error" field. */
 static int handle_search_batch(sock_t cli, const char *rq) {
+    g_qlog_batch = 1;   /* every line produced inside this request is marked batch:1 */
     char *bd3 = strstr(rq, "\r\n\r\n");
     if (!bd3) { sock_close(cli); return 0; }
     bd3 += 4;
@@ -5206,6 +5384,17 @@ static void dispatch(sock_t cli, char *rq) {
         handle_health(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/canary") == 0) {
         handle_canary(cli);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/qlog/flush") == 0) {
+        /* explicit flush: the buffer is normally written at 128 lines or 1 s, so a
+         * reader that must see "right now" (a gate, a test, a handoff) asks here. */
+        int had = g_qlog_n;
+        qlog_flush();
+        char qresp[160];
+        int qlen = snprintf(qresp, sizeof(qresp),
+            "{\"status\":\"ok\",\"mode\":\"qlog_flush\",\"flushed\":%d,\"dropped\":%d}",
+            had, g_qlog_dropped);
+        lz_http_send(cli, "200 OK", "application/json", qresp, qlen);
+        sock_close(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state/tags") == 0) {
         handle_tags(cli);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/restamp") == 0) {
@@ -5344,6 +5533,7 @@ static DWORD WINAPI client_thread(LPVOID arg) {
 
 int main(int argc, char **argv) {
     paths_init();
+    atexit(qlog_flush);   /* a clean stop never loses the tail of the log */
     int port = 8096;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) port = atoi(argv[++i]);

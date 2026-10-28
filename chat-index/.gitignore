@@ -1,0 +1,8 @@
+chatmap.db
+chatmap.db-*
+*.db-wal
+*.db-shm
+refresh.log
+work/
+__pycache__/
+*.pyc
