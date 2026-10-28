@@ -129,6 +129,27 @@ turn it sits on, and vault rows carry no clock of their own (their time is borro
 matching message). Both are recorded here instead of silently "solved".
 
 
+## Round 4 (2026-10-29, bare integers matched inside ids)
+
+`when 454` reported **348 vault rows**, a number no human had written: a bare integer matches inside
+uuids, hashes and long ids (`84975945489f`, `ses_...454...`). Three layers were inflating:
+
+| layer | before | after | why |
+|---|---|---|---|
+| vault | 348 | 55 | standalone-occurrence filter (`(?<![\w.])454(?![\w.])`) over the LIKE candidates |
+| fact | 11 | 1 | same filter |
+| artifact | 202 | 62 | same filter **and** `kind='sha'` excluded — a hex fragment is not a path hit |
+
+Decimals are untouched: `.9627` must still match inside `0.9627`, so the boundary is applied only
+to forms that are pure digits (`_digit_bound()` returns `None` otherwise). Each filtered layer now
+reports what it threw away — `substring_noise:vault:293` — and rewrites its `why` as
+"55 standalone of 348 substring rows", so the drop is visible instead of a silent recount.
+Rows are fetched capped at 5,001 for these queries; past that the count is a floor.
+
+Also fixed: the `block` layer's covering-half follows `k` (it covers the sessions of the rows
+shown), so `when 454` said 16 at `-k 3` and 72 at `-k 25`. Its `why` now says coverage follows
+`k` and that only text matches are totals. `eval_when.py`: 19/19, unchanged.
+
 ## What this proves on a real case
 
 `when 0.9627` returns the four messages where the ANN bucket number was measured (2026-10-23

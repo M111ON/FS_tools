@@ -44,6 +44,14 @@ def _like(s):
     return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _digit_bound(form):
+    """Regex that accepts Q only as a standalone number; None for decimals (substring is safe)."""
+    if not re.fullmatch(r"\d+", form or ""):
+        return None
+    return re.compile(r"(?<![\w.])" + re.escape(form) + r"(?![\w.])")
+
+
+
 def window(s, terms, width=200):
     """Head of the match: the text around the first query term, not the head of the row."""
     if not s:
@@ -419,6 +427,23 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
         if num is not None:
             for form in num_forms:
                 p = "%" + _like(form) + "%"
+                if _digit_bound(form):
+                    # a bare integer like 454 also occurs INSIDE ids, uuids and hashes
+                    # ("84975945489f"), which inflated vault to 348 meaningless hits.  Count
+                    # only real standalone numbers; report what the substring pass saw.
+                    raw = db.execute("select sid, turn_no, body from vault_turn "
+                                     "where body like ? escape '\\' limit 5001", (p,)).fetchall()
+                    rx = _digit_bound(form)
+                    kept = [r for r in raw if rx.search(r["body"] or "")]
+                    vault_total = len(kept)
+                    if len(raw) > len(kept):
+                        out["flags"].append("substring_noise:vault:%d" % (len(raw) - len(kept)))
+                    if vault_total:
+                        vr = kept
+                        vault_why = ("exported md turns (form %r, %d standalone of %d substring rows)"
+                                     % (form, vault_total, len(raw)))
+                        break
+                    continue
                 vault_total = db.execute("select count(*) from vault_turn where body like ? escape '\\'",
                                          (p,)).fetchone()[0]
                 if vault_total:
@@ -452,6 +477,21 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
     if num is not None:
         for form in num_forms:
             p = "%" + _like(form) + "%"
+            if _digit_bound(form):
+                # same integer-inside-id noise as the vault layer: count standalone only
+                rx = _digit_bound(form)
+                raw = db.execute("select fact_id, project, category, status, source_sid, created_ms, body "
+                                 "from fact where body like ? escape '\\' limit 5001", (p,)).fetchall()
+                kept = [r for r in raw if rx.search(r["body"] or "")]
+                fact_total = len(kept)
+                if len(raw) > len(kept):
+                    out["flags"].append("substring_noise:fact:%d" % (len(raw) - len(kept)))
+                if fact_total:
+                    facts = kept[:k]
+                    fact_why = ("memories with source id (form %r, %d standalone of %d substring rows)"
+                                % (form, fact_total, len(raw)))
+                    break
+                continue
             fact_total = db.execute("select count(*) from fact where body like ? escape '\\'",
                                     (p,)).fetchone()[0]
             if fact_total:
@@ -519,12 +559,25 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
 
     # ---- 5. artifact paths (the real file intersection: 149k file paths + 60k paths)
     like = "%" + _like(q) + "%"
-    art_total = db.execute("select count(*) from artifact where name like ? escape '\\'",
-                           (like,)).fetchone()[0]
-    arts = db.execute("select kind, name, ref from artifact where name like ? escape '\\' limit ?",
-                      (like, k)).fetchall()
-    layer("artifact", art_total, True, "file/path/mem/sha marks")
-    for r in arts:
+    art_rx = _digit_bound(q)
+    if art_rx:
+        # a bare integer also lives inside sha fragments ("849...454...89f") — those are not path hits
+        raw = db.execute("select kind, name, ref from artifact where kind <> 'sha' "
+                         "and name like ? escape '\\' limit 5001", (like,)).fetchall()
+        arts = [r for r in raw if art_rx.search(r["name"] or "")]
+        art_total = len(arts)
+        if art_total == 0:
+            art_why = "file/path/mem marks (sha excluded for a bare number)"
+        else:
+            art_why = "file/path/mem marks (%d standalone, sha excluded)" % art_total
+    else:
+        art_total = db.execute("select count(*) from artifact where name like ? escape '\\'",
+                               (like,)).fetchone()[0]
+        arts = db.execute("select kind, name, ref from artifact where name like ? escape '\\' limit ?",
+                          (like, k)).fetchall()
+        art_why = "file/path/mem/sha marks"
+    layer("artifact", art_total, True, art_why)
+    for r in arts[:k]:
         hits.append({"layer": "artifact", "kind": r["kind"], "ref": r["ref"],
                      "matched_via": q, "snippet": r["name"], "ts_ms": None, "ts_iso": "-"})
 
@@ -603,8 +656,8 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
     # mixed the two populations and under-reported the covering count
     n_cover = len([b for b in blocks if b["block_id"] in cover_ids])
     layer("block", len(blocks), True,
-          "compartment summaries: %d covering a hit session, %d matching the text"
-          % (n_cover, max(0, block_text)))
+          "compartment summaries: %d covering a shown session (coverage follows k, text matches are totals), "
+          "%d matching the text" % (n_cover, max(0, block_text)))
     for r in blocks[:k]:
         hits.append({"layer": "block", "block_id": r["block_id"], "sid": r["sid"],
                      "ts_ms": r["ts_ms"], "ts_iso": ts(r["ts_ms"]), "matched_via": q,
