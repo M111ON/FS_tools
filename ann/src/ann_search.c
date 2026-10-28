@@ -149,6 +149,11 @@ static void lz_json_escape(char *dst, size_t cap, const char *src) {
         else if (c == '\n') { dst[di++] = '\\'; dst[di++] = 'n'; }
         else if (c == '\r') { dst[di++] = '\\'; dst[di++] = 'r'; }
         else if (c == '\t') { dst[di++] = '\\'; dst[di++] = 't'; }
+        else if ((unsigned char)c < 0x20) {
+            /* any other control byte: raw in a JSON string it is a parse error at the receiver */
+            snprintf(dst + di, cap - di, "\\u%04x", (unsigned)(unsigned char)c);
+            di += 6;
+        }
         else dst[di++] = c;
     }
     dst[di] = '\0';
@@ -4850,18 +4855,28 @@ static int handle_search_batch(sock_t cli, const char *rq);
  * able to damage the other.
  */
 #define QLOG_RING 128
-static char g_qlog_line[QLOG_RING][768];
+#define QLOG_LINE 2048
+static char g_qlog_line[QLOG_RING][QLOG_LINE];
 static int g_qlog_n = 0;
 static DWORD g_qlog_last = 0;
 static int g_qlog_day = -1;
-static int g_qlog_on = -1;      /* -1 = not probed, 0 = off (env ANN_QUERY_LOG=0) */
-static int g_qlog_dropped = 0;  /* lines lost to a line that did not fit */
-static int g_qlog_batch = 0;    /* set by the batch path, reported per line */
+static int g_qlog_on = -1;      /* -1 = not probed, 0 = off (ANN_QUERY_LOG=0/false/off/no) */
+static long g_qlog_dropped = 0; /* lines lost: did not fit, or the write failed */
+static char g_qlog_last_error[320] = ""; /* sticky: last write failure, cleared by a good flush */
+static int g_qlog_batch = 0;    /* set by the batch path, reset when that request ends */
+static HANDLE g_qlog_thread = NULL;
+static int g_qlog_warned = 0;   /* one stderr line per process, not one per request */
 
 static int qlog_enabled(void) {
     if (g_qlog_on < 0) {
         const char *e = getenv("ANN_QUERY_LOG");
-        g_qlog_on = (e && e[0] == '0') ? 0 : 1;
+        /* fail toward OFF only when the value clearly says so: "0falseoffno" */
+        int off = 0;
+        if (e && e[0]) {
+            if (e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' ||
+                e[0] == 'o' || e[0] == 'O') off = 1;
+        }
+        g_qlog_on = off ? 0 : 1;
     }
     return g_qlog_on;
 }
@@ -4870,6 +4885,8 @@ static int qlog_enabled(void) {
  * -> "data/query_log". The index is immutable and swapped atomically; the log is
  * append-only and grows daily — one must never be able to damage the other. */
 static void qlog_dir(char *dst, size_t cap) {
+    const char *ov = getenv("ANN_QUERY_LOG_DIR");
+    if (ov && ov[0]) { snprintf(dst, cap, "%s", ov); return; }
     snprintf(dst, cap, "%s", PATH_INDEX);
     for (char *q = dst; *q; q++) if (*q == '/') *q = '\\';
     char *slash = strrchr(dst, '\\');
@@ -4891,8 +4908,11 @@ static long long qlog_ms(void) {
     return (t - 116444736000000000LL) / 10000LL;   /* 100ns since 1601 -> ms since 1970 */
 }
 
-static void qlog_flush(void) {
-    if (!g_qlog_n) return;
+/* Returns the number of lines actually written to disk, or -1 when the file could not
+ * be opened. Every line that does not reach the file is counted in g_qlog_dropped, so
+ * "flushed 128" can never be reported for a flush that wrote nothing. */
+static int qlog_flush(void) {
+    if (!g_qlog_n) return 0;
     SYSTEMTIME st;
     GetLocalTime(&st);
     char dir[512];
@@ -4903,14 +4923,37 @@ static void qlog_flush(void) {
              dir, st.wYear, st.wMonth, st.wDay);
     g_qlog_day = st.wYear * 10000 + st.wMonth * 100 + st.wDay;
     FILE *f = fopen(path, "ab");
-    if (!f) { g_qlog_dropped += g_qlog_n; g_qlog_n = 0; return; }
-    for (int i = 0; i < g_qlog_n; i++) {
-        fwrite(g_qlog_line[i], 1, strlen(g_qlog_line[i]), f);
-        fputc('\n', f);
+    if (!f) {
+        g_qlog_dropped += g_qlog_n;
+        snprintf(g_qlog_last_error, sizeof(g_qlog_last_error),
+                 "cannot open %s (CheckPermissionsError)", path);
+        if (!g_qlog_warned) {
+            g_qlog_warned = 1;
+            fprintf(stderr, "[ann_search] qlog: cannot open %s — %d lines dropped "
+                            "(set ANN_QUERY_LOG_DIR to a writable path)\n", path, g_qlog_n);
+        }
+        g_qlog_n = 0;
+        return -1;
     }
-    fclose(f);
+    int wrote = 0, bad = 0;
+    for (int i = 0; i < g_qlog_n; i++) {
+        size_t len = strlen(g_qlog_line[i]);
+        if (fwrite(g_qlog_line[i], 1, len, f) != len || fputc('\n', f) == EOF) bad++;
+        else wrote++;
+    }
+    if (fclose(f) != 0) { bad += wrote; wrote = 0; }   /* fclose can fail the whole block */
+    if (bad) {
+        g_qlog_dropped += bad;
+        if (!g_qlog_warned) {
+            g_qlog_warned = 1;
+            fprintf(stderr, "[ann_search] qlog: %d of %d lines FAILED to write to %s\n",
+                    bad, bad + wrote, path);
+        }
+    }
     g_qlog_n = 0;
     g_qlog_last = GetTickCount();
+    g_qlog_last_error[0] = '\0';   /* a good flush clears the sticky error */
+    return wrote;
 }
 
 /* One line per completed search. `coord` is copied verbatim (may be empty ->
@@ -4925,8 +4968,12 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
     if (!qlog_enabled()) return;
     char esc_coord[160] = "";
     char esc_scope[560] = "";
+    char esc_sidf[160] = "";
     if (coord && coord[0]) lz_json_escape(esc_coord, sizeof(esc_coord), coord);
     if (scope && scope[0]) lz_json_escape(esc_scope, sizeof(esc_scope), scope);
+    /* the client sends this one too — unescaped it could carry a quote, a backslash or a
+     * raw newline into the line and split one search into two unparsable records */
+    if (sid_filter && sid_filter[0]) lz_json_escape(esc_sidf, sizeof(esc_sidf), sid_filter);
     unsigned qh = 0;
     const char *in_kind = "text";
     if (qtext && qtext[0]) {
@@ -4951,7 +4998,7 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
                        "%s{\"sid\":\"%s\",\"score\":%.4f,\"rank\":%d}",
                        i ? "," : "", esid, top_sc[i], i + 1);
     }
-    char line[768];
+    char line[QLOG_LINE];
     int n = snprintf(line, sizeof(line),
         "{\"v\":1,\"ts_ms\":%lld,\"coord\":%s%s%s,\"input_kind\":\"%s\","
         "\"input_hash\":\"fnv:%08x\","
@@ -4960,7 +5007,9 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
         "\"truncated\":%d,\"fallback\":%d,\"roster\":%d,\"walk_hash\":%u,"
         "\"top\":[%s],\"latency_us\":%.0f,\"mode\":\"%s\",\"batch\":%d,"
         "\"scope\":%s%s%s,\"sid_filter\":%s%s%s,\"model_hash\":null}",
-        qlog_ms(),
+        /* request clock, not answer clock: ts_ms used to be sampled after the walk, so every
+         * line was stamped late by exactly latency_us (measured 12-180 ms in the first day). */
+        qlog_ms() - (long long)(lat_us / 1000.0),
         esc_coord[0] ? "\"" : "", esc_coord[0] ? esc_coord : "null", esc_coord[0] ? "\"" : "",
         in_kind, qh, qtext ? (int)strlen(qtext) : 0, qd, topk, K,
         idx_mtime, idx_size, nent, items_scored, budget,
@@ -4968,14 +5017,56 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
         tops, lat_us,
         mode ? mode : "search", g_qlog_batch,
         esc_scope[0] ? "\"" : "", esc_scope[0] ? esc_scope : "null", esc_scope[0] ? "\"" : "",
-        (sid_filter && sid_filter[0]) ? "\"" : "", (sid_filter && sid_filter[0]) ? sid_filter : "null",
-        (sid_filter && sid_filter[0]) ? "\"" : "");
+        esc_sidf[0] ? "\"" : "", esc_sidf[0] ? esc_sidf : "null", esc_sidf[0] ? "\"" : "");
     if (n < 0) return;
     if (n >= (int)sizeof(line)) { g_qlog_dropped++; return; }   /* never truncate JSON */
+    if (g_qlog_n < 0 || g_qlog_n >= QLOG_RING) { g_qlog_dropped++; return; }  /* append guard */
     memcpy(g_qlog_line[g_qlog_n], line, (size_t)n + 1);
     g_qlog_n++;
     DWORD now = GetTickCount();
-    if (g_qlog_n >= QLOG_RING || (now - g_qlog_last) >= 1000) qlog_flush();
+    if (g_qlog_n >= QLOG_RING) qlog_flush();
+    else if ((now - g_qlog_last) >= 1000) qlog_flush();
+}
+
+/* A stop must not eat the tail: atexit only covers exit(), not the TerminateProcess that
+ * Ctrl-C, SCM stop and taskkill /F deliver. The console handler covers the first two; the
+ * timer covers "the last search of the day was 3 hours ago and the buffer is still in RAM". */
+static void qlog_atexit(void) { qlog_flush(); }
+
+static DWORD WINAPI qlog_timer(LPVOID arg) {
+    (void)arg;
+    const char *te = getenv("ANN_QUERY_LOG_TIMER_MS");
+    int period = (te && te[0]) ? atoi(te) : 500;
+    if (period <= 0) return 0;   /* 0 disables the timer (gate: keep lines buffered) */
+    for (;;) {
+        Sleep((DWORD)period);
+        if (!qlog_enabled() || !g_qlog_n) continue;
+        if (TryEnterCriticalSection(&g_lock)) {
+            if (g_qlog_n && (GetTickCount() - g_qlog_last) >= 1000) qlog_flush();
+            LeaveCriticalSection(&g_lock);
+        }
+    }
+    return 0;
+}
+
+static BOOL WINAPI qlog_on_ctrl(DWORD type) {
+    (void)type;
+    if (TryEnterCriticalSection(&g_lock)) {
+        qlog_flush();
+        LeaveCriticalSection(&g_lock);
+    }
+    return FALSE;   /* FALSE = let the default handler do the terminating */
+}
+
+/* A request that is refused is still an event: without this line the log cannot answer
+ * "was this ever asked?" and a 400 looks identical to a night with no traffic. */
+static void qlog_reject(const char *coord, const char *qtext, int topk,
+                        const char *scope, const char *sid_filter, const char *code) {
+    char mode[64];
+    snprintf(mode, sizeof(mode), "reject:%s", code ? code : "error");
+    qlog_search(coord, (qtext && qtext[0]) ? qtext : "(rejected)", NULL, 0, topk,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, mode,
+                NULL, NULL, NULL, 0, 0u, scope, sid_filter);
 }
 
 /* ── admin guard ─────────────────────────────────────────────────────────
@@ -5119,6 +5210,7 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         int el = snprintf(eb, sizeof(eb),
             "{\"status\":\"error\",\"error\":\"topk_out_of_range\","
             "\"requested\":%d,\"max\":%d}", stopk, ANN_MAXK);
+        qlog_reject(coord_buf, sq, stopk, scope_buf, sid_filter, "topk_out_of_range");
         lz_http_send(cli, "400 Bad Request", "application/json", eb, el);
         sock_close(cli);
         return 0;
@@ -5147,6 +5239,8 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
                 "\"scope\":\"%s\",\"fine\":%d,\"kind\":%d,\"topk\":%d}",
                 sr == 0 ? "scope_not_found" : "scope_too_narrow",
                 esc, fine_n, kind_n, stopk);
+            qlog_reject(coord_buf, sq, stopk, scope_buf, sid_filter,
+                        sr == 0 ? "scope_not_found" : "scope_too_narrow");
             lz_http_send(cli, "400 Bad Request", "application/json", eb, el);
             sock_close(cli);
             return 0;
@@ -5423,6 +5517,7 @@ static int handle_search_batch(sock_t cli, const char *rq) {
  * client can no longer hold the accept loop. */
 
 static void dispatch(sock_t cli, char *rq) {
+    g_qlog_batch = 0;   /* per request: the flag used to stay 1 forever after one batch call */
     char method[16] = "", path[256] = "";
     sscanf(rq, "%15s %255s", method, path);
     if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
@@ -5435,7 +5530,8 @@ static void dispatch(sock_t cli, char *rq) {
          * Guarded: see lz_admin_token_ok() above. */
         const char *want = getenv("ANN_ADMIN_TOKEN");
         int allowed = (want && want[0]) ? lz_admin_token_ok(rq, want) : lz_peer_is_loopback(cli);
-        char qresp[256];
+        char qresp[1024];   /* must hold the fixed fields + errbuf(420): at 256 the send used the
+                             * untruncated length and shipped stack bytes past the end (G7) */
         int qlen;
         if (!allowed) {
             qlen = snprintf(qresp, sizeof(qresp),
@@ -5449,12 +5545,34 @@ static void dispatch(sock_t cli, char *rq) {
             return;
         }
         int had = g_qlog_n;
-        qlog_flush();
+        int wrote = qlog_flush();
+        int lost = had - (wrote < 0 ? 0 : wrote);
+        /* The blind case that used to read as healthy: a flush that could not open the
+         * file answered "ok, lost 0". The sticky error now travels with the answer, and
+         * the path's backslashes are escaped so the JSON stays parseable. */
+        char errbuf[420];
+        errbuf[0] = '\0';
+        if (g_qlog_last_error[0]) {
+            char esc[360];
+            /* lz_json_escape, not a hand-rolled quote/backslash loop: the message carries a
+             * newline, and a raw newline inside a JSON string made the whole flush answer
+             * unparsable at the caller (gate G7 caught exactly that). */
+            lz_json_escape(esc, sizeof(esc), g_qlog_last_error);
+            snprintf(errbuf, sizeof(errbuf), ",\"last_error\":\"%s\"", esc);
+        }
         qlen = snprintf(qresp, sizeof(qresp),
-            "{\"status\":\"ok\",\"mode\":\"qlog_flush\",\"flushed\":%d,\"dropped\":%d,"
-            "\"auth\":\"%s\"}",
-            had, g_qlog_dropped, (want && want[0]) ? "token" : "loopback");
-        lz_http_send(cli, "200 OK", "application/json", qresp, qlen);
+            "{\"status\":\"%s\",\"mode\":\"qlog_flush\",\"flushed\":%d,\"lost\":%d,"
+            "\"dropped_total\":%ld,\"auth\":\"%s\"%s%s}",
+            (wrote < 0 || lost > 0) ? "error" : "ok",
+            wrote < 0 ? 0 : wrote, lost, g_qlog_dropped,
+            (want && want[0]) ? "token" : "loopback",
+            (wrote < 0 || lost > 0)
+                ? ",\"detail\":\"the log file could not be written; lines were counted as dropped\""
+                : "", errbuf);
+        if (qlen < 0) qlen = 0;
+        if (qlen >= (int)sizeof(qresp)) qlen = (int)sizeof(qresp) - 1;   /* send only what exists */
+        lz_http_send(cli, (wrote < 0 || lost > 0) ? "500 Internal Server Error" : "200 OK",
+                     "application/json", qresp, qlen);
         sock_close(cli);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state/tags") == 0) {
         handle_tags(cli);
@@ -5594,7 +5712,8 @@ static DWORD WINAPI client_thread(LPVOID arg) {
 
 int main(int argc, char **argv) {
     paths_init();
-    atexit(qlog_flush);   /* a clean stop never loses the tail of the log */
+    atexit(qlog_atexit);   /* a clean stop never loses the tail of the log */
+    SetConsoleCtrlHandler(qlog_on_ctrl, TRUE);   /* Ctrl-C / SCM stop flushes too */
     int port = 8096;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) port = atoi(argv[++i]);
@@ -5620,16 +5739,35 @@ int main(int argc, char **argv) {
             pa.sin_port = htons((uint16_t)port);
             pa.sin_addr.s_addr = htonl(0x7F000001);
             int held = (connect(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0);
-            closesocket(probe);
             if (held) {
-                fprintf(stderr, "[ann_search] port %d already accepting -> another instance "
-                                "holds it; exiting without loading the index\n", port);
+                /* Ask WHO is holding it. A stub, a proxy or a dev server on the same port
+                 * used to be reported as "another instance", which silently kept the ANN
+                 * service down while looking healthy. Only our own /health proves it. */
+                char who[128] = "";
+                const char *ping = "GET /health HTTP/1.0\r\n\r\n";
+                if (send(probe, ping, (int)strlen(ping), 0) > 0) {
+                    int got = recv(probe, who, (int)sizeof(who) - 1, 0);
+                    if (got > 0) who[got] = '\0';
+                }
+                closesocket(probe);
+                int ours = (strstr(who, "\"entries\"") != NULL);
+                if (ours) {
+                    fprintf(stderr, "[ann_search] port %d already serving ann (health answered) -> "
+                                    "exiting without loading the index\n", port);
+                    WSACleanup();
+                    return 0;
+                }
+                fprintf(stderr, "[ann_search] port %d is held by something that did not answer "
+                                "like ann_search; refusing to start (exit 1)\n", port);
                 WSACleanup();
-                return 0;
+                return 1;
             }
+            closesocket(probe);
         }
     }
     InitializeCriticalSection(&g_lock);
+    g_qlog_last = GetTickCount();   /* the first line must not force an instant flush */
+    g_qlog_thread = CreateThread(NULL, 0, qlog_timer, NULL, 0, NULL);   /* 1 s flush */
     { const char *ce = getenv("ANN_CANARY");
       g_cy_on = (ce && atoi(ce)) ? 1 : 0;
       const char *re = getenv("ANN_CANARY_RECOMPUTE");
