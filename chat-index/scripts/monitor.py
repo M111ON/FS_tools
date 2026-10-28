@@ -37,7 +37,8 @@ TREND_DAYS = 3         # consecutive lower snapshots before we call it a bleed
 TREND_MIN_PCT = 1.0    # ...and it must be at least this much overall
 
 LAYERS = ["session", "msg", "vault_turn", "block", "fact", "gitcommit",
-          "ds_conv", "ds_turn", "ds_chunk", "ann", "artifact"]
+          "ds_conv", "ds_turn", "ds_chunk", "ann", "artifact",
+          "metric", "doc", "project", "src"]
 
 
 def db_readonly():
@@ -48,18 +49,27 @@ def take_snapshot():
     """Counts must come from the map itself, so a snapshot can never disagree with
     what a query would return.  Audit numbers are best-effort: a missing table is
     recorded as null, not as 0 (0 is a claim)."""
-    d = db_readonly()
     snap = {"date": datetime.date.today().isoformat(), "layers": {}, "audit": {}}
+    try:
+        d = db_readonly()
+        d.execute("select 1 from session limit 1").fetchone()
+    except sqlite3.Error as e:
+        # a locked/unreadable map is NOT a quiet night: every count would be null and
+        # the judge would call that "nothing moved".  Refuse the snapshot instead.
+        return {"date": snap["date"], "status": "unreadable", "error": str(e),
+                "layers": {}, "audit": {}}
     for t in LAYERS:
         try:
             snap["layers"][t] = d.execute("select count(*) from " + t).fetchone()[0]
         except sqlite3.Error:
             snap["layers"][t] = None
     try:
-        r = d.execute("select built_at from build_receipt where id=1").fetchone()
-        snap["built_at"] = r[0] if r else None
-    except sqlite3.Error:
-        snap["built_at"] = None
+        st = DB.stat()
+        snap["db_bytes"] = st.st_size
+        snap["db_mtime"] = int(st.st_mtime)
+    except OSError:
+        snap["db_bytes"] = None
+        snap["db_mtime"] = None
     try:
         q = """
         select
@@ -135,37 +145,39 @@ def cliff_alarms(prev, cur):
 
 
 def trend_alarms(snaps):
-    """Consecutive-day declines only.  Returns (alarms, notes) where notes carry the
-    [gap] evidence so a quiet night can never be mistaken for a clean streak."""
+    """Consecutive-snapshot declines only.  Returns (alarms, notes) where notes carry
+    the [gap] evidence so a quiet night can never be mistaken for a clean streak.
+
+    A null value is not a zero: it means the layer could not be read that night, so it
+    breaks the run for that layer instead of being skipped (skipping lets one bad night
+    silently freeze the streak, which is the same silent failure in a quieter costume).
+    """
     alarms, notes = [], []
     if len(snaps) < 2:
         return alarms, notes
     snaps = snaps[-(TREND_DAYS + 3):]
-    # build contiguous runs by date
-    runs, cur = [], [snaps[0]]
     for prev, nxt in zip(snaps, snaps[1:]):
-        if (_d(nxt["date"]) - _d(prev["date"])).days == 1:
-            cur.append(nxt)
-        else:
+        missing = (_d(nxt["date"]) - _d(prev["date"])).days - 1
+        if missing:
             notes.append("[gap] %s -> %s (%d days missing, trend window restarted)"
-                         % (prev["date"], nxt["date"],
-                            (_d(nxt["date"]) - _d(prev["date"])).days - 1))
-            runs.append(cur)
-            cur = [nxt]
-    runs.append(cur)
-    for run in runs:
+                         % (prev["date"], nxt["date"], missing))
+    for k in LAYERS:
+        run = []                              # [(date, value)] with no gaps and no nulls
+        for s in snaps:
+            v = s.get("layers", {}).get(k)
+            if v is None or (run and (_d(s["date"]) - _d(run[-1][0])).days != 1):
+                run = []
+            if v is None:
+                continue
+            run.append((s["date"], v))
         if len(run) <= TREND_DAYS:
             continue
         tail = run[-(TREND_DAYS + 1):]
-        for k in LAYERS:
-            vals = [s.get("layers", {}).get(k) for s in tail]
-            if any(v is None for v in vals):
-                continue
-            steps = [b - a for a, b in zip(vals, vals[1:])]
-            if all(s < 0 for s in steps):
-                total = 100.0 * (vals[0] - vals[-1]) / vals[0] if vals[0] else 0
-                if total >= TREND_MIN_PCT:
-                    alarms.append((k, vals, total))
+        vals = [v for _, v in tail]
+        if all(b < a for a, b in zip(vals, vals[1:])):
+            total = 100.0 * (vals[0] - vals[-1]) / vals[0] if vals[0] else 0
+            if total >= TREND_MIN_PCT:
+                alarms.append((k, vals, total))
     return alarms, notes
 
 
@@ -183,6 +195,8 @@ def coverage(snap):
     print("  facts that never recorded a source at all           %5s" % a.get("facts_without_source"))
     print("  sessions with no content in any layer            %5s" % a.get("sessions_no_content"))
     print("  sessions still titled with the recovery marker    %5s" % a.get("marker_titles"))
+    print("  numeric cells indexed              %7s" % lay.get("metric"))
+    print("  repo docs indexed                  %7s" % lay.get("doc"))
     q = snap.get("query_log") or {}
     if q.get("lines"):
         print("  ANN queries logged today  %4s  with a coordinate %5s%%"
@@ -206,7 +220,18 @@ def judge(snaps, cur=None, quiet_ok=False):
         prev = snaps[-1] if snaps[-1]["date"] != cur["date"] else None
     cliffs = cliff_alarms(prev, cur) if prev else []
     trends, notes = trend_alarms(snaps[:] if cur is snaps[-1] else snaps + [cur])
+    nulls = [k for k in LAYERS if cur.get("layers", {}).get(k) is None]
     print("\nintegrity  %s" % cur["date"])
+    if nulls:
+        print("  [null]     %d/%d layers unreadable this run: %s"
+              % (len(nulls), len(LAYERS), ", ".join(nulls)))
+        if len(nulls) == len(LAYERS):
+            print("  FAIL LOUD: not one layer could be counted — this is not a quiet night")
+            return 1
+    if cur.get("db_mtime"):
+        print("  map        %.1f MB, written %s"
+              % ((cur.get("db_bytes") or 0) / 1048576.0,
+                 datetime.datetime.fromtimestamp(cur["db_mtime"]).strftime("%Y-%m-%d %H:%M")))
     if prev:
         print("  baseline   %s" % prev["date"])
     else:
@@ -268,6 +293,28 @@ def selftest():
     t, _ = trend_alarms(run2)
     check("flat snapshots never raise the trend alarm", t == [])
 
+    # a null night means "could not read", not "zero": it must cut the run, and the
+    # streak that starts after it must still be judgeable
+    holey = [{"date": "2026-10-%02d" % i,
+              "layers": {"msg": None if i == 3 else 1010 - i * 10}} for i in range(1, 8)]
+    t, _ = trend_alarms(holey)
+    check("a null night cuts the window instead of freezing it",
+          len(t) == 1 and t[0][1] == [970, 960, 950, 940])
+
+    nulls = {"date": "2026-10-08", "layers": {k: None for k in LAYERS}}
+    prev = {"date": "2026-10-07", "layers": {k: 10 for k in LAYERS}}
+    check("judging an all-null snapshot exits 1, never quiet",
+          judge([prev, nulls], nulls) == 1)
+
+    real_db = DB
+    try:
+        globals()["DB"] = Path(r"I:\tools\chat-index\__no_such_map__.db")
+        snap = take_snapshot()
+    finally:
+        globals()["DB"] = real_db
+    check("an unreadable map refuses to become a snapshot",
+          snap.get("status") == "unreadable" and snap["layers"] == {})
+
     print("\nselftest %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
 
@@ -320,6 +367,10 @@ def main():
         cur = snaps[-1]
     else:
         cur = take_snapshot()
+        if cur.get("status") == "unreadable":
+            print("FAIL LOUD: cannot read %s — %s" % (DB, cur.get("error")))
+            print("no snapshot written: a null snapshot would hide this night from the judge")
+            return 1
         snaps = [s for s in load_snapshots() if s.get("date") != cur["date"]] + [cur]
         f = write_snapshot(cur)
         print("snapshot  %s  (%s)" % (f.name, "written" if f.exists() else "FAILED"))

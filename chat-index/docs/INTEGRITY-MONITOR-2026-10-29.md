@@ -19,12 +19,14 @@ Exit `0` quiet · `2` alarm · `1` cannot judge (no map, no baseline) — never 
 
 Per day, `snapshots/snap-YYYYMMDD.json`:
 
-- **11 layer counts** read from `chatmap.db` itself (session, msg, vault_turn, block, fact,
-  gitcommit, ds_conv, ds_turn, ds_chunk, ann, artifact) — so a snapshot can never disagree with
-  what a query would return
+- **15 layer counts** read from `chatmap.db` itself (session, msg, vault_turn, block, fact,
+  gitcommit, ds_conv, ds_turn, ds_chunk, ann, artifact, metric, doc, project, src) — so a snapshot
+  can never disagree with what a query would return
 - **audit needles**: orphan facts, facts with no source at all, sessions with no content in any
   layer, sessions still carrying the recovery marker, long sessions (≥20 msg) with no block
 - **ANN log health**: lines written today and what share of them carry a `coord`
+- **build receipt**: `built_at` plus the map's byte size, so "the numbers did not move" and "the
+  map was not rebuilt" can be told apart
 
 ## The two alarms
 
@@ -38,6 +40,17 @@ day is not a data point**: the run reports `[gap] … trend window restarted` an
 window again from the next real snapshot, because a machine that was off is not evidence of decay
 and an alarm that cries wolf gets ignored — which is exactly how 25 days passed unnoticed.
 
+## Hardening after the audit
+
+Three holes found by reading the code back, all of the same family — a night that could not be read
+looking exactly like a night where nothing happened:
+
+| hole | what it did | fix |
+|---|---|---|
+| locked / unreadable map | every layer counted `None`, judge printed **quiet**, exit 0 | `take_snapshot` probes the DB first and returns `status: unreadable`; `main` exits 1 and **writes no snapshot** (a null snapshot would also hide the night from the judge) |
+| a `None` inside a trend window | that layer was skipped, so one bad night silently froze the streak forever | a null **cuts** the run like a gap; the streak that starts after it is still judged |
+| blind layers | `metric`, `doc`, `project`, `src` were never counted | added to `LAYERS` (15 total), and the snapshot now records the map's size + write time, so "numbers did not move" and "the map was never rebuilt" can be told apart |
+
 ## Gates, run for real
 
 ```
@@ -49,6 +62,9 @@ $ monitor.py --selftest
   pass  a gap breaks the trend window
   pass  4 lower snapshots in a row raise the trend alarm
   pass  flat snapshots never raise the trend alarm
+  pass  a null night cuts the window instead of freezing it
+  pass  judging an all-null snapshot exits 1, never quiet
+  pass  an unreadable map refuses to become a snapshot
   selftest ok
 
 $ monitor.py --drill shrink          # real files in a temp dir, msg -10%
@@ -70,14 +86,19 @@ $ (file-level gap drill: 10-01, 10-02, 10-05, 10-06 all declining)
 First real snapshot, 2026-10-29, quiet and consistent with `chatmap.py audit`:
 
 ```
-block summaries              935 over 2226 sessions
-long sessions (>=20 msg) with NO block summary     151
+block summaries              956 over 2237 sessions
+long sessions (>=20 msg) with NO block summary     154
 facts whose source session no longer exists           867   (= audit: 867)
 facts that never recorded a source at all             187   (= audit: 187)
 sessions with no content in any layer                2
 sessions still titled with the recovery marker       14   (was 67; 53 rebuilt from first message)
-ANN queries logged today     4  with a coordinate 100.0%
+numeric cells indexed                         208826
+repo docs indexed                                223
+ANN queries logged today    83  with a coordinate  61.4%
 ```
+
+`coord_pct` dropped from 100% because today's file mixes real MCP searches with the bench run that
+deliberately sends `coord` on only half its queries to prove null is logged, not dropped.
 
 That agreement is the point: two independent code paths printing the same 867 and 187 means neither
 is inventing a number. The first version of this monitor printed **1054** for orphans because it
