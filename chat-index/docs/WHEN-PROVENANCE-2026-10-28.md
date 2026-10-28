@@ -91,6 +91,22 @@ Field rationale, one line each:
 | block absence | reported as `block_absent`, never silent |
 | latency | 0.2–0.4 s per query |
 
+## Round 2 (2026-10-29, after an audit of the same code)
+
+Four ways the first version could still mislead, and what replaced them:
+
+| defect | fix | seen on a real query |
+|---|---|---|
+| `layers.<name>.n` was "rows in the display page", so `-k 5` made a layer look like it had 5 hits | `n` is the **total occurrence count**, the list is only the page; `why` says `total occurrences (list is the first N)` | `when 0.9627`: `time=63` rows, 10 distinct events; with `-k 3` the count no longer moves |
+| the layer `printf`-built SQL with `%`-unescaped user text — a `%` or `_` in the query widened the match silently | every value goes through `_like()` and every pattern carries `escape '\'` | `when 50%` → `time=997` rows, not the whole 29,179-cell layer |
+| a Thai query was only ever searched in the ASCII layers, so Thai text looked absent | Thai terms reach the same layers (SQLite `LIKE` is byte-wise, so the prefix/suffix windows still span the term) | `when ท่อ`: `time=2958 vault=87 fact=41 commit=199 doc=76 block=157` |
+| the block-count SQL bound 4 placeholders while 8 values were supplied — the count threw instead of answering | one parenthesised group per normalised form | `when 0.9627` runs clean; the error is gone |
+
+Integer-shaped queries are still weak on purpose: `when 454` reaches `vault=348 artifact=202`
+by substring, which is honest (the digits do appear) but not selective. Use `when` for numbers
+with a decimal point, identifiers, hashes, and Thai phrases — the cases where a substring is
+already the answer.
+
 ## What this proves on a real case
 
 `when 0.9627` returns the four messages where the ANN bucket number was measured (2026-10-23

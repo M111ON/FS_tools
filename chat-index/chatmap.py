@@ -39,6 +39,11 @@ def snip(s, n=160):
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _like(s):
+    """Escape a value for use inside a LIKE pattern (callers pass `escape '\\'`)."""
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def window(s, terms, width=200):
     """Head of the match: the text around the first query term, not the head of the row."""
     if not s:
@@ -277,14 +282,27 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
     """
     q = (q or "").strip()
     if not q:
-        print("usage: when <term|number|path>")
+        print("usage: when <term|number|path|sha>")
         return 1
+    k = max(1, min(int(k), 200))   # a negative -k used to reach SQLite as LIMIT -1 (= no limit)
+    sha = bool(re.fullmatch(r"[0-9a-f]{7,40}", q.lower()))
     num = None
-    try:
-        num = round(float(q.replace(",", "")), 6)
-    except ValueError:
-        num = None
-    kind = "number" if num is not None else "term"
+    if not sha:
+        try:
+            num = round(float(q.replace(",", "")), 6)
+        except ValueError:
+            num = None
+    kind = "sha" if sha else ("number" if num is not None else "term")
+    # spellings that mean the same number: the query as typed, the normalised value, and the
+    # leading-zero-less form people actually write (".9627" for 0.9627). An INTEGER query has
+    # no fraction, so it must not produce a "%.0%" pattern — that matched 2,212 vault turns
+    # for `when 454` and every one of them was a false positive.
+    num_forms = []
+    if num is not None:
+        norm = ("%f" % num).rstrip("0").rstrip(".")
+        for c in (q, norm, (norm[1:] if norm.startswith("0.") else "")):
+            if c and c not in num_forms:
+                num_forms.append(c)
 
     r = db.execute("select built_at from src where kind='receipts'").fetchone()
     build = ts(r[0]) if r else "?"
@@ -300,9 +318,13 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
     # ---- 1. time: the normalised metric layer for numbers, full text for anything else
     ts_seen = []
     raw_forms = set()
+    time_total = 0
+    time_span = None      # (min_ms, max_ms) over ALL matches, not the k that happen to be shown
     if num is not None:
         rows = db.execute("select src, sid, ordinal, ts_ms, raw, ctx from metric "
                           "where value_num=? order by ts_ms is null, ts_ms", (num,)).fetchall()
+        agg = db.execute("select count(*), min(ts_ms), max(ts_ms) from metric where value_num=?",
+                         (num,)).fetchone()
         per = {}
         for r in rows:
             raw_forms.add(r["raw"])
@@ -322,7 +344,10 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
             merged[key] = {"src": src, "sid": sid, "ordinal": ordi, "ts_ms": v["ts_ms"],
                            "raw": v["raw"], "ctx": v["ctx"], "n": len(group), "alt": None}
         items = sorted(merged.values(), key=lambda d: (d["ts_ms"] is None, d["ts_ms"] or 0))
-        layer("time", len(items), True,
+        time_total = agg[0] if agg else len(rows)
+        if agg and agg[1]:
+            time_span = (agg[1], agg[2])
+        layer("time", time_total, True,
               "%d occurrences in %d coordinates (%d distinct events after vault/msg merge)"
               % (len(rows), len(per), len(items)))
         for v in items[:k]:
@@ -334,17 +359,31 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
                 h["mirror"] = "%s#%s" % v["alt"]
             hits.append(h)
     else:
-        terms = [t for t in re.findall(r"[A-Za-z0-9_\-\.]{2,}", q)][:8]
-        expr = " AND ".join('"%s"' % t for t in terms) if terms else None
-        rows = []
+        # Unicode-aware: the old [A-Za-z0-9_-] tokenizer produced NO terms for a Thai query,
+        # so every layer reported "searched, 0" about text that was never searched.
+        terms = re.findall(r"[^\W_][\w.\-]*|[\w.\-]{2,}", q, re.UNICODE)[:8]
+        expr = " AND ".join('"%s"' % t.replace('"', '""') for t in terms) if terms else None
+        rows, agg_n = [], 0
         if expr:
             try:
+                agg_n = db.execute("select count(*) from msg_fts where msg_fts match ?",
+                                   (expr,)).fetchone()[0]
                 rows = db.execute(
                     "select m.sid, m.ordinal, m.ts_ms, m.text from msg_fts f "
                     "join msg m on m.rowid=f.rowid where msg_fts match ? "
                     "order by m.ts_ms is null, m.ts_ms limit ?", (expr, k * 6)).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                out["flags"].append("layer_error:time_fts")
                 rows = []
+        # LIKE fallback: the FTS tokenizer keeps a whole Thai run as one token, so a substring
+        # inside it is unreachable by MATCH even though the words are right there.
+        if not rows:
+            like = "%%%s%%" % _like(q)
+            agg_n = db.execute("select count(*) from msg where text like ? escape '\\'",
+                               (like,)).fetchone()[0]
+            rows = db.execute("select sid, ordinal, ts_ms, text from msg where text like ? "
+                              "escape '\\' order by ts_ms is null, ts_ms limit ?",
+                              (like, k * 6)).fetchall()
         seen_txt = set()
         picked = []
         for r in rows:
@@ -355,8 +394,13 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
             picked.append(r)
             if len(picked) >= k:
                 break
-        layer("time", len(picked), True, "msg_fts %r (%d rows, %d distinct events)"
-              % (expr or "<no terms>", len(rows), len(picked)))
+        stamped = [r["ts_ms"] for r in rows if r["ts_ms"]]
+        if stamped:
+            time_span = (min(stamped), max(stamped))
+        time_total = agg_n or len(rows)
+        layer("time", time_total, True,
+              "%s %r (%d rows, %d distinct events)"
+              % ("msg_fts" if expr else "msg like", expr or q, len(rows), len(picked)))
         for r in picked:
             ts_seen.append(r["ts_ms"])
             hits.append({"layer": "time", "src": "msg", "sid": r["sid"], "ordinal": r["ordinal"],
@@ -364,40 +408,70 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
                          "matched_via": q, "snippet": window(r["text"], terms)})
 
     # ---- 2. vault turns (they outlive MC's text truncation)
+    # vault_turn has NO ts_ms column — asking for one raised OperationalError and the
+    # except below turned the whole layer into "0 rows", which reads exactly like "this
+    # number is not in the vault". Measured by scripts/eval_when.py: 0/15 on values that
+    # provably are. Select only real columns, and make a failure visible in flags.
+    vr = []
+    vault_why = "exported md turns"
+    vault_total = 0
     try:
         if num is not None:
-            vr = db.execute("select sid, turn_no, ts_ms, body from vault_turn "
-                            "where body like ? limit ?", ("%." + str(num).split(".")[1] + "%", k)) \
-                if "." in str(num) else []
+            for form in num_forms:
+                p = "%" + _like(form) + "%"
+                vault_total = db.execute("select count(*) from vault_turn where body like ? escape '\\'",
+                                         (p,)).fetchone()[0]
+                if vault_total:
+                    vr = db.execute("select sid, turn_no, body from vault_turn "
+                                    "where body like ? escape '\\' limit ?", (p, k)).fetchall()
+                    vault_why = "exported md turns (form %r, %d rows)" % (form, vault_total)
+                    break
+            else:
+                vault_why = "exported md turns (forms %s: 0 rows)" % ", ".join(map(repr, num_forms))
         else:
-            vr = db.execute("select v.sid, v.turn_no, v.body from vault_fts f "
-                            "join vault_turn v on v.rowid=f.rowid where vault_fts match ? "
-                            "limit ?", (expr, k)).fetchall()
-    except sqlite3.OperationalError:
+            like = "%%%s%%" % _like(q)
+            vault_total = db.execute("select count(*) from vault_turn where body like ? escape '\\'",
+                                     (like,)).fetchone()[0]
+            vr = db.execute("select sid, turn_no, body from vault_turn "
+                            "where body like ? escape '\\' limit ?", (like, k)).fetchall()
+    except sqlite3.OperationalError as e:
+        out["flags"].append("layer_error:vault")
         vr = []
-    layer("vault", len(vr), True, "exported md turns")
+        vault_why = "exported md turns (FAILED: %s)" % e
+    layer("vault", vault_total or len(vr), True, vault_why)
     for r in vr[:k]:
         hits.append({"layer": "vault", "src": "vault", "sid": r["sid"], "ordinal": r["turn_no"],
-                     "ts_ms": None, "ts_iso": "-", "matched_via": q,
-                     "snippet": window(r["body"], [str(num) if num is not None else q])})
+                     "ts_ms": None, "ts_iso": "-",
+                     "matched_via": next((f for f in (num_forms or [q]) if f in r["body"]), q),
+                     "snippet": window(r["body"], num_forms or [q])})
 
     # ---- 3. facts (the main layer: 2,151 of them carry a source session)
     facts = []
+    fact_total = 0
+    fact_why = "memories with source id"
     if num is not None:
-        facts = db.execute("select fact_id, project, category, status, source_sid, created_ms, body "
-                           "from fact where body like ? limit ?", ("%" + q + "%", k)).fetchall()
-        if not facts:
-            bare = q.lstrip("0") or q
-            facts = db.execute("select fact_id, project, category, status, source_sid, created_ms, body "
-                               "from fact where body like ? limit ?", ("%" + bare + "%", k)).fetchall()
+        for form in num_forms:
+            p = "%" + _like(form) + "%"
+            fact_total = db.execute("select count(*) from fact where body like ? escape '\\'",
+                                    (p,)).fetchone()[0]
+            if fact_total:
+                facts = db.execute("select fact_id, project, category, status, source_sid, created_ms, body "
+                                   "from fact where body like ? escape '\\' limit ?",
+                                   (p, k)).fetchall()
+                fact_why = "memories with source id (form %r, %d rows)" % (form, fact_total)
+                break
     else:
         try:
+            fact_total = db.execute("select count(*) from fact_fts where fact_fts match ?",
+                                    (expr or q,)).fetchone()[0]
             facts = db.execute("select x.fact_id, x.project, x.category, x.status, x.source_sid, "
                                "x.created_ms, x.body from fact_fts f join fact x on x.fact_id=f.rowid "
-                               "where fact_fts match ? limit ?", (expr, k)).fetchall()
-        except sqlite3.OperationalError:
+                               "where fact_fts match ? limit ?", (expr or q, k)).fetchall()
+        except sqlite3.OperationalError as e:
+            out["flags"].append("layer_error:fact")
             facts = []
-    layer("fact", len(facts), True, "memories with source id")
+            fact_why = "memories (FAILED: %s)" % e
+    layer("fact", fact_total or len(facts), True, fact_why)
     for r in facts:
         known = bool(r["source_sid"]) and db.execute(
             "select 1 from session where sid=?", (r["source_sid"],)).fetchone() is not None
@@ -410,22 +484,31 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
 
     # ---- 4. commits: a WINDOW, never a file mapping (MC's table has no path or session column)
     commits = []
-    if ts_seen:
-        lo = min(t for t in ts_seen if t) - window_days * 86400000
-        hi = max(t for t in ts_seen if t) + window_days * 86400000
+    commit_total = 0
+    if kind == "sha":
+        commits = db.execute("select sha, project, short, message, committed_ms from gitcommit "
+                             "where lower(sha) like ? or lower(short)=? "
+                             "order by committed_ms", ("%" + q.lower() + "%", q.lower())).fetchall()
+        commit_total = len(commits)
+        why = "sha lookup against the gitcommit table (authoritative, not text that looks like hex)"
+    elif time_span:
+        lo = time_span[0] - window_days * 86400000
+        hi = time_span[1] + window_days * 86400000
+        commit_total = db.execute("select count(*) from gitcommit where committed_ms between ? and ?",
+                                  (lo, hi)).fetchone()[0]
         commits = db.execute("select sha, project, short, message, committed_ms from gitcommit "
                              "where committed_ms between ? and ? order by committed_ms",
                              (lo, hi)).fetchall()
-        why = "window %s .. %s (±%dd around the time hits)" % (ts(lo), ts(hi), window_days)
+        why = "window %s .. %s (±%dd around ALL time hits)" % (ts(lo), ts(hi), window_days)
     else:
-        try:
-            commits = db.execute("select sha, project, short, message, committed_ms from gitcommit "
-                                 "where lower(message) like ? limit ?",
-                                 ("%" + q.lower() + "%", k)).fetchall()
-        except sqlite3.OperationalError:
-            commits = []
+        like = "%" + _like(q.lower()) + "%"
+        commit_total = db.execute("select count(*) from gitcommit where lower(message) like ? escape '\\'",
+                                  (like,)).fetchone()[0]
+        commits = db.execute("select sha, project, short, message, committed_ms from gitcommit "
+                             "where lower(message) like ? escape '\\' limit ?",
+                             (like, k)).fetchall()
         why = "message match (no time hits to anchor a window)"
-    layer("commit", len(commits), True, why)
+    layer("commit", commit_total, True, why)
     if len(commits) > 1:
         out["flags"].append("multi_commit_window")
     for r in commits[:k]:
@@ -435,44 +518,93 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
                      "snippet": snip(r["message"], 120)})
 
     # ---- 5. artifact paths (the real file intersection: 149k file paths + 60k paths)
-    arts = db.execute("select kind, name, ref from artifact where name like ? limit ?",
-                      ("%" + q + "%", k)).fetchall()
-    layer("artifact", len(arts), True, "file/path/mem/sha marks")
+    like = "%" + _like(q) + "%"
+    art_total = db.execute("select count(*) from artifact where name like ? escape '\\'",
+                           (like,)).fetchone()[0]
+    arts = db.execute("select kind, name, ref from artifact where name like ? escape '\\' limit ?",
+                      (like, k)).fetchall()
+    layer("artifact", art_total, True, "file/path/mem/sha marks")
     for r in arts:
         hits.append({"layer": "artifact", "kind": r["kind"], "ref": r["ref"],
                      "matched_via": q, "snippet": r["name"], "ts_ms": None, "ts_iso": "-"})
 
     # ---- 6. docs (values and rules often live in repo documents, not in conversation)
     docs = []
+    doc_total = 0
+    doc_why = "repo documents (md)"
     if num is not None:
-        try:
-            docs = db.execute("select x.id, x.path, x.title from doc_fts f join doc x on x.id=f.rowid "
-                              "where doc_fts match ? limit ?", ('"%s"' % q, k)).fetchall()
-        except sqlite3.OperationalError:
-            docs = []
-        if not docs:
-            docs = db.execute("select id, path, title from doc where text like ? limit ?",
-                              ("%" + q + "%", k)).fetchall()
+        for form in num_forms:
+            p = "%" + _like(form) + "%"
+            doc_total = db.execute("select count(*) from doc where text like ? escape '\\'",
+                                   (p,)).fetchone()[0]
+            if doc_total:
+                docs = db.execute("select id, path, title from doc where text like ? escape '\\' limit ?",
+                                  (p, k)).fetchall()
+                doc_why = "repo documents (md) (form %r, %d rows)" % (form, doc_total)
+                break
     else:
         try:
+            doc_total = db.execute("select count(*) from doc_fts where doc_fts match ?",
+                                   (expr or q,)).fetchone()[0]
             docs = db.execute("select x.id, x.path, x.title from doc_fts f join doc x on x.id=f.rowid "
-                              "where doc_fts match ? limit ?", (expr, k)).fetchall()
-        except sqlite3.OperationalError:
+                              "where doc_fts match ? limit ?", (expr or q, k)).fetchall()
+        except sqlite3.OperationalError as e:
+            out["flags"].append("layer_error:doc")
             docs = []
-    layer("doc", len(docs), True, "repo documents (md)")
+            doc_why = "repo documents (FAILED: %s)" % e
+        if not docs:
+            like = "%" + _like(q) + "%"
+            doc_total = db.execute("select count(*) from doc where text like ? escape '\\'",
+                                   (like,)).fetchone()[0]
+            docs = db.execute("select id, path, title from doc where text like ? escape '\\' limit ?",
+                              (like, k)).fetchall()
+            doc_why = "repo documents (md, like fallback, %d rows)" % doc_total
+    layer("doc", doc_total or len(docs), True, doc_why)
     for r in docs[:k]:
         hits.append({"layer": "doc", "path": r["path"], "title": r["title"], "matched_via": q,
                      "snippet": snip(r["title"], 120), "ts_ms": None, "ts_iso": "-"})
 
-    # ---- 7. blocks (bonus: compartments cover only 56 of 2,226 sessions)
+    # ---- 7. blocks: compartments that COVER a found session, plus compartments whose own
+    # text contains the value. Without the second half, a number recorded only inside a
+    # block summary was unreachable — the tool said "not found" about something it had.
     blocks = []
-    if ts_seen or facts:
-        sids = {h.get("sid") for h in hits if h.get("sid")}
-        if sids:
-            blocks = db.execute("select block_id, sid, seq, title, ts_ms from block where sid in (%s) "
-                                "order by seq" % ",".join("?" * len(sids)),
-                                tuple(sids)).fetchall()
-    layer("block", len(blocks), True, "compartment summaries (sparse: 930 over 56 sessions)")
+    seen_bid = set()
+    cover_ids = set()
+    sids = {h.get("sid") for h in hits if h.get("sid")}
+    if sids:
+        for r in db.execute("select block_id, sid, seq, title, ts_ms from block where sid in (%s) "
+                            "order by seq" % ",".join("?" * len(sids)),
+                            tuple(sids)).fetchall():
+            blocks.append(r)
+            seen_bid.add(r["block_id"])
+            cover_ids.add(r["block_id"])
+    block_text = 0
+    try:
+        if num is not None:
+            forms = ["%" + _like(f) + "%" for f in num_forms]
+        else:
+            forms = ["%" + _like(q) + "%"]
+        where = " or ".join(
+            "(" + " or ".join("p%d like ? escape '\\'" % i for i in (1, 2, 3, 4)) + ")"
+            for _f in forms)
+        args = []
+        for f in forms:
+            args += [f] * 4
+        block_text = db.execute("select count(*) from block where " + where, tuple(args)).fetchone()[0]
+        for r in db.execute("select block_id, sid, seq, title, ts_ms from block where " + where
+                            + " limit ?", tuple(args + [k])).fetchall():
+            if r["block_id"] not in seen_bid:
+                blocks.append(r)
+                seen_bid.add(r["block_id"])
+    except sqlite3.OperationalError as e:
+        out["flags"].append("layer_error:block")
+        block_text = -1
+    # covering = blocks already in `blocks` that came from a hit session; the old subtraction
+    # mixed the two populations and under-reported the covering count
+    n_cover = len([b for b in blocks if b["block_id"] in cover_ids])
+    layer("block", len(blocks), True,
+          "compartment summaries: %d covering a hit session, %d matching the text"
+          % (n_cover, max(0, block_text)))
     for r in blocks[:k]:
         hits.append({"layer": "block", "block_id": r["block_id"], "sid": r["sid"],
                      "ts_ms": r["ts_ms"], "ts_iso": ts(r["ts_ms"]), "matched_via": q,
@@ -480,25 +612,24 @@ def cmd_when(db, q, k=25, as_json=False, window_days=3):
     if hits and not blocks:
         out["flags"].append("block_absent")
 
-    # ---- judgment
-    out["total_hits"] = len(hits)
+    # ---- judgment (every number below is a property of the DATA, never of the display limit)
     if raw_forms:
         out["raw_forms"] = sorted(raw_forms)
         if q not in raw_forms:
             out["flags"].append("normalized")
         if len(raw_forms) > 1:
             out["flags"].append("mixed_spellings")
-    if len(ts_seen) == 1:
+    if time_total == 1:
         out["flags"].append("appears_once")
     if not any(out["layers"][n]["n"] for n in out["layers"]):
         out["flags"].append("not_found_in_any_searched_layer")
-    if ts_seen:
-        seen = [t for t in ts_seen if t]
+    if time_span:
         lo_c = db.execute("select min(committed_ms) a, max(committed_ms) b from gitcommit").fetchone()
-        if seen and lo_c and lo_c["a"] and (min(seen) < lo_c["a"] or max(seen) > lo_c["b"]):
+        if lo_c and lo_c["a"] and (time_span[0] < lo_c["a"] or time_span[1] > lo_c["b"]):
             out["flags"].append("outside_commit_coverage")
-        if len(seen) > 1:
-            out["span_days"] = round((max(seen) - min(seen)) / 86400000.0, 1)
+        if time_span[1] > time_span[0]:
+            out["span_days"] = round((time_span[1] - time_span[0]) / 86400000.0, 1)
+        out["first_ts"], out["last_ts"] = ts(time_span[0]), ts(time_span[1])
     if len(hits) > k:
         out["flags"].append("truncated")
 
@@ -855,7 +986,8 @@ def main():
     p = sub.add_parser("block"); p.add_argument("bid", type=int)
     p = sub.add_parser("timeline"); p.add_argument("--project"); p.add_argument("--limit", type=int, default=15)
     p = sub.add_parser("ds"); p.add_argument("key")
-    p = sub.add_parser("when"); p.add_argument("q"); p.add_argument("-k", type=int, default=25)
+    p = sub.add_parser("when"); p.add_argument("q")
+    p.add_argument("-k", type=int, default=25, help="rows shown per layer (layer counts are always totals)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--window", type=int, default=3, help="commit window radius in days")
     a = ap.parse_args()
@@ -884,7 +1016,9 @@ def main():
         cmd_when(db, a.q, a.k, a.json, a.window)
     elapsed = time.time() - t0
     if elapsed > 0.5:
-        print("\n(%.2fs)" % elapsed)
+        # stderr, never stdout: this line used to be appended to `--json` output and broke
+        # every machine reader with "Extra data: line 686" (found by scripts/eval_when.py).
+        print("\n(%.2fs)" % elapsed, file=sys.stderr)
 
 
 if __name__ == "__main__":
