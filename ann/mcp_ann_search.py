@@ -61,18 +61,25 @@ def _call(method, path, body=None):
 
 
 @mcp.tool()
-def ann_search(query: str, topk: int = 5, sid: str = "") -> str:
+def ann_search(query: str, topk: int = 5, sid: str = "", coord: str = "") -> str:
     """Semantic search over the memcore-derived ANN index (~62k entries).
 
     Args:
         query: natural language query (Thai or English)
         topk: number of results (default 5)
-        sid: optional session id for the server's route log (usually omit)
+        sid: optional session id — FILTERS the search to that session's rows
+        coord: optional provenance stamp "sid#ordinal" of the message this query
+            is about. It does not change the search; it lands in
+            data/query_log/ann_query-*.jsonl so `chatmap.py when` can later show
+            which searches consumed that message. Omit it and the log records
+            coord:null, which is honest but unattributable.
 
     Returns the ANN server's JSON: hits with scores plus route/anchor info."""
     body = {"query": query, "topk": max(1, min(int(topk), 64))}
     if sid:
         body["sid"] = sid
+    if coord:
+        body["coord"] = coord
     return json.dumps(_call("POST", "/v1/state/search", body),
                       ensure_ascii=False, indent=1)
 
