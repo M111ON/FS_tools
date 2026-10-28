@@ -3449,11 +3449,17 @@ static int graft_candidates(uint32_t *out, int cap) {
  * PATH_ORDER, and rewrites PATH_INDEX with anchor/anchor2 fields added.
  * This is what makes a fresh base index (sid/file/npast/dim/vec) routable.
  *
- * ── REGROW MODES (2026-10-20) ──
- *   unchanged   : index mtime+size+rowcount match the state file AND the
- *                 anchors load with their checksum -> return WITHOUT reading
- *                 or writing anything beyond stat + a small anchors read
- *                 (measured <0.5s). Telemetry: mode:"unchanged", skipped:1.
+ * ── REGROW MODES (2026-10-20, mtime-tolerant 2026-10-28) ──
+ *   unchanged   : index size matches the state file, the anchors load with
+ *                 their checksum, the labels sidecar is live, AND the file is
+ *                 the same one the state was written for — proven by mtime, or
+ *                 (when mtime differs, e.g. a copy/restore) by the last line
+ *                 still carrying state.last_sid. Returns WITHOUT reading or
+ *                 writing anything beyond stat + a small anchors read + one
+ *                 tail line (measured 4-13 ms). Telemetry: mode:"unchanged",
+ *                 skipped:1. Rationale: mtime is not content — a restored
+ *                 index with identical bytes used to pay a full 59 s kmeans
+ *                 re-derive (measured 2026-10-28).
  *   incremental : the index GREW by appending only — the line at
  *                 state.n_prev-1 still carries state.last_sid, n >= n_prev.
  *                 Reuses the EXISTING trained anchors (no kmeans); routes ONLY
@@ -3488,11 +3494,19 @@ typedef struct {
     long index_mtime, index_size;
     int K;
     unsigned anchors_cksum;
+    /* identity fingerprint of the index the state was written for: FNV1a-64 over
+     * (size, n_prev, anchors_cksum, first 4 KB, last 4 KB). 0 = absent (state
+     * written before 2026-10-28). This is what proves "same file" without
+     * trusting the mtime — a copy or restore changes the mtime but not the
+     * bytes, and an in-place edit of the first or last row changes the bytes
+     * but not the mtime-only contract. */
+    unsigned long long index_fp;
 } RegrowState;
 static void regrow_state_load(RegrowState *st) {
     st->n_prev = -1;
     st->last_sid[0] = 0;
     st->index_mtime = -1; st->index_size = -1; st->K = -1; st->anchors_cksum = 0;
+    st->index_fp = 0;
     FILE *f = fopen(regrow_state_path(), "r");
     if (!f) return;
     char sb[2048];
@@ -3516,6 +3530,8 @@ static void regrow_state_load(RegrowState *st) {
     if (p) st->K = atoi(p + 4);
     p = strstr(sb, "\"anchors_cksum\":");
     if (p) st->anchors_cksum = (unsigned)strtoul(p + 16, NULL, 10);
+    p = strstr(sb, "\"index_fp\":");
+    if (p) st->index_fp = strtoull(p + 11, NULL, 10);
 }
 /* THE GATE: the sidecar's labels are valid for this buffer only if the
  * buffer's prefix is the SAME rows the sidecar was computed for. The proof
@@ -3523,6 +3539,8 @@ static void regrow_state_load(RegrowState *st) {
  * A buffer that fails it gets NO sidecar labels: the route then reads as
  * dead and the walk fails loud (full scan) instead of routing by stamps
  * that belong to another index version. */
+static unsigned long long lz_index_fp(const char *path, long size, long n_prev,
+                                      unsigned anchors_cksum);   /* defined below */
 static int lz_stamp_prefix_ok(const LZEntry *a, int n, int *why) {
     if (why) *why = 0;
     if (!a || n <= 0) { if (why) *why = 2; return 0; }
@@ -3548,9 +3566,9 @@ static void regrow_state_save(const RegrowState *st, double full_ms) {
     lz_json_escape(esid, sizeof(esid), st->last_sid);
     fprintf(f, "{\"n_prev\":%ld,\"last_sid\":\"%s\",\"index_mtime\":%ld,"
                "\"index_size\":%ld,\"K\":%d,\"anchors_cksum\":%u,"
-               "\"full_ms\":%.0f}\n",
+               "\"index_fp\":%llu,\"full_ms\":%.0f}\n",
             st->n_prev, esid, st->index_mtime, st->index_size, st->K,
-            st->anchors_cksum, full_ms);
+            st->anchors_cksum, st->index_fp, full_ms);
     fclose(f);
     remove(regrow_state_path());
     if (rename(tmp, regrow_state_path()) != 0) remove(tmp);
@@ -3652,6 +3670,7 @@ static int lz_restamp(int *n_out, int *K_out) {
                     }
                     ns.K = K;
                     ns.anchors_cksum = anch_cksum(C, K, dim);
+                    ns.index_fp = lz_index_fp(PATH_INDEX, ns.index_size, n, ns.anchors_cksum);
                     regrow_state_save(&ns, 0.0);
                     rc = 0;
                     *n_out = n;
@@ -3763,6 +3782,86 @@ typedef struct {
     double ms_load, ms_train, ms_route, ms_rewrite, ms_save;
 } RegrowTelemetry;
 
+/* ── index identity fingerprint (2026-10-28) ──
+ * FNV1a-64 over (size, n_prev, anchors_cksum) plus the first and last 4 KB of
+ * the index. Two 4 KB reads, so O(1) — this is what the unchanged fast path
+ * compares when the mtime differs (a copy or restore), instead of trusting a
+ * timestamp. It covers append/truncate (size), a retrain (anchors_cksum), and
+ * an edit of the first or last row (window bytes); an edit in the middle of a
+ * 263 MB file is NOT covered — only a full-file hash would, at ~0.1-0.2 s. */
+#define LZ_FNV_OFF 1469598103934665603ULL
+#define LZ_FNV_PRIME 1099511628211ULL
+static unsigned long long lz_fnv64(unsigned long long h, const void *buf, size_t n) {
+    const unsigned char *p = (const unsigned char *)buf;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned long long)p[i]; h *= LZ_FNV_PRIME; }
+    return h;
+}
+static unsigned long long lz_index_fp(const char *path, long size, long n_prev,
+                                      unsigned anchors_cksum) {
+    unsigned long long h = LZ_FNV_OFF;
+    char hdr[96];
+    int hl = snprintf(hdr, sizeof(hdr), "%ld|%ld|%u", size, n_prev, anchors_cksum);
+    if (hl > 0) h = lz_fnv64(h, hdr, (size_t)hl);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char win[4096];
+    size_t got = fread(win, 1, sizeof(win), f);
+    if (got) h = lz_fnv64(h, win, got);
+    if (size > (long)sizeof(win) && fseek(f, size - (long)sizeof(win), SEEK_SET) == 0) {
+        got = fread(win, 1, sizeof(win), f);
+        if (got) h = lz_fnv64(h, win, got);
+    }
+    fclose(f);
+    return h ? h : 1;   /* 0 is the "state predates the fingerprint" sentinel */
+}
+
+/* Does the LAST line of <path> still carry <want_sid>? O(1): seek into the final
+ * 64 KB, find the last complete line, read its "sid" field. The unchanged fast
+ * path uses this when the mtime differs but the bytes may be identical (a copy
+ * or a restore) — mtime is not content, and paying a full kmeans re-derive for a
+ * timestamp is the bug this closes (measured 2026-10-28: 59 s -> 13 ms).
+ * Returns 1 on match, 0 when the tail is unreadable, cut off, or different. */
+static int lz_index_tail_sid_is(const char *path, const char *want_sid) {
+    if (!want_sid || !want_sid[0]) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int ok = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long end = ftell(f);
+        long win = 65536;
+        long start = (end > win) ? end - win : 0;
+        if (end > 0 && fseek(f, start, SEEK_SET) == 0) {
+            size_t cap = (size_t)(end - start);
+            char *b = (char *)malloc(cap + 1);
+            if (b && fread(b, 1, cap, f) == cap) {
+                b[cap] = 0;
+                char *p = b + cap;                  /* trim trailing newlines */
+                while (p > b && (p[-1] == '\n' || p[-1] == '\r')) p--;
+                char *line_end = p;
+                char *line_start = line_end;
+                while (line_start > b && line_start[-1] != '\n') line_start--;
+                /* a window that cut into the line cannot be trusted */
+                if (line_start > b || start == 0) {
+                    char save = *line_end;
+                    *line_end = 0;
+                    const char *k = strstr(line_start, "\"sid\"");
+                    if (k) {
+                        k = strchr(k, ':');
+                        if (k) { k++; while (*k == ' ') k++; if (*k == '"') k++; }
+                        size_t wl = strlen(want_sid);
+                        if (k && strncmp(k, want_sid, wl) == 0 &&
+                            (k[wl] == '"' || k[wl] == 0)) ok = 1;
+                    }
+                    *line_end = save;
+                }
+            }
+            free(b);
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
 static int lz_anchor_refresh(int force, int *Kout, int *nout,
                              RegrowTelemetry *tel) {
     if (Kout) *Kout = 0;
@@ -3781,8 +3880,12 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
         regrow_state_load(&st0);
         if (stat(PATH_INDEX, &sti) == 0 &&
             st0.n_prev >= 0 && st0.K > 0 &&
-            st0.index_mtime == (long)sti.st_mtime &&
             st0.index_size == (long)sti.st_size) {
+            /* mtime equal is the cheap proof that this is the file the state was
+             * written for. When it differs (copy/restore/touch) the tail line
+             * carries the same proof at O(1) cost, so a byte-identical index no
+             * longer falls through to a full re-derive. */
+            int mtime_ok = (st0.index_mtime == (long)sti.st_mtime);
             /* row count: the state holds n_prev; we need n — count lines cheaply?
              * NO: do it RIGHT. stat alone can't count lines. The ORIGINAL
              * contract requires row count matching — but row count matching at
@@ -3821,6 +3924,18 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                     fclose(af);
                 }
             }
+            if (unchanged && !mtime_ok) {
+                /* mtime differs: the index may be the same bytes under a new
+                 * timestamp (copy/restore) or a different file. Ask the stored
+                 * fingerprint; old states without one fall back to the tail
+                 * line, which is weaker (it cannot see a first-row edit). */
+                if (st0.index_fp)
+                    unchanged = (lz_index_fp(PATH_INDEX, (long)sti.st_size,
+                                             st0.n_prev, st0.anchors_cksum)
+                                 == st0.index_fp);
+                else
+                    unchanged = lz_index_tail_sid_is(PATH_INDEX, st0.last_sid);
+            }
             if (unchanged) {
                 /* THE TREE'S CHANNEL MUST EXIST TOO (2026-10-20): the
                  * "unchanged" fast path proves the FRUIT is unchanged (stat)
@@ -3854,6 +3969,17 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                       }
                   } }
                 if (labels_ok) {
+                    /* Upgrade in place: a state written before the fingerprint
+                     * existed gets one now, but ONLY when the mtime proved this
+                     * is the same file (mtime_ok) — never on the weaker tail
+                     * proof. Free (two 4 KB reads) and makes the next copy or
+                     * restore take the fingerprint path instead of the tail. */
+                    if (mtime_ok && st0.index_fp == 0) {
+                        RegrowState up = st0;
+                        up.index_fp = lz_index_fp(PATH_INDEX, (long)sti.st_size,
+                                                  st0.n_prev, st0.anchors_cksum);
+                        if (up.index_fp) regrow_state_save(&up, 0.0); /* full_ms is telemetry-only */
+                    }
                     QueryPerformanceCounter(&tld1);
                     tel->ms_load = (double)(tld1.QuadPart - tld0.QuadPart) * 1000.0 / (double)qf0.QuadPart;
                     tel->ms_train = 0; tel->ms_route = 0; tel->ms_rewrite = 0; tel->ms_save = 0;
@@ -4173,6 +4299,8 @@ static int lz_anchor_refresh(int force, int *Kout, int *nout,
                         }
                         ns.K = K;
                         ns.anchors_cksum = anch_cksum(C, K, dim);
+                        ns.index_fp = lz_index_fp(PATH_INDEX, ns.index_size, n,
+                                                  ns.anchors_cksum);
                         QueryPerformanceCounter(&t_sv0);
                         regrow_state_save(&ns, 0.0);
                         QueryPerformanceCounter(&t_sv1);
@@ -4288,6 +4416,8 @@ full_pipeline:
                                 ns.index_size = (long)sns.st_size;
                                 ns.K = K;
                                 ns.anchors_cksum = anch_cksum(C, K, dim);
+                                ns.index_fp = lz_index_fp(PATH_INDEX, ns.index_size, n,
+                                                          ns.anchors_cksum);
                                 regrow_state_save(&ns, 0.0);
                             }
                             QueryPerformanceCounter(&t_sv1);
