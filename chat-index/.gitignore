@@ -6,3 +6,4 @@ refresh.log
 work/
 __pycache__/
 *.pyc
+monitor.log

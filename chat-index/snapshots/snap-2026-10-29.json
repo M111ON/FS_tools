@@ -1,0 +1,30 @@
+{
+ "date": "2026-10-29",
+ "layers": {
+  "session": 2226,
+  "msg": 40409,
+  "vault_turn": 29341,
+  "block": 935,
+  "fact": 2352,
+  "gitcommit": 487,
+  "ds_conv": 84,
+  "ds_turn": 860,
+  "ds_chunk": 1053,
+  "ann": 63915,
+  "artifact": 276369
+ },
+ "audit": {
+  "orphan_facts": 867,
+  "facts_without_source": 187,
+  "sessions_no_content": 2,
+  "marker_titles": 14,
+  "long_sessions_without_block": 151
+ },
+ "built_at": null,
+ "query_log": {
+  "file": "ann_query-20261029.jsonl",
+  "lines": 4,
+  "coord_null": 0,
+  "coord_pct": 100.0
+ }
+}

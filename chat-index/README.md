@@ -32,16 +32,22 @@ python I:\tools\chat-index\chatmap.py session ses_f9cba8fe0          :: one sess
 python I:\tools\chat-index\chatmap.py block 454                      :: one block + span messages
 python I:\tools\chat-index\chatmap.py timeline --limit 20            :: newest sessions first
 python I:\tools\chat-index\chatmap.py ds 201                         :: deepseek chunk -> conversation
-python I:\tools\chat-index\chatmap.py when 0.9627                   :: when did this value change (7 layers)
+python I:\tools\chat-index\chatmap.py when 0.9627                   :: when did this value change (8 layers)
+python I:\tools\chat-index\scripts\monitor.py                        :: daily snapshot + cliff/trend alarms
 ```
 
 `ask` tries every layer and prints the source coordinate for each hit
 (`session#ordinal`, `turn N`, `fact #id`, `block id`, `commit sha`).
 
 `when` is the intersection view: time (normalised numbers), vault, fact, commit window,
-artifact path, repo doc, block. Every layer reports how many rows it examined, so "not found"
-and "never searched" cannot look alike. `--json` emits schema 1 (see
+artifact path, repo doc, block, and the ANN query log. Every layer reports how many rows it
+examined, so "not found" and "never searched" cannot look alike. `--json` emits schema 1 (see
 `docs/WHEN-PROVENANCE-2026-10-28.md`).
+
+`monitor.py` writes `snapshots/snap-YYYYMMDD.json` and judges it: a layer losing >5% is a
+cliff, three consecutive lower days is a trend, a missing day is a `[gap]` and never a trend
+input. Exit 2 on alarm. Scheduled daily 05:40 after the refresh (S4U, catches up after the
+machine was off). See `docs/INTEGRITY-MONITOR-2026-10-29.md`.
 
 ## fail-loud contract
 
