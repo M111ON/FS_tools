@@ -14,7 +14,7 @@ python I:\tools\chat-index\chatmap.py when 1.18 --json
 
 | layer | covers | why it is trustworthy | known blind spot |
 |---|---|---|---|
-| **time** | 29,179 numeric cells / 40,221 messages, 100% clocked | normalised decimals, raw spelling kept | vault rows added before the clock existed have no time |
+| **time** | 208,826 numeric cells / 40,221 messages, 100% clocked | normalised decimals (1–6 places, comma groups included), raw spelling kept | vault rows added before the clock existed have no time |
 | **vault** | 29,341 archived turns | survives MC text truncation | 0 clocks of its own for numbers (time comes from `metric`) |
 | **fact** | 2,343 memories, 2,151 with a source session | event time on every row | 867 point at lost session ids → flagged per hit |
 | **commit** | 487 commits, a **time window** (±3 days) | `committed_ms` on all | no file column, no session column, and only 2026-08..10 |
@@ -106,6 +106,28 @@ Integer-shaped queries are still weak on purpose: `when 454` reaches `vault=348 
 by substring, which is honest (the digits do appear) but not selective. Use `when` for numbers
 with a decimal point, identifiers, hashes, and Thai phrases — the cases where a substring is
 already the answer.
+
+## Round 3 (2026-10-29, metric extraction)
+
+The layer above only knew about numbers shaped `\d*\.\d{2,6}`. Three shapes it got wrong, all
+fixed in `scripts/build_chatmap.py` before the table is filled:
+
+| shape | old behaviour | now |
+|---|---|---|
+| `1,234.5678` | matched as `234.5678` (a comma is not a word char, so the lookbehind let the tail through) — a *wrong* value, not a miss | comma groups are their own alternative and are stripped before `float()`: `20,736` → `20736.0` (23,103 such cells) |
+| `1.5ms`, `0.5B` | dropped: the unit letter tripped the trailing guard | a trailing unit is allowed; scientific notation `1.2e5` is still excluded because it means 120000, not 1.2 |
+| `1.5` | not indexed at all, so `when 1.5` answered "not found" while the value is everywhere | 1–6 decimal places (2,230 cells, 754 vault turns) |
+
+Version strings stay out by construction: `python3.14`, `qwen2.5`, `v1.18`, `2.0.1` all fail the
+`(?<![\w.])` / `(?![\d.])` pair. Build size after the change: 208,826 cells / 4,034 distinct
+values (was 29,179 / 1,918); the map grows 302.7 → 352.6 MB. `eval_when.py` is still 19/19 with
+per-layer recall block 3/3, doc 6/6, time 12/12, vault 16/16.
+
+Two metric-layer defects from the audit are deliberately **not** fixed, because they are display
+questions rather than wrong answers: a cell knows `sid` + `ordinal` but not which side of the
+turn it sits on, and vault rows carry no clock of their own (their time is borrowed from the
+matching message). Both are recorded here instead of silently "solved".
+
 
 ## What this proves on a real case
 

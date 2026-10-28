@@ -493,27 +493,39 @@ step("fts: msg=%d vault=%d" % (n_msg_fts, n_vault_fts))
 # leading zero — a literal search returns 0 hits for a value that has four coordinates. So every
 # decimal token in the transcript is normalised to a float, with the raw spelling kept so the
 # answer can say what it actually matched.
-NUM_RE = re.compile(r"(?<![\w.])(\d*\.\d{2,6})(?![\w.])")
-metric_rows = []
-for sid, ordinal, ts_ms, text in out.execute(
-        "select sid, ordinal, ts_ms, text from msg where text is not null and ts_ms is not null"):
+#
+# Three shapes the first version got wrong:
+#   - "1,234.5678" matched as "234.5678" (a comma is not a word char, so the lookbehind allowed it)
+#     -> comma-grouped numbers are now their own alternative, grouped and stripped
+#   - "1.5ms" / "0.5B" were dropped because the unit letter tripped the trailing guard
+#     -> a trailing unit is allowed, but scientific notation "1.2e5" stays out (it is 120000)
+#   - one-decimal values ("0.5", "1.5") were not indexed at all, so "when 1.5" said "not found"
+#     -> any 1..6 decimal places
+NUM_RE = re.compile(
+    r"(?<![\w.])(\d{1,3}(?:,\d{3})+(?:\.\d{1,6})?|\d*\.\d{1,6})(?![\d.]|[eE][+-]?\d)")
+
+
+def _num_cells(text):
+    """(value, raw) for every decimal in text, comma groups collapsed to the number they mean."""
     for m in NUM_RE.finditer(text):
         raw = m.group(1)
         try:
-            v = float(raw)
+            v = float(raw.replace(",", ""))
         except ValueError:
             continue
+        yield v, raw, m
+
+
+metric_rows = []
+for sid, ordinal, ts_ms, text in out.execute(
+        "select sid, ordinal, ts_ms, text from msg where text is not null and ts_ms is not null"):
+    for v, raw, m in _num_cells(text):
         lo = max(0, m.start() - 70)
         metric_rows.append((round(v, 6), raw, "msg", sid, ordinal, ts_ms,
                             text[lo:m.end() + 70].replace("\n", " ")))
 for sid, file, turn_no, body in out.execute(
         "select sid, file, turn_no, body from vault_turn where body is not null"):
-    for m in NUM_RE.finditer(body):
-        raw = m.group(1)
-        try:
-            v = float(raw)
-        except ValueError:
-            continue
+    for v, raw, m in _num_cells(body):
         lo = max(0, m.start() - 70)
         metric_rows.append((round(v, 6), raw, "vault", sid, turn_no, None,
                             body[lo:m.end() + 70].replace("\n", " ")))
