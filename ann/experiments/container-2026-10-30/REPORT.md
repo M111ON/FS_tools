@@ -277,6 +277,31 @@ not a defect — which is the `#7166` rule: same point, different dims, scoring
 merges, nothing deleted. Choose by which question the address answers, not by
 which string is shorter.
 
+### Depth as metadata — the chain length rides along
+
+Owner (2026-10-30): the chain length is already known, so attach it to the address
+instead of leaving `bN` silent about how many levels sit between head and tail.
+Length differences then become visible, which removes the last ambiguity the
+letters alone could not settle.
+
+`ChainHT` carries `depth` and it is written **once at the end**, never per letter:
+
+```
+bN        depth unknown -> matches any length   (the merge case)
+bN4       depth 4       -> matches only a 4-level chain
+bN5       depth 5       -> same head and tail, different length
+```
+
+Letters and digits cannot be confused, so no separator is needed, and the name
+stays readable. `chain_ht_any_depth()` clears the depth, which turns the exact key
+back into the merge key — that is `#7166`: two paths with the same entry and exit
+are the same connection and should score together, but only when the caller says
+so. Exact is the default, because that is what an ordinary lookup means.
+
+Test `T7` covers it: `bN4` parses back to depth 4, `bN` parses to depth 0, `bN0` is
+rejected (0 is the marker, not a depth), and two chains sharing head and tail print
+as `bN4` and `bN5`.
+
 ## Files
 
 - `phase_b_gate.py` — A/B/C comparison, stability

@@ -3,13 +3,15 @@
  *   T1 the ladder     : bHyN gives bN, then bHN, then bHyN (letters only)
  *   T2 notation       : print/parse round-trips; digits and markers rejected
  *   T3 match          : a compact key matches a stored key iff the head run and
- *                       the last letter agree, whatever the stored key's length
+ *                       the last letter agree AND the depth agrees when set
  *   T4 escalation     : the step that separates two keys is the first interior
  *                       position where they differ, and 1 for head or tail
  *   T5 termination    : the top step is the whole address, so two different
  *                       addresses are always separable
  *   T6 zero is kept   : 0 stays the maintenance marker — a stored key carrying it
  *                       has no compact form, and '0' is not a letter
+ *   T7 depth metadata : bN4 is depth-exact, bN is any depth, and clearing the
+ *                       depth turns the exact key back into the merge key
  *
  * build: gcc -O2 -I.. -o test_chain_headtail.exe test_chain_headtail.c
  */
@@ -75,7 +77,7 @@ int main(void)
     {
         ChainKey stored;
         chain_key(&full, "bHyN");
-        chain_ht_build(&full, 1, &ht);            /* bN */
+        chain_ht_build(&full, 1, &ht);            /* bN, depth 4 */
         ck("T3 matches the same key", chain_ht_match(&ht, &full) == 1, NULL);
 
         chain_key(&stored, "bXyN");               /* same head and tail */
@@ -93,14 +95,21 @@ int main(void)
         ck("T3 rejects a stored key shorter than the head run",
            chain_ht_match(&ht, &stored) == 0, NULL);
 
-        /* but bN as the WHOLE address is matched by the bN compact key */
-        chain_ht_build(&full, 1, &ht);
-        ck("T3 a 2-level key is fully named by bN",
-           chain_ht_match(&ht, &stored) == 1, NULL);
+        /* a 2-level chain is fully named by its own bN */
+        {
+            ChainHT h2;
+            chain_ht_build(&stored, 1, &h2);
+            ck("T3 a 2-level key is fully named by bN",
+               chain_ht_match(&h2, &stored) == 1 && h2.depth == 2, NULL);
+        }
 
-        /* length independence: bN matches bHyN and also bHXyN */
+        /* a longer chain sharing head and tail is a DIFFERENT depth */
         chain_key(&stored, "bHXyN");
-        ck("T3 tail is the LAST letter, not position 4",
+        ck("T3 depth 4 does not match a 5-level key",
+           chain_ht_match(&ht, &stored) == 0, NULL);
+
+        chain_ht_any_depth(&ht);
+        ck("T3 cleared depth matches any length",
            chain_ht_match(&ht, &stored) == 1, NULL);
     }
 
@@ -172,6 +181,35 @@ int main(void)
         chain_key(&q, "bHyN");
         q.d[1] = CHAIN_MARK;
         ck("T6 resolve stops at the marker", chain_resolve(&q, &out) == 1, NULL);
+    }
+
+    /* T7 — depth as metadata on the name */
+    {
+        ChainKey deep;
+        chain_key(&full, "bHyN");                 /* 4 levels */
+        chain_ht_build(&full, 1, &ht);
+        ck("T7 build records the depth", ht.depth == 4, NULL);
+
+        int ok = chain_ht_str_meta(&ht, buf, sizeof buf);
+        ck("T7 meta form is bN4", ok && strcmp(buf, "bN4") == 0, buf);
+
+        ok = chain_ht_str(&ht, buf, sizeof buf);
+        ck("T7 plain form stays bN (no digits)", ok && strcmp(buf, "bN") == 0, buf);
+
+        ok = chain_ht_parse(&ht, "bN4");
+        ck("T7 parse bN4 keeps the depth", ok && ht.depth == 4 && ht.m == 1, NULL);
+
+        ok = chain_ht_parse(&ht, "bN");
+        ck("T7 parse bN means any depth", ok && ht.depth == 0, NULL);
+
+        ck("T7 bN0 rejected (0 is not a depth)",
+           chain_ht_parse(&ht, "bN0") == 0, NULL);
+
+        chain_key(&deep, "bHXyN");                /* 5 levels */
+        chain_ht_build(&deep, 1, &ht);
+        ok = chain_ht_str_meta(&ht, buf, sizeof buf);
+        ck("T7 same name, different depth -> bN5",
+           ok && strcmp(buf, "bN5") == 0, buf);
     }
 
     printf("\n%s (%d failing checks)\n", fails ? "FAIL" : "PASS", fails);
