@@ -97,7 +97,53 @@ to set a threshold on).
 - **Relation queries.** `#7819` already showed unconditional view union breaks
   relation recall. This experiment is value/shape queries only.
 
+## Phase C — promotion: split a full bucket without moving anyone
+
+Phase B's cost was buckets filling up (largest 3.4% → 9.0% while the corpus grew
+2.5x). `phase_c_promotion.py` answers it: when a bucket exceeds capacity, open ONE
+more chain level under it.
+
+Seed partition learned on the first 8,000 rows (40%), then frozen. Stream the
+remaining 12,000 in steps of 2,000; split any leaf over 500 members; never
+re-learn anything else. Ground truth is recomputed per step over the rows that
+exist at that moment, so the curve is not penalised for rows not yet arrived.
+
+```
+   rows  leaves  splits  recall   scan  rewritten   prefix
+  10000      64       0  0.8292  2.9%          0        0
+  12000      64       0  0.8195  3.6%          0        0
+  14000      65       1  0.7752  4.4%        861        0
+  16000      67       3  0.7938  5.0%       2013        0
+  18000      71       7  0.7899  5.8%        4201        0
+  20000      74      10  0.7870  7.6%        6322        0
+```
+
+- **prefix = 0 broken at every step.** No root ever moved. Promotion extends an
+  address, it never relocates one.
+- **rewritten** counts leaves that received a longer address (a child level).
+  That is promotion by definition: their prefix is unchanged, so an old pointer
+  still resolves — it just resolves to the parent instead of the leaf.
+- recall 0.829 → 0.787 while 12,000 rows arrive and 10 splits happen. It tracks
+  the frozen baseline (0.7885 at the same size), so splitting costs nothing.
+
+**Design note found by the first run:** probing by leaf is wrong. After a split,
+three leaf probes cover fewer vectors than three root probes did, and recall fell
+to 0.708 for a reason that had nothing to do with promotion. A chain resolves to a
+NODE and searches under it, so the probe target must be the root and the search
+covers its whole subtree. With that fix recall returns to 0.787. This is the same
+statement as `chain_resolve`: resolve to the longest healthy prefix, search under
+it.
+
+## Phase C — still open
+
+- Promotion at more than one level (this run is depth 2 only).
+- Capacity threshold: 500 was arbitrary. The right value comes from the bucket
+  fullness curve, not from a guess.
+- Concurrency: a split while a reader is mid-scan is not addressed here at all.
+
 ## Files
 
 - `phase_b_gate.py` — A/B/C comparison, stability
 - `phase_b_drift.py` — frozen-partition sweep
+- `phase_c_promotion.py` — split-on-full, prefix stability
+
