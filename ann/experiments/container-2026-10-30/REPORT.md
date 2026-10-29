@@ -160,7 +160,7 @@ repair finds it. A closed node has no compact form because it has no address to
 look up.
 
 Implemented in `include/chain_headtail.h`, test `tests/test_chain_headtail.c`
-**PASS 29/29**:
+**PASS 38/38**:
 
 - the ladder is always "first m letters, then the tail", m = 1..n-1, and the top
   step IS the full key, so no lookup can fail to resolve
