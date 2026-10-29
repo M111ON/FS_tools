@@ -141,9 +141,94 @@ it.
   fullness curve, not from a guess.
 - Concurrency: a split while a reader is mid-scan is not addressed here at all.
 
+## Phase D — head+tail addressing: `b1N4`, grow on collision
+
+Owner pattern (2026-10-30): a chain b(1), H(2), y(3), N(4) is written `b1N4` —
+head letter with its position, tail letter with its position. On a miss or a
+duplicate, add the second position (`b1H2N4`), then the third, until it is the
+whole address.
+
+Implemented in `include/chain_headtail.h`, test `tests/test_chain_headtail.c`
+**PASS 22/22**:
+
+- the ladder is always "first m letters, then the tail", m = 1..n-1, and the top
+  step IS the full key, so no lookup can fail to resolve
+- notation round-trips, including two-digit positions (`A12X12`)
+- a difference in the head **or the tail** separates at step 1, because every
+  step carries both; only an interior difference needs the ladder
+- a closed node (marker 0) has no compact form — it has no address to look up
+
+### What it costs on real addresses
+
+20,000 rows, 12-letter addresses derived from the real vectors:
+
+```
+step  letters  groups  unique   max group
+   1        2     269    1.3%        6878
+   2        3    2378   11.9%         940
+   4        5    8286   41.4%         136
+   6        7   15334   76.7%          35
+  11       12   19156   95.8%          34
+
+mean letters per lookup = 7.19 of 12
+lookups answered by head+tail alone = 0.38%
+```
+
+`b1N4` is unique for 0.38% of addresses. To get a candidate set of ~35 you need
+**7 of 12 letters**. So head+tail is a **naming convention** (the same idea as a
+git short hash), not a lookup shortcut — it makes an address readable and
+quotable, it does not make the search cheaper.
+
+Note the honest bar: uniqueness is not what a chain needs — a chain resolves to a
+prefix and may legitimately return many records. The operational number is the
+**candidate set size**, which is the `max group` column. Both are reported.
+
+### Why it needs so many letters — the real finding
+
+The 12-letter addresses above came from sign bits of random projections, and
+**844 of 20,000 rows shared an address in a 52^12 space**. That should be
+impossible. The cause is not the projection, it is the corpus:
+
+```
+||mean|| / mean||x||      = 0.915
+median cos(mean, x)       = 0.918
+eigenvalue max/min        = 1.16e9
+```
+
+Every e5 vector is **91.5% the same direction**. This is the known anisotropy of
+sentence embeddings, and it is severe here: the covariance is so degenerate that
+most of the 384 dimensions carry almost no per-row information.
+
+Consequence for a value-blind address, measured on the same 20,000 rows:
+
+```
+raw        distinct addresses  1158/20000  ( 5.79%)   largest bucket 8.8%
+centred    distinct addresses 14305/20000  (71.53%)   largest bucket 1.9%
+whitened   distinct addresses 16063/20000  (80.31%)   largest bucket 1.8%
+```
+
+**A value-blind address computed on raw embeddings collapses: 94% of rows land on
+the same address.** That is why phase B's pure projection scored 0.214 — the sign
+bits were reporting the shared mean, not the row.
+
+This does not change the phase B verdict (frozen k-means still wins), but it
+changes the reason: the failure was never "random projections cannot route", it
+was "there was almost nothing to route on". Centring or whitening restores the
+address space by a factor of 12.
+
+**Caveat, and it is a real one:** all recall numbers here are measured against
+brute-force **raw cosine** as ground truth. Whitening changes which vectors are
+near each other, so a whitened recall figure against raw-cosine truth is not
+meaningful, and this experiment cannot say whether whitening improves retrieval —
+only that it restores address distinctness. There is no relevance ground truth in
+this corpus, so retrieval quality is not measured anywhere in this report.
+
 ## Files
 
 - `phase_b_gate.py` — A/B/C comparison, stability
 - `phase_b_drift.py` — frozen-partition sweep
+- `phase_b_center.py` — anisotropy: raw vs centred projection
 - `phase_c_promotion.py` — split-on-full, prefix stability
+- `phase_d_headtail.py` — ladder cost on real addresses
+
 
