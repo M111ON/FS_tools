@@ -223,6 +223,46 @@ meaningful, and this experiment cannot say whether whitening improves retrieval 
 only that it restores address distinctness. There is no relevance ground truth in
 this corpus, so retrieval quality is not measured anywhere in this report.
 
+### The position digits carry nothing
+
+Owner's counter-argument (2026-10-30): pure letters means writing every position;
+head+tail means writing two and growing only when it fills, so it is paying later
+rather than paying less. That framing is right — but the ladder's positions are
+always `1, 2, 3, ..., m` and then `n`, so **every digit is determined by the order
+and the address length**. They are redundant. `b1H2N4` (6 chars) says exactly what
+`bHN` (3 chars) says under the rule "last letter is the tail, the rest is the
+prefix".
+
+At an equal **letter** count the two schemes are a tie (20,000 real addresses):
+
+```
+letters  prefix {1..k}          head+tail {1..m, n}
+      2  groups   683 max 1597   groups   269 max 6878   prefix
+      4  groups  4800 max  230   groups  4142 max  695   prefix
+      7  groups 15699 max   36   groups 15334 max   35   head+tail
+      8  groups 16871 max   35   groups 17230 max   35   tie
+     12  groups 19156 max   34   groups 19156 max   34   tie
+```
+
+And in expectation, to reach uniqueness:
+
+```
+prefix      mean 7.03 chars
+head+tail   mean 14.23 chars  (with the redundant digits)
+head+tail   mean  7.19 chars  (digits stripped = one char per letter)
+```
+
+So deferring the payment does not make it cheaper — **7.19 vs 7.03, the same**.
+What made it look cheap was the digits, and the digits buy 3.58 bits (log2 12)
+while a letter buys 5.70 bits (log2 52): a full byte spent for 63% of a letter.
+
+The remaining reason to prefer head+tail is not economic. A head and a tail name a
+**connection** (entry face to exit face); a prefix names a **location**. Two paths
+with the same head and tail are the same journey, so their collision is a merge,
+not a defect — which is the `#7166` rule: same point, different dims, scoring
+merges, nothing deleted. Choose by which question the address answers, not by
+which string is shorter.
+
 ## Files
 
 - `phase_b_gate.py` — A/B/C comparison, stability
