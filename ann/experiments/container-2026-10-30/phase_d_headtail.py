@@ -1,8 +1,8 @@
 """phase_d_headtail.py — how many letters does a real address need to be unique?
 
-Owner pattern (2026-10-30): call an address by head and tail, b1N4. If it misses
-or lands on more than one record, add the second position (b1H2N4), then the
-third, until it is the whole address.
+Owner pattern (2026-10-30): call an address by head and tail, bN. If it misses or
+lands on more than one record, add the second letter (bHN), then the third, until
+it is the whole address. No position digits — the letters alone carry it.
 
 This measures that on real vectors: 12-level addresses derived from the actual
 rows in ann_index.jsonl, then for every address the smallest ladder step at which

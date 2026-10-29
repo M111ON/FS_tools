@@ -141,22 +141,36 @@ it.
   fullness curve, not from a guess.
 - Concurrency: a split while a reader is mid-scan is not addressed here at all.
 
-## Phase D — head+tail addressing: `b1N4`, grow on collision
+## Phase D — head+tail addressing: `bN`, grow on collision
 
-Owner pattern (2026-10-30): a chain b(1), H(2), y(3), N(4) is written `b1N4` —
-head letter with its position, tail letter with its position. On a miss or a
-duplicate, add the second position (`b1H2N4`), then the third, until it is the
-whole address.
+Owner pattern (2026-10-30): a chain b(1), H(2), y(3), N(4) is called `bN` — head
+letter, then tail letter. On a miss or a duplicate, add the second letter (`bHN`),
+then the third (`bHyN`), until it is the whole address.
+
+**No position numbers.** The owner's reason is reading, not bytes: a person seeing
+`bHyN` knows the shape at a glance, while `b1H2y3N4` forces them to count. The
+digits were also redundant — the ladder is always "letters 1..m, then the tail", so
+the order and the stored key's length already say where each letter sits (see the
+cost table below: writing them costs 14.23 chars against 7.03 for plain letters,
+for zero extra information).
+
+**The reserved digit 0 is kept.** It remains the maintenance/fault marker from
+`chain_addr.h`: a stored key carrying 0 is a closed node, lookup stops there,
+repair finds it. A closed node has no compact form because it has no address to
+look up.
 
 Implemented in `include/chain_headtail.h`, test `tests/test_chain_headtail.c`
-**PASS 22/22**:
+**PASS 29/29**:
 
 - the ladder is always "first m letters, then the tail", m = 1..n-1, and the top
   step IS the full key, so no lookup can fail to resolve
-- notation round-trips, including two-digit positions (`A12X12`)
-- a difference in the head **or the tail** separates at step 1, because every
-  step carries both; only an interior difference needs the ladder
-- a closed node (marker 0) has no compact form — it has no address to look up
+- the compact key is m+1 bytes of letters and nothing else; the tail's position is
+  the stored key's own length, so the form does not depend on how long the chain is
+- notation round-trips (`bN`, `bHN`, `bHyN`); digits are rejected as notation
+- a difference in the head **or the tail** separates at step 1, because every step
+  carries both; only an interior difference needs the ladder
+- `0` is still the marker: `chain_valid` rejects it, `chain_resolve` stops at it,
+  and `b0N` is not a letter string
 
 ### What it costs on real addresses
 
@@ -174,7 +188,7 @@ mean letters per lookup = 7.19 of 12
 lookups answered by head+tail alone = 0.38%
 ```
 
-`b1N4` is unique for 0.38% of addresses. To get a candidate set of ~35 you need
+`bN` is unique for 0.38% of addresses. To get a candidate set of ~35 you need
 **7 of 12 letters**. So head+tail is a **naming convention** (the same idea as a
 git short hash), not a lookup shortcut — it makes an address readable and
 quotable, it does not make the search cheaper.
