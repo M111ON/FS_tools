@@ -62,6 +62,7 @@ typedef SOCKET sock_t;
 
 #include "anchor_route.h"
 #include "geo_wang_latch.h"
+#include "anchor_lettercube.h"
 #include "nfkc_table.h"
 
 /* ── paths (overridable so the fork is not hard-wired to one checkout) ──
@@ -1336,6 +1337,32 @@ static int lz_zone_of_vec(const float *q, int d) {
     return lz_zone_of((float)x, (float)y);
 }
 
+/* ── the anchor's LetterCube identity (derived from the table, like the zones) ──
+ * Every bucket gets a DIRECTION at the shallowest level that names it exactly
+ * (offset 0) — axial buckets at L0, corners at L1, edges at L2. Both numbers come
+ * from the centroid table alone, so nothing new is stored and a reload reproduces
+ * them bit-for-bit. The rank/parent/lean work lives in the bridge header
+ * (include/anchor_lettercube.h); this caches the PER-BUCKET answer so the query
+ * path reads a byte instead of ranking K centroids per query. */
+static uint8_t g_alc_dir[LZ_ANCH_MAXK];   /* L2 identity code per bucket */
+static uint8_t g_alc_name[LZ_ANCH_MAXK];  /* level that names it exactly */
+static int g_alc_ok = 0, g_alc_k = 0;
+
+static void lz_alc_build(void)
+{
+    g_alc_ok = 0; g_alc_k = 0;
+    if (!g_anch_cache || g_anch_k <= 0 || g_anch_k > LZ_ANCH_MAXK || g_anch_dim <= 0)
+        return;
+    int K = g_anch_k;
+    for (int k = 0; k < K; k++) {
+        uint8_t d = alc_dir_of(k, K, g_anch_cache, g_anch_dim);
+        if (!d) return;                        /* never publish a half table */
+        g_alc_dir[k]  = d;
+        g_alc_name[k] = alc_name_level(d);
+    }
+    g_alc_ok = 1; g_alc_k = K;
+}
+
 static uint32_t *g_ord_cache = NULL;
 static int g_ord_n = 0;
 static long g_ord_stale = 0;   /* .order refused (stale/torn) -> derived in memory */
@@ -1346,6 +1373,7 @@ static void lz_route_cache_invalidate(void) {
     free(g_ord_cache);  g_ord_cache = NULL;
     lz_roster_free();   /* derived from (ents, ord): dies with them */
     free(g_zp); g_zp = NULL; g_zone_ok = 0; g_zone_k = 0;
+    g_alc_ok = 0; g_alc_k = 0;
     g_anch_k = g_anch_dim = g_anch_ntr = 0; g_ord_n = 0;
     g_pair_n = 0;   /* the partner table is derived FROM the centroids */
     for (int i = 0; i < 4; i++) g_anch_key[i] = 0;
@@ -1674,6 +1702,7 @@ static int lz_route_cached(int nent) {
     g_anch_cache = C; g_anch_k = K; g_anch_dim = adim; g_anch_ntr = antr;
     lz_pair_build(C, K, adim);   /* G2.6: pair buckets by centroid, not parity */
     lz_zone_build();   /* derived from the table; no stored state */
+    lz_alc_build();    /* derived from the table; the LetterCube identity per bucket */
     if (g_labels_derive) {
         /* H2 stays: the table must still cover this row count (checked
          * above). What disappears is the second file that could disagree. */
@@ -5305,6 +5334,16 @@ static int handle_search(sock_t cli, const char *rq, char *out, int out_cap, int
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"totem\":{\"lit\":%d,\"open\":%d,\"shut\":%d,\"replayed\":%d,\"free\":%u,\"pair\":%d},",
             totem.lit, totem.open, totem.shut, totem.replayed, (unsigned)WL_FREE, g_pair_n);
+        /* The top bucket's LetterCube identity: the face it lands on and the
+         * shallowest level that names it exactly (offset 0). Identity only — the
+         * walk is untouched, because promotion is a storage-side decision. */
+        int lcb = (route_nb > 0) ? route_bk[0] : -1;
+        int lc_on = (g_alc_ok && lcb >= 0 && lcb < g_alc_k);
+        srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
+            "\"lc\":{\"on\":%d,\"bucket\":%d,\"face\":%u,\"name_level\":%u},",
+            lc_on, lc_on ? lcb : -1,
+            lc_on ? (unsigned)g_alc_dir[lcb] : 0u,
+            lc_on ? (unsigned)g_alc_name[lcb] : 0u);
         srlen += snprintf(sresp + srlen, sizeof(sresp) - srlen,
             "\"amp\":{\"on\":%d,\"k\":%.2f,\"applied\":%d}}}",
             (g_amp_boost && g_graft_on) ? 1 : 0, (double)g_amp_k, g_amp_applied);

@@ -10,7 +10,10 @@ PY      ?= I:/python3.14.4/python.exe
 # NOTE: test_anchor_determinism is deliberately NOT here — it fails in the
 # upstream repo too (anch_assign vs anch_route[0] tie-break on equidistant
 # centroids). See FORK.md §Known upstream issue. Do not "fix" it here first.
-TESTS := test_anchor_route test_anchor_routed test_wang_latch
+TESTS := test_anchor_route test_anchor_routed test_wang_latch test_anchor_letter test_anchor_lettercube
+# The anchor->LetterCube bridge also has a REAL-DATA gate. It reads the served
+# index (263 MB) so it is not in `test`; run it by hand after touching the bridge:
+#   ./build/alc_real_gate.exe data/memcore/ann_index.jsonl data/memcore/ann_anchors.bin
 
 all: $(BUILD)/ann_search.exe
 
