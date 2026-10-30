@@ -35,7 +35,7 @@ C_TESTS = ["test_anchor_route", "test_anchor_routed", "test_wang_latch",
            "test_anchor_letter", "test_anchor_lettercube",
            # chain container: address primitive, node, bucket join, head+tail
            "test_chain_addr", "test_chain_node", "test_chain_bucket",
-           "test_chain_headtail", "test_lcr_great"]
+           "test_chain_headtail", "test_chain_ident", "test_lcr_great"]
 # python tests (need numpy unless noted)
 PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py",
             "tests/test_scope.py", "tests/test_tag_lut.py",
