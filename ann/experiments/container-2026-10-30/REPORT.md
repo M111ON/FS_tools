@@ -309,6 +309,7 @@ as `bN4` and `bN5`.
 - `phase_b_center.py` — anisotropy: raw vs centred projection
 - `phase_c_promotion.py` — split-on-full, prefix stability
 - `phase_d_headtail.py` — ladder cost on real addresses
+- `phase_e_projection.py` — is the dir3 loss the projection or the direction set
 
 
 
@@ -349,25 +350,76 @@ Router cost on top of that, per level:
 | 26 | dir3   | 4 | 15.2% | 0.726 | 0.629 |
 | 26 | dir3   | 8 | 31.0% | 0.912 | 0.845 |
 
-Four things this settles:
+Three things this settles:
 
 1. **K=26 with 4 probes is the operating point**: 16.3% of the corpus scanned,
    rec10 0.905 against a 0.987 ceiling. The router costs about 8% of recall at
    one sixth of the scan.
-2. **Going deeper pays.** Recall per unit of scan rises from 4.0 (K=6, 1 probe) to
-   5.4 (K=14, 2 probes) to 9.6 (K=26, 2 probes). The 6 -> 14 -> 26 ladder is not
+2. **Going deeper pays.** Efficiency here means rec10 / scan. It rises from 4.0
+   (K=6, one probe: 0.712 / 17.7%) to 5.4 (K=14, two probes: 0.844 / 15.6%) to
+   9.6 (K=26, two probes: 0.780 / 8.1%). The 6 -> 14 -> 26 ladder is not
    decoration; each level buys a better scan/recall trade.
-3. **Balance is not routing.** Both K=26 routers are near the ideal bucket size
-   (kmeans largest bucket 6.3%, `dir3` 7.2%, ideal 3.8%), yet `dir3` keeps 0.214 at
-   one probe against kmeans' 0.572. A static geometric direction spreads documents
-   evenly and still points the wrong way. This is the same lesson as phase B:
-   stability alone is worthless.
-4. **The pure-address arm reproduces phase B.** `dir3` keep at K=26/1 probe is
-   0.214; the pure-projection arm of phase B scored 0.214 recall. Two different
-   corpora, two different metrics, the same number — the static-direction router
-   has a characteristic ceiling around a fifth of brute force at one probe.
+3. **Bucket balance is not routing.** Both K=26 routers are near the ideal bucket
+   size (kmeans largest bucket 6.3%, `dir3` 7.2%, ideal 3.8%), yet `dir3` keeps
+   0.214 at one probe against kmeans' 0.572. Evenly spread and still pointing the
+   wrong way — the same lesson as phase B.
+
+## Correction: what actually costs the dir3 arm
+
+The first version of this section claimed that the two 0.214 values (phase B's
+pure projection, and `dir3` keep here) were "not a coincidence". Two 3-decimal
+matches from different corpora and different metrics are not evidence, and the
+claim is withdrawn. `phase_e_projection.py` replaces it with a mechanism test:
+hold K=26 and the probe count fixed and vary only how many PCA dimensions the
+partition is built on.
+
+| dims | var% | p=1 keep | p=2 keep | p=4 keep |
+|---|---|---|---|---|
+| 3 | 9.8 | 0.245 | 0.417 | 0.655 |
+| 8 | 19.1 | 0.417 | 0.574 | 0.752 |
+| 16 | 27.2 | 0.479 | 0.642 | 0.801 |
+| 32 | 37.2 | 0.528 | 0.671 | 0.822 |
+| 64 | 50.5 | 0.532 | 0.715 | 0.838 |
+| 384 | 100.0 | 0.572 | 0.728 | 0.853 |
+
+keep climbs monotonically with dimension count, so the projection is the loss. And
+at three dimensions a learned partition and the fixed direction set are
+statistically indistinguishable: kmeans-3d 0.245 versus `dir3` 0.214, a paired
+difference of +0.031 with a 95% CI of [-0.007, +0.069] — not separated.
+
+So the honest statement is not "geometry cannot route". It is: **384 dimensions
+cannot be compressed to 3 and still route, whatever the partition looks like.**
+The 26 faces are an addressing structure, not a routing structure — a cleaner
+reason for the two-layer split than the one originally given.
+
+Paired bootstrap on the same 200 queries (95% CI of the mean difference):
+
+```
+kmeans-384d p=4 - kmeans-3d  p=4    +0.198  [+0.163, +0.234]  real
+kmeans-384d p=4 - dir3       p=4    +0.225  [+0.185, +0.261]  real
+kmeans-384d p=1 - kmeans-3d  p=1    +0.327  [+0.276, +0.374]  real
+kmeans-3d   p=1 - dir3       p=1    +0.031  [-0.007, +0.069]  not separated
+```
+
+Also corrected: a single arm's interval at rec10 0.905 over 200 queries is about
++-4% at 95% (binomial SE 0.021), not the +-3% claimed earlier. Paired comparisons
+are far tighter, and those are what the table above uses.
+
+Limits to state before quoting any of this:
+
+- Positives are 6.1% of this corpus (1,249 / 20,339); in the full 542k corpus they
+  would be 0.23%. Topic clusters here are therefore tighter than reality and the
+  numbers flatter any partition. A 50k-distractor rerun (positives 2.4%) checks the
+  direction of that effect.
+- The qrels hard negatives were **not** included: `miracl_local.py` keeps only rows
+  with label 1, so every non-positive is a plain distractor.
+- `kmeans` is retrained on the whole corpus each run. The frozen-centroid path
+  production would use is measured in phase C on memcore, not on MIRACL.
+- Distractors are every 20th document, not a uniform sample, so scan percentages
+  lean towards the front of the corpus.
+- These numbers do not transfer to the memcore corpus: MIRACL is clean prose with
+  separable topics, while memcore mixes code and notes. Use MIRACL to confirm the
+  router mechanism, and tune the real operating point on labelled memcore data.
 
 Not tested: the full 542k corpus, efSearch-style reranking, the shape-phase pool,
-and whether kmeans buckets survive an embedding swap. The distractor sample is
-every 20th document rather than uniform, so the scan percentages lean towards the
-front of the corpus.
+and whether kmeans buckets survive an embedding swap.
