@@ -311,3 +311,63 @@ as `bN4` and `bN5`.
 - `phase_d_headtail.py` — ladder cost on real addresses
 
 
+
+## The first qrels-based router measurement (MIRACL Thai, 2026-10-30)
+
+Everything above compares the router against brute force on the same vectors.
+That measures self-consistency, not relevance — the memcore corpus has no ground
+truth. This run is the first one scored against human relevance labels.
+
+Setup: MIRACL Thai dev, 200 queries, 1,249 positives (all found), 20,000
+distractors from the 542,166-doc corpus, embedded with the real ONNX int8 e5-small
+(`passage: ` / `query: ` prefixes, the same `sanitize()` as `build_index.py`).
+`scripts/miracl_local.py` fetches the raw files, `scripts/prep_miracl_th.py`
+builds the set, `scripts/eval_router.py` scores it.
+
+```
+BASELINE 1 — brute force vs qrels:  rec10 0.987  hit10 0.995  mrr10 0.942
+```
+
+The embedder is fine (0.987 recall@10 over 20k candidates; the absolute number is
+inflated versus a full 542k corpus, so do not compare it to MTEB).
+
+Router cost on top of that, per level:
+
+| level | router | probes | scan | rec10 | keep |
+|---|---|---|---|---|---|
+| 6  | kmeans | 1 | 17.7% | 0.712 | 0.704 |
+| 6  | kmeans | 4 | 70.0% | 0.979 | 0.962 |
+| 6  | dir3   | 1 | 17.6% | 0.576 | 0.522 |
+| 14 | kmeans | 2 | 15.6% | 0.844 | 0.782 |
+| 14 | kmeans | 8 | 57.4% | 0.977 | 0.968 |
+| 14 | dir3   | 2 | 14.5% | 0.656 | 0.562 |
+| 26 | kmeans | 1 |  4.0% | 0.641 | 0.572 |
+| 26 | kmeans | 2 |  8.1% | 0.780 | 0.727 |
+| 26 | kmeans | 4 | 16.3% | 0.905 | 0.853 |
+| 26 | kmeans | 8 | 32.0% | 0.960 | 0.933 |
+| 26 | dir3   | 1 |  3.8% | 0.275 | 0.214 |
+| 26 | dir3   | 4 | 15.2% | 0.726 | 0.629 |
+| 26 | dir3   | 8 | 31.0% | 0.912 | 0.845 |
+
+Four things this settles:
+
+1. **K=26 with 4 probes is the operating point**: 16.3% of the corpus scanned,
+   rec10 0.905 against a 0.987 ceiling. The router costs about 8% of recall at
+   one sixth of the scan.
+2. **Going deeper pays.** Recall per unit of scan rises from 4.0 (K=6, 1 probe) to
+   5.4 (K=14, 2 probes) to 9.6 (K=26, 2 probes). The 6 -> 14 -> 26 ladder is not
+   decoration; each level buys a better scan/recall trade.
+3. **Balance is not routing.** Both K=26 routers are near the ideal bucket size
+   (kmeans largest bucket 6.3%, `dir3` 7.2%, ideal 3.8%), yet `dir3` keeps 0.214 at
+   one probe against kmeans' 0.572. A static geometric direction spreads documents
+   evenly and still points the wrong way. This is the same lesson as phase B:
+   stability alone is worthless.
+4. **The pure-address arm reproduces phase B.** `dir3` keep at K=26/1 probe is
+   0.214; the pure-projection arm of phase B scored 0.214 recall. Two different
+   corpora, two different metrics, the same number — the static-direction router
+   has a characteristic ceiling around a fifth of brute force at one probe.
+
+Not tested: the full 542k corpus, efSearch-style reranking, the shape-phase pool,
+and whether kmeans buckets survive an embedding swap. The distractor sample is
+every 20th document rather than uniform, so the scan percentages lean towards the
+front of the corpus.
