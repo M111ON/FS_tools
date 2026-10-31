@@ -16,12 +16,14 @@ this file with the anchor fields added (same split as upstream).
 
 Usage:
     python build_index.py [--db PATH] [--out PATH] [--limit N] [--max-chars 400]
+        [--route-db PATH] [--routes-out PATH]
 """
 import argparse, json, os, sqlite3, struct, sys, time
 
 DEFAULT_DB = r"I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(_ROOT, "data", "ann_index.jsonl")
+DEFAULT_ROUTES = os.path.join(_ROOT, "data", "ann_routes.jsonl")
 
 
 def sanitize(t: str, max_chars: int) -> str:
@@ -56,6 +58,8 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--limit", type=int, default=0, help="0 = all")
     ap.add_argument("--max-chars", type=int, default=400)
+    ap.add_argument("--route-db", default="", help="optional producer route metadata SQLite DB")
+    ap.add_argument("--routes-out", default=DEFAULT_ROUTES)
     a = ap.parse_args()
 
     con = sqlite3.connect(a.db)
@@ -106,6 +110,13 @@ def main():
     print(f"wrote {n} entries -> {a.out}")
     print(f"dims: {dims}")
     print(f"elapsed {time.time()-t0:.1f}s")
+    if a.route_db:
+        sys.path.insert(0, _ROOT)
+        from export_producer_routes import export as export_routes
+        route_n, route_digest = export_routes(a.out, a.route_db, a.routes_out)
+        print(f"wrote {route_n} route records -> {a.routes_out} sha256={route_digest}")
+    else:
+        print("route sidecar: disabled (no --route-db; baseline index behavior preserved)")
 
 
 if __name__ == "__main__":

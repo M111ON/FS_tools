@@ -44,12 +44,18 @@ PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py",
             "tests/test_route_watch.py", "tests/test_soft_zone.py",
             "tests/test_roster_cold.py", "tests/test_zone_rows.py",
             "tests/test_query_sanitize.py",
+            # route sidecar / multi-view producer gate
+            "tests/test_export_producer_routes.py", "tests/test_export_unknown_routes.py",
+            "tests/test_route_manifest.py", "tests/test_route_sidecar.py",
+            "tests/test_numeric_sidecar_fixture.py",
             "dashboard/tests/test_dashboard_core.py"]
 
 
 def run(name, cmd, cwd=HERE):
     print(f"--- {name} ---")
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # ann/ on PYTHONPATH so tests can import the repo modules they exercise
+    env = {**os.environ, "PYTHONPATH": HERE + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     out = (r.stdout or "") + (r.stderr or "")
     tail = [ln for ln in out.strip().splitlines() if ln.strip()][-3:]
     for ln in tail:
