@@ -661,56 +661,6 @@ static inline uint32_t lz_totem_id(int bucket) {
  * bucket a nearby query would route to instead of k. Derived, never stored;
  * deterministic (ties -> lowest id). Fail-safe: no table -> -1 -> the warm
  * test reads OWN only. */
-/* Magnifier pointer: antipodal jump (principle from DWGLS bfs_magnify.h,
- * rewritten for ANN -- no code reuse, no coupling).
- * DWGLS: glass = 5184 of 20736; antipode = w + 72 mod 144; bijection.
- * ANN: K buckets; antipode(b) = (b + K/2) % K. Involution + injective.
- * O(1) per bucket. Env ANN_MG=0 disables (A/B). */
-/* ANN_MG_MODE: off | antipode (default) | random */
-static inline const char *lz_mg_mode(void) {
-    static const char *cached = NULL;
-    if (cached) return cached;
-    const char *e = getenv("ANN_MG_MODE");
-    if (!e || !e[0]) {
-        const char *mg = getenv("ANN_MG");
-        if (mg && mg[0] == '0') cached = "off";
-        else cached = "antipode";
-    } else cached = e;
-    return cached;
-}
-static inline int lz_mg_enabled(void) {
-    const char *m = lz_mg_mode();
-    return (strcmp(m, "off") != 0) ? 1 : 0;
-}
-static inline int lz_mg_antipode(int bucket, int K) {
-    if (K <= 1 || bucket < 0 || bucket >= K) return -1;
-    int half = K / 2;
-    if (half == 0) return -1;
-    int a = bucket + half;
-    if (a >= K) a -= K;
-    return a;
-}
-static int lz_mg_append_antipodes(int *rb, int rnb, int K) {
-    if (!lz_mg_enabled() || K <= 1) return rnb;
-    const char *mode = lz_mg_mode();
-    int orig = rnb;
-    for (int i = 0; i < orig && rnb < 64; i++) {
-        int a;
-        if (strcmp(mode, "random") == 0) {
-            /* deterministic pseudo-random bucket (not antipodal) */
-            a = (rb[i] * 37 + 13 * (i + 1)) % K;
-            if (a < 0) a += K;
-        } else {
-            a = lz_mg_antipode(rb[i], K);
-        }
-        if (a < 0) continue;
-        int dup = 0;
-        for (int r = 0; r < rnb; r++) if (rb[r] == a) { dup = 1; break; }
-        if (!dup) rb[rnb++] = a;
-    }
-    return rnb;
-}
-
 static int g_pair[ANCHR_MAXK];
 static int g_pair_n = 0;
 static int lz_pair_of(int bucket);
@@ -2684,8 +2634,6 @@ static int lz_mem_search(const float *qv, int qd,
             if (topb > LZ_ANCH_MAXK) topb = LZ_ANCH_MAXK;  /* rb[]/shut[] scratch */
             if (topb < 1) topb = 1;
             rnb = anch_route(qv, C, K, qd, topb, rb);
-            /* magnifier pointer: antipodal jump (O(1), no spin) */
-            rnb = lz_mg_append_antipodes(rb, rnb, K);
             routed = 1;
             snprintf(rm, sizeof(rm), "%s", "anchor");
             if (!g_totem_ready) lz_totem_init();
