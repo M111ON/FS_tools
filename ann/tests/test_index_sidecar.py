@@ -34,6 +34,15 @@ def raises(fn, *a, **k):
         return True, str(e)[:70]
 
 
+def raises_full(fn, *a, **k):
+    """Same, but keeps the whole message (the reason sits after a long path)."""
+    try:
+        fn(*a, **k)
+        return False, ""
+    except Exception as e:
+        return True, str(e)
+
+
 def make_jsonl(path, n=200, dim=16, seed=0):
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((n, dim)).astype(np.float32)
@@ -77,9 +86,16 @@ print("\n5. same size, one byte flipped in the middle -> reject")
 raw = open(J, "rb").read()
 mid = len(raw) // 2
 open(J, "wb").write(raw[:mid] + bytes([raw[mid] ^ 0x01]) + raw[mid + 1:])
-ok, why = raises(check_fresh, info, J)
-check("rejected", ok, why)
+# restore the mtime the SIDECAR was built with (case 4 moved it), so size and
+# mtime both look untouched and only the content hash can catch this
+os.utime(J, ns=(info["jsonl_mtime_ns"],) * 2)
 check("size unchanged by the flip", os.path.getsize(J) == len(raw))
+check("mtime restored to the sidecar's",
+      os.stat(J).st_mtime_ns == info["jsonl_mtime_ns"])
+ok, why = raises_full(check_fresh, info, J)
+check("rejected", ok, why[:70])
+check("rejected by the full hash, not by size/mtime",
+      "full-content hash" in why, why[-60:])
 
 print("\n6. reordered rows, same size -> reject")
 X2 = make_jsonl(J)

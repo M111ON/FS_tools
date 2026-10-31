@@ -933,7 +933,227 @@ static int lz_stamp_overlay(LZEntry *a, int n) {
     return live;
 }
 
-static int lz_index_load(LZEntry **out, int *n_out, int *stamp_live_out) {
+/* ── BINARY SIDECAR (v3) ────────────────────────────────────────────────
+ * Row i of the sidecar is row i of the JSONL BY POSITION. A sidecar built from
+ * a different file would serve the wrong vector for every row after the first
+ * change: recall looks normal, every answer is wrong, and nothing logs. So the
+ * header carries the source's size, mtime_ns, a first/last-4KB fingerprint AND
+ * a whole-file hash, and we REFUSE on mismatch and fall back to the JSONL with
+ * a loud diag line. The full pass costs ~0.5 s on a 212 MB index and runs once
+ * per rebuild; ANN_SIDECAR_FAST=1 drops it to size+mtime+sampled fp only.
+ *
+ * ANN_USE_SIDECAR=0 forces the JSONL path, so both can be A/B'd on the same
+ * binary (same reasoning as ANN_ZONE_ROWS).
+ *
+ * Format (scripts/index_sidecar.py is the reference implementation):
+ *   64-byte header, then n*336 metadata records, then n*dim f16 values.
+ */
+#define SIDECAR_MAGIC "ANNIDX\0\2"
+#define SIDECAR_HDR   64
+#define SIDECAR_META  336
+#define SIDECAR_F16   1
+
+/* telemetry for the loader log: which path ran, and how long it took */
+static LARGE_INTEGER g_sc_t0, g_sc_t1, g_sc_qf;
+static int    g_sc_used = 0;
+static double g_sc_ms = 0.0;
+
+typedef struct {
+    char     magic[8];
+    uint32_t version, dtype, dim, reserved0;
+    uint64_t n_rows, jsonl_size, jsonl_mtime_ns, jsonl_fp, jsonl_hash;
+} SidecarHdr;
+
+static unsigned long long lz_index_fp(const char *path, long size, long n_prev,
+                                      unsigned anchors_cksum);   /* defined below */
+
+static float lz_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign << 31;
+        } else {                       /* subnormal: renormalise */
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3FFu;
+            bits = (sign << 31) | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        bits = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static int lz_sidecar_enabled(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *e = getenv("ANN_USE_SIDECAR");
+    cached = (e && e[0] == '0') ? 0 : 1;      /* unset = auto (use if valid) */
+    return cached;
+}
+
+/* ANN_SIDECAR_FAST=1 trades the full-file hash for size+mtime_ns+sampled fp. */
+static int lz_sidecar_fast(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *e = getenv("ANN_SIDECAR_FAST");
+    cached = (e && e[0] == '1') ? 1 : 0;
+    return cached;
+}
+
+/* FNV-1a-64 over the whole file, same basis as lz_index_fp so the two are
+ * computed the same way (scripts/index_sidecar.py jsonl_hash is the twin). */
+static unsigned long long lz_fnv_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    static unsigned char buf[1 << 20];
+    unsigned long long h = 1469598103934665603ULL;
+    size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0) {
+        for (size_t i = 0; i < got; i++) {
+            h ^= (unsigned long long)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    fclose(f);
+    return h;
+}
+
+/* ns since the Unix epoch, or -1. FILETIME counts 100 ns units from 1601 and
+ * Python's st_mtime_ns is derived from the same field, so the conversion is
+ * *100 minus the 1601->1970 offset. Both steps must stay UNSIGNED: 2026 in
+ * FILETIME*100 is ~1.34e19, which overflows a signed 64-bit long long. */
+#define LZ_FILETIME_EPOCH_NS 11644473600000000000ULL
+static long long lz_file_mtime_ns(const char *path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return -1;
+    ULARGE_INTEGER u;
+    u.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    u.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    unsigned long long t = u.QuadPart * 100ULL - LZ_FILETIME_EPOCH_NS;
+    return (long long)t;
+}
+
+static int lz_index_load_sidecar(LZEntry **out, int *n_out, int *stamp_live_out,
+                                 char *why, size_t whysz) {
+    *out = NULL; *n_out = 0;
+    char sp[600];
+    snprintf(sp, sizeof sp, "%s.f16", PATH_INDEX);
+    FILE *f = fopen(sp, "rb");
+    if (!f) { snprintf(why, whysz, "no %s", sp); return -1; }
+
+    SidecarHdr h;
+    if (fread(&h, sizeof h, 1, f) != 1) {
+        snprintf(why, whysz, "short header"); fclose(f); return -1;
+    }
+    if (memcmp(h.magic, SIDECAR_MAGIC, 8) != 0) {
+        snprintf(why, whysz, "bad magic"); fclose(f); return -1;
+    }
+    if (h.version != 3 || h.dtype != SIDECAR_F16) {
+        snprintf(why, whysz, "version %u dtype %u (need 3/f16)",
+                 h.version, h.dtype);
+        fclose(f); return -1;
+    }
+    if (h.n_rows == 0 || h.dim == 0 || h.dim > 1024 || h.n_rows > 4000000u) {
+        snprintf(why, whysz, "implausible n=%llu dim=%u",
+                 (unsigned long long)h.n_rows, h.dim);
+        fclose(f); return -1;
+    }
+    struct stat js;
+    if (stat(PATH_INDEX, &js) != 0) {
+        snprintf(why, whysz, "no %s", PATH_INDEX); fclose(f); return -1;
+    }
+    if ((uint64_t)js.st_size != h.jsonl_size) {
+        snprintf(why, whysz, "size %ld != header %llu",
+                 (long)js.st_size, (unsigned long long)h.jsonl_size);
+        fclose(f); return -1;
+    }
+    long long mt = lz_file_mtime_ns(PATH_INDEX);
+    if (mt < 0 || (uint64_t)mt != h.jsonl_mtime_ns) {
+        snprintf(why, whysz, "mtime moved (sidecar is stale)");
+        fclose(f); return -1;
+    }
+    if (lz_index_fp(PATH_INDEX, (long)js.st_size, (long)h.n_rows, 0) != h.jsonl_fp) {
+        snprintf(why, whysz, "content fingerprint mismatch");
+        fclose(f); return -1;
+    }
+    /* The sampled fingerprint above cannot see a change in the middle of the
+     * file, and a sidecar that maps onto the wrong rows is exactly the silent
+     * failure this guard exists for. The full pass costs ~0.5 s on the 212 MB
+     * index, once per rebuild, so it is the default; ANN_SIDECAR_FAST=1 skips
+     * it and leaves only size+mtime_ns+sampled fp. */
+    if (h.jsonl_hash != 0 && !lz_sidecar_fast()) {
+        unsigned long long full = lz_fnv_file(PATH_INDEX);
+        if (full != h.jsonl_hash) {
+            snprintf(why, whysz, "full-content hash mismatch (%016llx != %016llx)",
+                     full, (unsigned long long)h.jsonl_hash);
+            fclose(f); return -1;
+        }
+    }
+
+    int n = (int)h.n_rows, dim = (int)h.dim;
+    LZEntry *a = (LZEntry *)calloc((size_t)n, sizeof(LZEntry));
+    unsigned char *meta = (unsigned char *)malloc((size_t)n * SIDECAR_META);
+    size_t vbytes = (size_t)n * (size_t)dim * sizeof(uint16_t);
+    uint16_t *hv = (uint16_t *)malloc(vbytes);
+    if (!a || !meta || !hv) {
+        snprintf(why, whysz, "out of memory");
+        free(a); free(meta); free(hv); fclose(f); return -1;
+    }
+    if (fread(meta, SIDECAR_META, (size_t)n, f) != (size_t)n) {
+        snprintf(why, whysz, "truncated metadata");
+        free(a); free(meta); free(hv); fclose(f); return -1;
+    }
+    if (fread(hv, 1, vbytes, f) != vbytes) {
+        snprintf(why, whysz, "truncated vectors");
+        free(a); free(meta); free(hv); fclose(f); return -1;
+    }
+    fclose(f);
+
+    for (int i = 0; i < n; i++) {
+        const unsigned char *m = meta + (size_t)i * SIDECAR_META;
+        memcpy(a[i].sid, m, 63); a[i].sid[63] = 0;
+        memcpy(a[i].file, m + 64, 255); a[i].file[255] = 0;
+        int npast, mdim, anc, anc2;
+        memcpy(&npast, m + 320, 4);
+        memcpy(&mdim, m + 324, 4);
+        memcpy(&anc, m + 328, 4);
+        memcpy(&anc2, m + 332, 4);
+        a[i].npast = npast;
+        a[i].anchor = anc;
+        a[i].anchor2 = anc2;
+        a[i].dim = (mdim > 0 && mdim <= dim) ? mdim : dim;
+        a[i].vec = (float *)malloc((size_t)a[i].dim * sizeof(float));
+        if (!a[i].vec) {
+            snprintf(why, whysz, "out of memory at row %d", i);
+            for (int k = 0; k < i; k++) free(a[k].vec);
+            free(a); free(meta); free(hv);
+            return -1;
+        }
+        const uint16_t *src = hv + (size_t)i * dim;
+        double n2 = 0;
+        for (int w = 0; w < a[i].dim; w++) {
+            float x = lz_f16_to_f32(src[w]);
+            a[i].vec[w] = x;
+            n2 += (double)x * x;
+        }
+        a[i].norm = sqrt(n2);
+    }
+    free(meta); free(hv);
+
+    if (stamp_live_out) *stamp_live_out = lz_stamp_overlay(a, n);
+    *out = a; *n_out = n;
+    return 0;
+}
+
+static int lz_index_load_jsonl(LZEntry **out, int *n_out, int *stamp_live_out) {
     *out = NULL; *n_out = 0;
     FILE *ix = fopen(PATH_INDEX, "r");
     if (!ix) return 0;
@@ -963,6 +1183,29 @@ static int lz_index_load(LZEntry **out, int *n_out, int *stamp_live_out) {
     *out = a; *n_out = n;
     return 0;
 }
+/* Dispatcher: try the guarded sidecar, fall back to the JSONL. A rejected
+ * sidecar is never an error — a stale file must not stop the service, it must
+ * only lose the speedup and say so once. */
+static int lz_index_load(LZEntry **out, int *n_out, int *stamp_live_out) {
+    if (lz_sidecar_enabled()) {
+        char why[192];
+        why[0] = 0;
+        if (!g_sc_qf.QuadPart) QueryPerformanceFrequency(&g_sc_qf);
+        QueryPerformanceCounter(&g_sc_t0);
+        if (lz_index_load_sidecar(out, n_out, stamp_live_out, why, sizeof why) == 0) {
+            QueryPerformanceCounter(&g_sc_t1);
+            g_sc_used = 1;
+            g_sc_ms = (double)(g_sc_t1.QuadPart - g_sc_t0.QuadPart) * 1000.0
+                      / (double)g_sc_qf.QuadPart;
+            lz_diag("sidecar: loaded %d rows in %.1f ms (JSONL skipped)\n", *n_out, g_sc_ms);
+            return 0;
+        }
+        g_sc_used = 0;
+        lz_diag("sidecar: REJECTED (%s) - falling back to the JSONL\n", why);
+    }
+    return lz_index_load_jsonl(out, n_out, stamp_live_out);
+}
+
 /* ── FLOAT-KERNEL parallel arrays (ANN_FLOAT_KERNEL=1) ─────────────── */
 static float *g_inv = NULL;
 static int g_inv_n = 0;

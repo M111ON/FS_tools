@@ -10,9 +10,11 @@ No re-embedding: memcore already stores multilingual-e5-small vectors at dim
 384, and the ANN sidecar serves the SAME model, so the spaces match (measured
 cosine 0.955 — close enough for routing; re-embed only if exactness matters).
 
-anchor/anchor2 are NOT written here — the server's POST /v1/state/regrow
-trains the centroids, posts every entry into its top-2 buckets, and rewrites
-this file with the anchor fields added (same split as upstream).
+anchor/anchor2 are NOT written here, and the server does NOT rewrite this file
+(it did in an older design; anchors now live in ann_anchors.bin, and
+POST /v1/state/regrow keeps its own state file). So this script is the only
+writer of the live index, and it also writes the binary sidecar
+(<out>.f16) in the same run, right after the swap, so the two can never drift.
 
 Usage:
     python build_index.py [--db PATH] [--out PATH] [--limit N] [--max-chars 400]
@@ -24,7 +26,7 @@ import numpy as np
 
 DEFAULT_DB = r"I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUT = os.path.join(_ROOT, "data", "ann_index.jsonl")
+DEFAULT_OUT = os.path.join(_ROOT, "data", "memcore", "ann_index.jsonl")
 DEFAULT_ROUTES = os.path.join(_ROOT, "data", "ann_routes.jsonl")
 
 
@@ -82,6 +84,7 @@ def main():
     # so sidecar row i is byte-for-byte the JSONL row i after a float32 cast.
     first_dim = (len(rows[0]["vec"]) // 4) if rows else 0
     X = np.empty((len(rows), first_dim), dtype=np.float32)
+    meta_rows = []
     with open(tmp, "w", encoding="utf-8") as out:
         for r in rows:
             vec = struct.unpack("<%df" % (len(r["vec"]) // 4), r["vec"])
@@ -95,6 +98,11 @@ def main():
             rec = {"sid": sid, "file": file, "npast": npast, "dim": dim,
                    "vec": [round(x, 6) for x in vec]}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            # anchor/anchor2 are NOT known here (the server's regrow adds them
+            # to the .stamp overlay), so they stay -1 in the sidecar exactly as
+            # they are absent from the JSONL.
+            meta_rows.append({"sid": sid, "file": file, "npast": npast,
+                              "dim": dim, "anchor": -1, "anchor2": -1})
             if dim == first_dim:
                 X[n] = rec["vec"]
             n += 1
@@ -128,7 +136,7 @@ def main():
         print(f"sidecar: SKIPPED - {n - X.shape[0]} rows have a different dim")
     else:
         from index_sidecar import write_index
-        meta = write_index(sidecar, X, "f16", src_jsonl=a.out)
+        meta = write_index(sidecar, X, "f16", src_jsonl=a.out, meta=meta_rows)
         print(f"wrote {meta['n_rows']}x{meta['dim']} f16 -> {sidecar} "
               f"fp={meta['jsonl_fp']}")
 

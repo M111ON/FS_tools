@@ -42,11 +42,22 @@ import numpy as np
 
 MAGIC_V1 = b"ANNIDX\0\0"
 MAGIC_V2 = b"ANNIDX\0\1"
-VERSION = 2
+MAGIC_V3 = b"ANNIDX\0\2"
+VERSION = 3
 DTYPES = {"f32": (0, np.float32, 4), "f16": (1, np.float16, 2)}
 
 HDR_V1 = struct.Struct("<8sIIIQ")                  # magic version dtype dim n
 HDR_V2 = struct.Struct("<8sIIIIQQQQQ")             # + size mtime_ns fp reserved
+
+# v3 adds a per-row metadata block so the C server can build its entry table
+# without parsing the JSONL at all — without it the "89x faster" is a lie, since
+# the 212 MB text scan is where the time actually goes.
+#   sid[64] file[256] npast i32 dim i32 anchor i32 anchor2 i32 = 336 bytes
+# anchor/anchor2 are here because lz_entry_parse() reads them from the JSONL;
+# dropping them would silently lose the stamps on any file that carries them.
+META_FMT = "<64s256siiii"
+META_SIZE = struct.calcsize(META_FMT)
+assert META_SIZE == 336, META_SIZE
 
 FNV_OFF = 1469598103934665603                      # ann_search.c:3826
 FNV_PRIME = 1099511628211
@@ -75,42 +86,96 @@ def jsonl_fp(path, size, n_rows):
     return h or 1
 
 
-def write_index(path, X, dtype="f16", src_jsonl=None):
-    """Write the sidecar. src_jsonl=None produces an unguarded v2 (size/fp = 0)."""
+def jsonl_hash(path):
+    """FNV-1a-64 over the WHOLE file.
+
+    The sampled jsonl_fp cannot see a change in the middle of the file, and a
+    sidecar that maps onto the wrong rows serves the wrong vector with no error
+    - the one failure this whole guard exists for. A full pass costs ~0.5 s on
+    the 212 MB index, paid once per rebuild, so it is the default; the C side
+    checks it unless ANN_SIDECAR_FAST=1 is set.
+    """
+    h = FNV_OFF
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(1 << 20)
+            if not buf:
+                break
+            h = fnv64(h, buf)
+    return h or 1
+
+
+def write_index(path, X, dtype="f16", src_jsonl=None, meta=None):
+    """Write the sidecar.
+
+    meta=None  -> v2 (vectors only). src_jsonl=None -> no guard fields.
+    meta=list of dicts with sid/file/npast -> v3 (vectors + metadata block),
+    which is what the C server needs to skip the JSONL entirely.
+    """
     code, np_dt, _ = DTYPES[dtype]
     n, dim = X.shape
     if src_jsonl:
         st = os.stat(src_jsonl)
         size, mtime_ns = st.st_size, st.st_mtime_ns
         fp = jsonl_fp(src_jsonl, size, n)
+        full = jsonl_hash(src_jsonl)
     else:
-        size = mtime_ns = fp = 0
+        size = mtime_ns = fp = full = 0
+    magic = MAGIC_V3 if meta is not None else MAGIC_V2
     tmp = f"{path}.tmp"
     with open(tmp, "wb") as f:
-        f.write(HDR_V2.pack(MAGIC_V2, VERSION, code, dim, 0, n, size,
-                            mtime_ns, fp, 0))
+        f.write(HDR_V2.pack(magic, VERSION if meta is not None else 2,
+                            code, dim, 0, n, size, mtime_ns, fp, full))
+        if meta is not None:
+            if len(meta) != n:
+                raise ValueError(f"meta has {len(meta)} rows, X has {n}")
+            for m in meta:
+                f.write(struct.pack(
+                    META_FMT,
+                    (m.get("sid") or "").encode("utf-8")[:63],
+                    (m.get("file") or "").encode("utf-8")[:255],
+                    int(m.get("npast") or 0), int(m.get("dim") or dim),
+                    int(m.get("anchor", -1)), int(m.get("anchor2", -1))))
         X.astype(np_dt, copy=False).tofile(f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
     return {"n_rows": n, "dim": dim, "dtype": dtype, "jsonl_size": size,
-            "jsonl_mtime_ns": mtime_ns, "jsonl_fp": fp}
+            "jsonl_mtime_ns": mtime_ns, "jsonl_fp": fp, "jsonl_hash": full,
+            "has_meta": meta is not None}
 
 
 def read_index(path, require_guard=True):
     """Return (info, float32 array). Raises if the sidecar is stale or bad.
 
     info["guarded"] is False for v1 headers (no fingerprint to check).
+    info["meta"] is the per-row metadata list for v3, else None.
     """
     with open(path, "rb") as f:
         head = f.read(HDR_V2.size)
     magic = head[:8]
-    if magic == MAGIC_V2:
-        _, ver, code, dim, _r0, n, size, mtime_ns, fp, _r1 = HDR_V2.unpack(head)
+    meta = None
+    if magic in (MAGIC_V2, MAGIC_V3):
+        _, ver, code, dim, _r0, n, size, mtime_ns, fp, full = HDR_V2.unpack(head)
         off = HDR_V2.size
+        if magic == MAGIC_V3:
+            with open(path, "rb") as f:
+                f.seek(off)
+                raw = f.read(n * META_SIZE)
+            if len(raw) != n * META_SIZE:
+                raise ValueError(f"{path}: truncated metadata block")
+            meta = []
+            for i in range(n):
+                sid, fil, npast, mdim, anc, anc2 = struct.unpack_from(
+                    META_FMT, raw, i * META_SIZE)
+                meta.append({"sid": sid.rstrip(b"\0").decode("utf-8", "replace"),
+                             "file": fil.rstrip(b"\0").decode("utf-8", "replace"),
+                             "npast": npast, "dim": mdim,
+                             "anchor": anc, "anchor2": anc2})
+            off += n * META_SIZE
     elif magic == MAGIC_V1:
         _, ver, code, dim, n = HDR_V1.unpack(head[:HDR_V1.size])
-        size = mtime_ns = fp = 0
+        size = mtime_ns = fp = full = 0
         off = HDR_V1.size
     else:
         raise ValueError(f"{path}: bad magic {magic!r}")
@@ -120,7 +185,9 @@ def read_index(path, require_guard=True):
     mm = np.memmap(path, dtype=np_dt, mode="r", offset=off, shape=(n, dim))
     info = {"path": path, "version": ver, "dtype": name, "dim": dim,
             "n_rows": n, "jsonl_size": size, "jsonl_mtime_ns": mtime_ns,
-            "jsonl_fp": fp, "guarded": magic == MAGIC_V2 and fp != 0}
+            "jsonl_fp": fp, "jsonl_hash": full,
+            "guarded": magic != MAGIC_V1 and fp != 0,
+            "meta": meta}
     return info, np.asarray(mm, dtype=np.float32)
 
 
@@ -138,6 +205,11 @@ def check_fresh(info, src_jsonl):
                          f"was built")
     if jsonl_fp(src_jsonl, st.st_size, info["n_rows"]) != info["jsonl_fp"]:
         raise ValueError(f"STALE: {src_jsonl} content fingerprint does not match")
+    if info.get("jsonl_hash"):
+        if jsonl_hash(src_jsonl) != info["jsonl_hash"]:
+            raise ValueError(f"STALE: {src_jsonl} full-content hash does not "
+                             f"match (the file changed without touching its "
+                             f"size or mtime)")
     return True
 
 
@@ -145,7 +217,7 @@ def load_vectors(path, src_jsonl=None):
     """Load either a JSONL index or a binary sidecar, by magic. Guarded if asked."""
     with open(path, "rb") as f:
         magic = f.read(8)
-    if magic in (MAGIC_V1, MAGIC_V2):
+    if magic in (MAGIC_V1, MAGIC_V2, MAGIC_V3):
         info, X = read_index(path)
         if src_jsonl:
             check_fresh(info, src_jsonl)
@@ -154,13 +226,57 @@ def load_vectors(path, src_jsonl=None):
     return read_jsonl(path)[2]
 
 
+def write_from_jsonl(path, src_jsonl, dtype="f16"):
+    """One pass over the JSONL -> v3 sidecar (metadata + vectors). Bounded memory."""
+    import json
+
+    n = 0
+    with open(src_jsonl, "rb") as f:
+        while True:
+            chunk = f.read(1 << 22)
+            if not chunk:
+                break
+            n += chunk.count(b"\n")
+
+    X = None
+    meta = []
+    with open(src_jsonl, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            v = o.get("vec")
+            if not v:
+                continue
+            if X is None:
+                X = np.empty((n, len(v)), dtype=np.float32)
+            if len(v) != X.shape[1]:
+                continue
+            i = len(meta)
+            if i >= n:
+                break
+            X[i] = v
+            meta.append({"sid": o.get("sid"), "file": o.get("file"),
+                         "npast": o.get("npast"), "dim": len(v),
+                         "anchor": o.get("anchor", -1),
+                         "anchor2": o.get("anchor2", -1)})
+    if X is None or not meta:
+        raise SystemExit("no usable rows")
+    return write_index(path, X[:len(meta)], dtype, src_jsonl=src_jsonl, meta=meta)
+
+
 def main():
     import argparse
-    from convert_jsonl_to_f16 import read_jsonl
     ap = argparse.ArgumentParser(description="build / verify the sidecar")
     ap.add_argument("--in", dest="src", required=True)
     ap.add_argument("--out", dest="dst", required=True)
     ap.add_argument("--dtype", default="f16", choices=sorted(DTYPES))
+    ap.add_argument("--vectors-only", action="store_true",
+                    help="write v2 (no metadata block); the C server needs v3")
     ap.add_argument("--verify", action="store_true",
                     help="check an existing sidecar against its JSONL")
     a = ap.parse_args()
@@ -168,11 +284,17 @@ def main():
         info, _ = read_index(a.dst)
         check_fresh(info, a.src)
         print(f"ok: {a.dst} matches {a.src} "
-              f"(n_rows={info['n_rows']}, fp={info['jsonl_fp']})")
+              f"(n_rows={info['n_rows']}, fp={info['jsonl_fp']}, "
+              f"meta={'yes' if info['meta'] else 'no'})")
         return
-    n, dim, X = read_jsonl(a.src)
-    meta = write_index(a.dst, X, a.dtype, src_jsonl=a.src)
-    print(f"wrote {a.dst}  rows={n} dim={dim} dtype={a.dtype} "
+    if a.vectors_only:
+        from convert_jsonl_to_f16 import read_jsonl
+        n, dim, X = read_jsonl(a.src)
+        meta = write_index(a.dst, X, a.dtype, src_jsonl=a.src)
+    else:
+        meta = write_from_jsonl(a.dst, a.src, a.dtype)
+    print(f"wrote {a.dst}  rows={meta['n_rows']} dim={meta['dim']} "
+          f"dtype={meta['dtype']} meta={meta['has_meta']} "
           f"fp={meta['jsonl_fp']} size={os.path.getsize(a.dst)}")
 
 
