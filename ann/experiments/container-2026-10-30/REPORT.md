@@ -483,3 +483,66 @@ the two without saying so.
 - `epoch` must carry `mean_hash`; a mismatch refuses to resolve rather than
   silently answering from a different space.
 - Nothing in the search path changes: the index keeps raw vectors and raw cosine.
+
+## Phase G — D2 phase 1: the f16 sidecar passes its gate (2026-10-31)
+
+`phase_g_f16_gate.py` + `ann/scripts/convert_jsonl_to_f16.py`. Offline only: no
+production path was touched.
+
+Corpus: 54,064 rows x 384 (the live index after the D3 delete; `ann-sync`
+rebuilt it at 19:47 from `entries JOIN embeddings`).
+
+### Load and size
+
+| | size | load |
+|---|---:|---:|
+| JSONL (text) | 212.3 MB | 7.74 s |
+| f16 sidecar | **39.6 MB** | **0.08 s** |
+
+5.4x smaller, 96x faster to load. (An earlier note said "parse ~50 s" — that was
+wrong for this file; the measured cost is 7.74 s.)
+
+### Loss
+
+```
+f32 sidecar bit-identical to the JSONL : True     <- the container itself is lossless
+element |dx|  max 6.104e-05   mean 7.783e-06
+cosine        min 1.000000 (6dp)   rows below 0.9999: 0
+```
+
+The 0.09% figure quoted earlier was per-element relative precision, not loss of
+recall. Measured neighbour loss:
+
+```
+top-10 f16 vs f32 = 0.9985   (9.98 of 10 neighbours identical)
+```
+
+### Container recall, kmeans K=26, truth = f32 brute force
+
+| probes | f32 recall@10 / scan | f16 recall@10 / scan | drop |
+|---|---|---|---|
+| 1 | 0.6180 / 4.3% | 0.6165 / 4.3% | +0.0015 |
+| 2 | 0.7520 / 8.5% | 0.7525 / 8.5% | -0.0005 |
+| 4 | 0.8790 / 16.7% | 0.8780 / 16.7% | +0.0010 |
+
+Occupancy identical (max 6.9%, min 1.5%, 26/26 used).
+
+**Gate 0.5%: PASS.** Worst drop 0.0015, and at probes=2 the f16 arm is
+*infinitesimally better* — i.e. the difference is noise, not a trend.
+
+### Two corrections that change the phase-2 plan
+
+1. **The JSONL is not the source of truth.** `ann-sync` (scheduled) runs
+   `build_index.py`, which reads `entries JOIN embeddings` and writes
+   `ann_index.jsonl`. Vectors live in the DB, so a lost or corrupted JSONL is
+   rebuilt with **no re-embedding**. The earlier statement "JSONL is the source
+   of truth, writer failure = re-embed 542k docs" was wrong.
+2. **A stale sidecar is undetectable with this header.** Row i of the binary is
+   row i of the JSONL by position only; `ann-sync` rewrites the JSONL on a
+   schedule, and a reorder would silently serve the wrong vector for every row
+   after the first change. Phase 2 must add a guard — the cheap one is 16 bytes
+   of source size + mtime in the header, refused on mismatch (the sync always
+   rewrites the whole file, so mtime is a reliable signal here).
+
+Not done (phase 2, needs the guard first): reader in the load path, writer in
+`build_index.py`, bench scripts, backward compatibility.
