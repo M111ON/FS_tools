@@ -48,6 +48,8 @@ PY_TESTS = ["tests/test_p3_compact.py", "tests/test_vec_format.py",
             "tests/test_export_producer_routes.py", "tests/test_export_unknown_routes.py",
             "tests/test_route_manifest.py", "tests/test_route_sidecar.py",
             "tests/test_numeric_sidecar_fixture.py",
+            # binary index sidecar + staleness guard
+            "tests/test_index_sidecar.py",
             "dashboard/tests/test_dashboard_core.py"]
 
 

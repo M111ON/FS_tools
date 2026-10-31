@@ -20,6 +20,8 @@ Usage:
 """
 import argparse, json, os, sqlite3, struct, sys, time
 
+import numpy as np
+
 DEFAULT_DB = r"I:\tools\cloud_ws\memcore\fact_store.v2.sqlite3"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(_ROOT, "data", "ann_index.jsonl")
@@ -76,6 +78,10 @@ def main():
     n = 0
     dims = {}
     t0 = time.time()
+    # The sidecar is filled from the SAME rounded values that go into the JSONL,
+    # so sidecar row i is byte-for-byte the JSONL row i after a float32 cast.
+    first_dim = (len(rows[0]["vec"]) // 4) if rows else 0
+    X = np.empty((len(rows), first_dim), dtype=np.float32)
     with open(tmp, "w", encoding="utf-8") as out:
         for r in rows:
             vec = struct.unpack("<%df" % (len(r["vec"]) // 4), r["vec"])
@@ -89,6 +95,8 @@ def main():
             rec = {"sid": sid, "file": file, "npast": npast, "dim": dim,
                    "vec": [round(x, 6) for x in vec]}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if dim == first_dim:
+                X[n] = rec["vec"]
             n += 1
             if n % 5000 == 0:
                 print(f"  {n}/{len(rows)}  ({time.time()-t0:.1f}s)")
@@ -110,6 +118,20 @@ def main():
     print(f"wrote {n} entries -> {a.out}")
     print(f"dims: {dims}")
     print(f"elapsed {time.time()-t0:.1f}s")
+
+    # The binary sidecar is written HERE, in the same run, and never by a
+    # separate job: two writers would drift and the guard would only tell us
+    # after the fact. src_jsonl is the file just swapped in, so the size,
+    # mtime_ns and fingerprint all describe the bytes the reader will see.
+    sidecar = a.out + ".f16"
+    if X.shape[0] != n:
+        print(f"sidecar: SKIPPED - {n - X.shape[0]} rows have a different dim")
+    else:
+        from index_sidecar import write_index
+        meta = write_index(sidecar, X, "f16", src_jsonl=a.out)
+        print(f"wrote {meta['n_rows']}x{meta['dim']} f16 -> {sidecar} "
+              f"fp={meta['jsonl_fp']}")
+
     if a.route_db:
         sys.path.insert(0, _ROOT)
         from export_producer_routes import export as export_routes

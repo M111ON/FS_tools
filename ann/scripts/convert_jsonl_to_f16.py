@@ -39,8 +39,12 @@ DTYPES = {"f32": (0, np.float32, 4), "f16": (1, np.float16, 2)}
 HEADER = struct.Struct("<8sIIIQ")
 
 
-def read_jsonl(path, limit=None, dim=384):
-    """Return (n, dim, float32 array) in file order."""
+def read_jsonl(path, limit=None, dim=None):
+    """Return (n, dim, float32 array) in file order.
+
+    dim=None infers it from the first usable row, so this works for any embedder
+    size (384 for e5-small, 768 for mpnet, ...).
+    """
     vecs = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -54,7 +58,11 @@ def read_jsonl(path, limit=None, dim=384):
             except Exception:
                 continue
             v = o.get("vec")
-            if not v or len(v) != dim:
+            if not v:
+                continue
+            if dim is None:
+                dim = len(v)
+            if len(v) != dim:
                 continue
             vecs.append(v)
     if not vecs:

@@ -25,8 +25,8 @@ import numpy as np
 from phase_b_gate import kmeans, recall_at, TOPK
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-from convert_jsonl_to_f16 import (read_jsonl, write_binary, read_binary,  # noqa: E402
-                                  DTYPES)
+from convert_jsonl_to_f16 import read_jsonl                    # noqa: E402
+from index_sidecar import check_fresh, read_index, write_index  # noqa: E402
 
 INDEX = r"I:\tools\ann\data\memcore\ann_index.jsonl"
 GATE = 0.005          # 0.5%
@@ -58,13 +58,14 @@ def main():
     tmp = tempfile.mkdtemp(prefix="f16gate_")
     p16 = os.path.join(tmp, "idx.f16")
     p32 = os.path.join(tmp, "idx.f32")
-    write_binary(p16, X32, "f16")
-    write_binary(p32, X32, "f32")
+    write_index(p16, X32, "f16", src_jsonl=INDEX)
+    write_index(p32, X32, "f32", src_jsonl=INDEX)
 
     t0 = time.time()
-    _, X16 = read_binary(p16)
+    info16, X16 = read_index(p16)
+    check_fresh(info16, INDEX)
     t_bin = time.time() - t0
-    _, X32r = read_binary(p32)
+    _, X32r = read_index(p32)
     print(f"load f16 binary {t_bin:6.2f}s   "
           f"{os.path.getsize(p16)/1048576:7.1f} MB  "
           f"({t_jsonl/max(t_bin,1e-6):.0f}x faster)")
