@@ -423,3 +423,63 @@ Limits to state before quoting any of this:
 
 Not tested: the full 542k corpus, efSearch-style reranking, the shape-phase pool,
 and whether kmeans buckets survive an embedding swap.
+
+## Phase F — D1 decided: address on the CENTRED vector (2026-10-31)
+
+Owner decision D1 = B. `phase_f_centred.py`, 20,000 rows, mean frozen on the
+first 40% (what production does: freeze at epoch start, append after).
+
+### Address: the win is LENGTH, not uniqueness
+
+| arm | unique (12 letters) | collided | largest group | mean letters/lookup |
+|---|---|---|---|---|
+| raw | 95.78% | 844 | 34 | **7.19** |
+| centred, frozen mean (40%) | 98.67% | 265 | 15 | **3.83** |
+| centred, oracle mean (100%) | 98.63% | 274 | 11 | 3.82 |
+
+Centring does not rescue uniqueness — it was already 95.78% at 12 letters. It
+**halves the address length** (7.19 -> 3.83 letters, -47%), which is what the
+head+tail ladder actually pays for.
+
+### Correction to an earlier claim
+
+An earlier note said the raw address space "collapses, 5.79% unique, 94% of rows
+collide". That is **not true at 12 letters** and must not be quoted. The 5.79%
+figure belongs to a much shorter address (4 levels x 16 values = 65,536 keys),
+not to the 12-letter one measured here. The real raw cost is length (7.19 of 12
+letters), not collision.
+
+### Freezing the mean is mandatory, measured
+
+Recomputing the mean on the full 100% moves **18,442 / 20,000 addresses (92.21%)**.
+The mean is therefore part of the epoch: `epoch = (embedder_id, mean_hash)`.
+Change either one and a new epoch opens; old addresses stay valid inside the old
+epoch (`include/chain_ident.h` already carries the field).
+
+### Routing: no gain, so do not claim one
+
+kmeans K=26, truth = brute force in the SAME space as the arm.
+
+| probes | raw recall@10 / scan | centred recall@10 / scan |
+|---|---|---|
+| 1 | 0.6225 / 4.5% | 0.5985 / 4.3% |
+| 2 | 0.7810 / 8.9% | 0.7625 / 8.6% |
+| 4 | 0.8755 / 17.5% | **0.8820 / 16.5%** |
+
+Occupancy is more even (max 6.9% -> 6.1%, min 0.5% -> 1.4%), but recall is flat:
+slightly worse at 1-2 probes, marginally better at 4. **Centring is an addressing
+change, not a routing change.**
+
+### The cost that must be stated with every number
+
+Top-10 overlap raw vs centred = **0.5395**. Only 5.39 of 10 nearest neighbours are
+the same after centring — the metric becomes Pearson correlation, not cosine.
+Every recall figure measured on raw vectors changes meaning; do not compare across
+the two without saying so.
+
+### What D1 changes in the code
+
+- Address derivation takes a frozen mean (384 floats = 1.5 KB per epoch).
+- `epoch` must carry `mean_hash`; a mismatch refuses to resolve rather than
+  silently answering from a different space.
+- Nothing in the search path changes: the index keeps raw vectors and raw cosine.
