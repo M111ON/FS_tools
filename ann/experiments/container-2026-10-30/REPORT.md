@@ -546,3 +546,99 @@ Occupancy identical (max 6.9%, min 1.5%, 26/26 used).
 
 Not done (phase 2, needs the guard first): reader in the load path, writer in
 `build_index.py`, bench scripts, backward compatibility.
+
+## Phase 2 — guarded sidecar (2026-10-31, commit a5eb63b)
+
+Phase 1 produced a file. Phase 2 makes it safe to trust.
+
+### The failure this closes
+
+Row i of the binary is row i of the JSONL **by position**. `ann-sync` rewrites
+the JSONL on a schedule. Without a guard, one reorder serves the wrong vector
+for every row after the change: recall looks normal, every answer is wrong, no
+error anywhere. So the reader refuses instead.
+
+### Format already existed — reused, not invented
+
+`ann_anchors-state.json` already carries `n_prev`, `last_sid`, `index_mtime`,
+`index_size`, `anchors_cksum`, `index_fp`. `index_fp` is `lz_index_fp`
+(`ann_search.c:3833`): FNV-1a-64 over `"size|n_prev|anchors_cksum"` + first 4 KB
++ last 4 KB, with a **non-standard offset basis** `1469598103934665603`
+(the standard FNV-1a-64 basis is `0xcbf29ce484222325`).
+
+Reproduced in Python and checked against the live state file:
+
+```
+computed 11559300728668170804 == stored index_fp
+```
+
+So the header reuses that fingerprint rather than inventing a first/last row id
+hash — the 4 KB windows already contain the row ids, and it is the contract the C
+server already speaks. Do not "fix" the offset basis: matching the existing
+contract is worth more than being standard.
+
+Kept from the owner's proposal: **nanosecond** mtime (the state file stores
+seconds, so two writes in one second are indistinguishable today) and the atomic
+write.
+
+### Header v2, 64 bytes LE
+
+```
+magic            "ANNIDX\0\1"        version 2
+dtype u32        dim u32             reserved u32
+n_rows u64       jsonl_size u64      jsonl_mtime_ns u64
+jsonl_fp u64     reserved u64
+```
+
+Guard = `size` + `mtime_ns` + first/last-4 KB fingerprint. mtime catches a
+same-size, same-window rewrite; fp catches a reorder or truncation. v1 headers
+still read, but are marked unguarded and `check_fresh` refuses them.
+
+### Who writes it
+
+`build_index.py`, in the same run, immediately after the existing atomic swap
+(`tmp` -> `os.replace` with retry), from the same rounded values that go into the
+JSONL. One writer, no drift window. Never a separate cron.
+
+Q: is `build_index.py` the only writer of the live JSONL? Yes — the C server
+opens `PATH_INDEX` once, line 938, mode `"r"`; every other use is `stat()`.
+`prep_miracl_th.py` writes into its own `--out` dir and `ab_door_live.py` into
+scratch. Two stale claims found: `build_index.py:13-15` says the server's
+`/v1/state/regrow` rewrites this file (it does not; anchors live in
+`ann_anchors.bin`), and `DEFAULT_OUT` is `data/ann_index.jsonl` while the live
+file is `data/memcore/ann_index.jsonl`, so a manual run without `--out` writes
+somewhere else and looks like it worked.
+
+### Tests — every case asserts a raise
+
+`ann/tests/test_index_sidecar.py`, 10 cases: mtime moved with identical bytes;
+one byte flipped mid-file with size unchanged; rows reordered with size
+unchanged; v1 header refused; guarded load of a stale file refused; rebuild
+passes again. Registered in `run_tests.py`, full suite ALL PASS.
+
+### Gate re-run through the guarded path — identical numbers
+
+```
+JSONL 212.3 MB / 7.67 s   ->   f16 39.6 MB / 0.09 s   (89x)
+top-10 overlap 0.9985
+container K=26 recall@10  f32 / f16
+  probes 1  0.6180 / 0.6165
+  probes 2  0.7520 / 0.7525
+  probes 4  0.8790 / 0.8780
+worst drop 0.0015  (gate 0.005)  PASS
+```
+
+Live sidecar: 54,064x384, `fp=16579103434641292738`, guard fresh,
+`max|dx| 6.104e-05`.
+
+### Also fixed
+
+`read_jsonl` hard-coded `dim=384`, so any other embedder size silently produced
+zero rows ("no usable rows"). Now infers dim from the first usable row.
+
+### Still open — the actual payoff
+
+The C server still reads the JSONL only. Nothing in the hot path mmaps the
+sidecar yet, so today this is a validated artifact plus a writer, not a served
+format. Wiring `ann_search.c` to the sidecar is the real speedup and carries its
+own risk, so it is a separate change.
