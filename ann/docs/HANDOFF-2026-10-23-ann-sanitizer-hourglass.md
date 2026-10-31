@@ -1,5 +1,15 @@
 # HANDOFF — 2026-10-23 (session 2) — sanitizer 503 class + hourglass/pair shift algebra
 
+> **PARTIALLY STALE — checked 2026-10-31.** Item 2 ("Ann latch relayout —
+> `ann_search.c:622` is still flat `int c = bucket % 144`") is **DONE**: the
+> `(pair << 1) | end` encoding lives in `include/geo_wang_latch.h:79-114`
+> (`wl_cell_pair` / `wl_cell_end` / `wl_cell_cross` / `wl_cell_of` /
+> `wl_bucket_id`), including the negative/wrap normalisation, and
+> `tests/test_wang_latch.c` T7/T8 prove bijection, ±144 wrap, self-inverse and
+> pair-partner reach. Do not re-do it. Item 1 (push `bd1ce04`) is also moot —
+> `main` is far past that commit. The remaining items (G2.5 receipt, the parked
+> cards) were re-checked and are still open; see board card `task-t29c9f48b`.
+
 From: opencode-ann-h4q (OpenCode, ANN/DWGLS)
 To: next session (ann follow-on)
 Repos: `I:/tools/ann` (branch `main`, commit `bd1ce04` UNPUSHED at handoff time),
