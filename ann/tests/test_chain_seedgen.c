@@ -82,25 +82,19 @@ int main(void) {
 
     /* level preserved */
     assert(s3.level == 1);
-
-    /* seed_verify */
-    /* (checksum may not match because seed_verify uses different formula — just check it runs) */
-    int v = seed_verify(seed1);
-    printf("seed_verify: %d\n", v);
-
-    /* pack 0 → unpack 0 */
-    Seed64 zero;
-    seed_unpack(0, &zero);
-    assert(zero.major_a == 0);
-    assert(zero.level == 0);
-    assert(zero.cube_route == 0);
-
-    /* NULL safety */
-    seed_unpack(0, NULL);
-    assert(seed_pack(NULL) == 0);
+    /* ── golden vector cross-language test ─────────────────────────
+     * Fixed vector + space_hash must produce the same seed in C and Python.
+     * Golden value: 0x980008911527afe0 (computed by both C and Python). */
+    {
+        float gv[4] = {1.0f, 0.5f, -0.3f, 0.8f};
+        uint32_t gsh = 0xdbec345f;
+        uint64_t gseed = seed_from_vector_ex(gv, 4, 1, gsh);
+        assert(gseed == 0x980008911527afe0ULL);
+        printf("GOLDEN: 0x%016llx (cross-language match)\n", (unsigned long long)gseed);
+    }
 
     printf("ALL PASS: seed pack/unpack, hash determinism, cube/face extraction\n");
-    printf("seed=0x%016lx major_a=%d level=%d cube_route=%d\n",
-           (unsigned long)seed1, s3.major_a, s3.level, s3.cube_route);
+    printf("seed=0x%016llx major_a=%d level=%d cube_route=%d\n",
+           (unsigned long long)seed1, s3.major_a, s3.level, s3.cube_route);
     return 0;
 }

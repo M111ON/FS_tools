@@ -182,6 +182,9 @@ def main():
         f.write(_struct.pack("<I", 2))  # version 2 (fixed FNV + bias)
         f.write(_struct.pack("<Q", len(seeds)))  # n_rows
         f.write(_struct.pack("<I", space_hash))  # space_hash
+        # index file size (fingerprint — prevents stale seed reuse)
+        idx_size = os.path.getsize(a.out)
+        f.write(_struct.pack("<Q", idx_size))
         for seed in seeds:
             f.write(_struct.pack("<Q", seed))
         f.flush()

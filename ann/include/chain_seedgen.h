@@ -157,14 +157,6 @@ static inline uint64_t seed_probe(uint64_t seed, int probe) {
     return mix64(seed + (uint64_t)probe * 0x9E3779B97F4A7C15ULL);
 }
 
-/* ── verify checksum ────────────────────────────────────────────── */
-static inline int seed_verify(uint64_t seed) {
-    /* checksum is a 13-bit slice of the FNV+Mix64 hash (bits 35-47),
-     * not a function of the fields. Cannot be recomputed from fields.
-     * To verify, compare against seed_from_vector() on the original vector. */
-    (void)seed;
-    return 1;
-}
 
 /* ── cube/face extraction ───────────────────────────────────────── */
 static inline uint8_t seed_cube(uint8_t cube_route) {

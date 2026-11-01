@@ -1920,6 +1920,10 @@ static int lz_roster_build_timed(LZEntry *ents, int n, const uint32_t *ord, int 
 
 /* seed identity layer: load + locate */
 static int lz_seeds_load(const char *path, int nent) {
+    /* Invalidate cache at entry — any failure leaves g_seed_n=0 */
+    g_seed_n = 0;
+    if (g_seed_cache) { free(g_seed_cache); g_seed_cache = NULL; }
+
     FILE *f = fopen(path, "rb");
     if (!f) { lz_diag("[seeds] FAIL: cannot open %s\n", path); return 0; }
     char magic[8];
@@ -1927,31 +1931,42 @@ static int lz_seeds_load(const char *path, int nent) {
         lz_diag("[seeds] FAIL: bad magic in %s\n", path); fclose(f); return 0;
     }
     uint32_t version;
-    if (fread(&version, 4, 1, f) != 1 || (version != 1 && version != 2)) {
-        lz_diag("[seeds] FAIL: bad version %u in %s\n", version, path); fclose(f); return 0;
+    if (fread(&version, 4, 1, f) != 1 || version != 2) {
+        lz_diag("[seeds] FAIL: bad version %u in %s (expected 2)\n", version, path); fclose(f); return 0;
     }
     uint64_t n_rows;
     if (fread(&n_rows, 8, 1, f) != 1) {
         lz_diag("[seeds] FAIL: short header in %s\n", path); fclose(f); return 0;
     }
     if ((int)n_rows != nent) {
-        lz_diag("[seeds] FAIL: n_rows=%llu != nent=%d in %s (index may have grown)\n",
+        lz_diag("[seeds] FAIL: n_rows=%llu != nent=%d in %s\n",
                 (unsigned long long)n_rows, nent, path);
-        fclose(f);
-        g_seed_n = 0;
-        return 0;
+        fclose(f); return 0;
     }
     uint32_t space_hash;
     if (fread(&space_hash, 4, 1, f) != 1) {
         lz_diag("[seeds] FAIL: short header (space_hash) in %s\n", path); fclose(f); return 0;
     }
+    /* index file size (fingerprint) — v2 addition */
+    uint64_t idx_size;
+    if (fread(&idx_size, 8, 1, f) != 1) {
+        lz_diag("[seeds] FAIL: short header (idx_size) in %s\n", path); fclose(f); return 0;
+    }
+    /* verify against actual index file size */
+    struct stat sti;
+    if (stat(PATH_INDEX, &sti) == 0 && (uint64_t)sti.st_size != idx_size) {
+        lz_diag("[seeds] FAIL: idx_size mismatch (%llu != %llu) in %s\n",
+                (unsigned long long)idx_size, (unsigned long long)sti.st_size, path);
+        fclose(f); return 0;
+    }
     uint64_t *new_cache = (uint64_t *)malloc((size_t)nent * sizeof(uint64_t));
     if (!new_cache) { lz_diag("[seeds] FAIL: OOM for %d seeds\n", nent); fclose(f); return 0; }
     if (fread(new_cache, 8, (size_t)nent, f) != (size_t)nent) {
         lz_diag("[seeds] FAIL: short read (expected %d seeds) in %s\n", nent, path);
-        free(new_cache); fclose(f); g_seed_n = 0; return 0;
+        free(new_cache); fclose(f); return 0;
     }
     fclose(f);
+    /* atomic swap */
     if (g_seed_cache) free(g_seed_cache);
     g_seed_cache = new_cache;
     g_seed_n = nent;
