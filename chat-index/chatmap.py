@@ -8,6 +8,7 @@
   python chatmap.py block 454                     # one block: title, p1..p4, span
   python chatmap.py timeline --project git:29b08  # sessions in date order
   python chatmap.py ds 201                        # deepseek chunk -> conversation + turn
+  python chatmap.py coord --sid ses_f9cba8fe [--ord 12] [--json]
 """
 import argparse
 import datetime
@@ -1028,6 +1029,39 @@ def cmd_ds(db, key):
               (ts(c["inserted_ms"]), ts(c["updated_ms"]), c["n_turns"], c["n_chunks"], c["chars"]))
 
 
+def cmd_coord(db, sid, ordinal=None, as_json=False):
+    """Read-only opaque coordinate lookup; no ANN/KV payload is inferred."""
+    session = db.execute("select sid, harness, project, first_ms, last_ms from session where sid=?",
+                         (sid,)).fetchone()
+    rows = []
+    if session:
+        q = ("select sid, ordinal, mid, role, ts_ms, chars from msg where sid=? "
+             "order by ordinal")
+        args = [sid]
+        if ordinal is not None:
+            q = q.replace("order by ordinal", "and ordinal=? order by ordinal")
+            args.append(ordinal)
+        rows = db.execute(q, args).fetchall()
+    result = {
+        "sid": sid,
+        "session": dict(session) if session else None,
+        "coordinates": [dict(r) for r in rows],
+        "linked": False,
+        "ann": None,
+        "kv": None,
+    }
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return
+    if not session:
+        print("[]")
+        return
+    print("session %s  coordinates=%d" % (sid, len(rows)))
+    for r in rows:
+        print("  %s#%s role=%s chars=%s ts=%s" %
+              (r["sid"], r["ordinal"], r["role"], r["chars"], ts(r["ts_ms"])))
+
+
 def main():
     ap = argparse.ArgumentParser(description="chatmap query tool")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1039,6 +1073,8 @@ def main():
     p = sub.add_parser("block"); p.add_argument("bid", type=int)
     p = sub.add_parser("timeline"); p.add_argument("--project"); p.add_argument("--limit", type=int, default=15)
     p = sub.add_parser("ds"); p.add_argument("key")
+    p = sub.add_parser("coord"); p.add_argument("--sid", required=True)
+    p.add_argument("--ord", type=int); p.add_argument("--json", action="store_true")
     p = sub.add_parser("when"); p.add_argument("q")
     p.add_argument("-k", type=int, default=25, help="rows shown per layer (layer counts are always totals)")
     p.add_argument("--json", action="store_true")
@@ -1065,6 +1101,8 @@ def main():
         cmd_timeline(db, a.project, a.limit)
     elif a.cmd == "ds":
         cmd_ds(db, a.key)
+    elif a.cmd == "coord":
+        cmd_coord(db, a.sid, a.ord, a.json)
     elif a.cmd == "when":
         cmd_when(db, a.q, a.k, a.json, a.window)
     elapsed = time.time() - t0
