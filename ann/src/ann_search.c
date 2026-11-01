@@ -773,6 +773,7 @@ static int  lz_zone_rows(int zone, const uint32_t **rows);
 
 static void lz_tags_free(void);
 static void lz_tags_load(LZEntry *ents, int nent);
+static int lz_seeds_load(const char *path, int nent);
 static int  lz_stamp_overlay(LZEntry *a, int n);
 static int  lz_stamp_prefix_ok(const LZEntry *a, int n, int *why);
 static void lz_index_free(LZEntry *a, int n);
@@ -1233,6 +1234,10 @@ static void lz_index_free(LZEntry *a, int n) {
 /* index cache: load-once, reload on mtime/size change (single-threaded). */
 static LZEntry *g_idx_cache = NULL;
 static int g_idx_n = 0;
+/* seed identity layer (chain) */
+static uint64_t *g_seed_cache = NULL;
+static int g_seed_n = 0;
+static uint32_t g_seed_space_hash = 0;
 static long g_idx_mtime = 0;
 static long g_idx_size = 0;
 static void lz_index_cache_invalidate(void) {
@@ -1262,6 +1267,8 @@ static int lz_index_cached(LZEntry **out, int *n_out) {
             g_idx_mtime = mt; g_idx_size = sz;
             g_stamp_live = sl;
             lz_tags_load(g_idx_cache, g_idx_n);
+            char _sp[1024]; snprintf(_sp, sizeof(_sp), "%s.seeds", PATH_INDEX);
+            lz_seeds_load(_sp, g_idx_n);
             *out = g_idx_cache; *n_out = g_idx_n; return 1;
         }
     }
@@ -1452,6 +1459,8 @@ static DWORD WINAPI index_loader_thread(LPVOID arg) {
                     g_idx_cache = na; g_idx_n = nn;
                     g_idx_mtime = mt; g_idx_size = sz;
                     g_stamp_live = nsl;
+                    char _sp[1024]; snprintf(_sp, sizeof(_sp), "%s.seeds", PATH_INDEX);
+                    lz_seeds_load(_sp, nn);
                     lz_tags_load(na, nn);      /* the labels follow the rows */
                     g_loaded_at_ms = lz_now_ms();
                     if (old) lz_index_free(old, oldn);  /* still under the lock */
@@ -1907,6 +1916,52 @@ static int lz_roster_build_timed(LZEntry *ents, int n, const uint32_t *ord, int 
             ok, g_roster_src == 1 ? "mmap" : (g_roster_src == 2 ? "built" : "none"),
             g_roster_doors, g_roster_rows, g_roster_bytes, n, ms);
     return ok;
+}
+
+/* seed identity layer: load + locate */
+static int lz_seeds_load(const char *path, int nent) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "ANNSEED\0", 8) != 0) {
+        fclose(f); return 0;
+    }
+    uint32_t version;
+    if (fread(&version, 4, 1, f) != 1 || version != 1) {
+        fclose(f); return 0;
+    }
+    uint64_t n_rows;
+    if (fread(&n_rows, 8, 1, f) != 1 || (int)n_rows != nent) {
+        fclose(f); return 0;
+    }
+    uint32_t space_hash;
+    if (fread(&space_hash, 4, 1, f) != 1) {
+        fclose(f); return 0;
+    }
+    if (g_seed_cache) { free(g_seed_cache); g_seed_cache = NULL; }
+    g_seed_cache = (uint64_t *)malloc((size_t)nent * sizeof(uint64_t));
+    if (!g_seed_cache) { fclose(f); return 0; }
+    if (fread(g_seed_cache, 8, (size_t)nent, f) != (size_t)nent) {
+        free(g_seed_cache); g_seed_cache = NULL; fclose(f); return 0;
+    }
+    g_seed_n = nent;
+    g_seed_space_hash = space_hash;
+    fclose(f);
+    lz_diag("[seeds] loaded %d seeds (space_hash=0x%08x)\n", nent, space_hash);
+    return 1;
+}
+
+static inline uint64_t lz_seed_of_row(int i) {
+    if (!g_seed_cache || i < 0 || i >= g_seed_n) return 0;
+    return g_seed_cache[i];
+}
+
+static int lz_seed_locate(uint64_t seed) {
+    if (!g_seed_cache || seed == 0) return -1;
+    for (int i = 0; i < g_seed_n; i++) {
+        if (g_seed_cache[i] == seed) return i;
+    }
+    return -1;
 }
 
 static int lz_route_cached(int nent) {
@@ -4761,6 +4816,8 @@ regrow_done:
         g_idx_cache = a; g_idx_n = n;
         g_idx_mtime = mt; g_idx_size = sz;
         lz_tags_load(a, n);
+        char _sp2[1024]; snprintf(_sp2, sizeof(_sp2), "%s.seeds", PATH_INDEX);
+        lz_seeds_load(_sp2, n);
         published = 1;
         if (old) lz_index_free(old, oldn);
         LeaveCriticalSection(&g_lock);
