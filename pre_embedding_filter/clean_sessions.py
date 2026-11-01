@@ -100,12 +100,55 @@ def clean_session(content: str) -> str:
 
 files = sorted(INPUT_DIR.glob("session-*.md"))
 FORCE = "--force" in sys.argv
+
+# ---- low-value session filter ----
+# Sessions with fewer than MSG_MIN messages AND fewer than TOK_MIN tokens are
+# skipped: they are empty boots, connection-tests, or magic-context-compartment
+# stubs that add noise without useful content.
+MSG_MIN = 6
+TOK_MIN = 10_000
+
+# Build a fast lookup {short_id -> (msg_count, token_count)} from opencode.db.
+# Keyed by first 11 chars of session id ("ses_XXXXXXX") to match filenames.
+_session_stats: dict = {}
+try:
+    import sqlite3 as _sqlite3
+    _db = _sqlite3.connect("file:I:/Opencode-data/opencode.db?mode=ro", uri=True)
+    for _r in _db.execute("""
+        SELECT s.id, count(m.id),
+               s.tokens_input + s.tokens_output + s.tokens_reasoning
+        FROM session s LEFT JOIN message m ON m.session_id=s.id
+        GROUP BY s.id
+    """):
+        _session_stats[_r[0][:11]] = (_r[1], _r[2] or 0)
+    _db.close()
+except Exception as _e:
+    print(f"[warn] could not load session stats from opencode.db: {_e}")
+
+def _is_low_value(stem: str) -> bool:
+    """Return True if session should be skipped (too few messages + tokens)."""
+    if not _session_stats:
+        return False
+    # stem e.g. "session-ses_XXXXXXX" — strip prefix to get short id
+    inner = stem[len("session-"):]
+    short = inner[:11]
+    stats = _session_stats.get(short)
+    if stats is None:
+        return False
+    msgs, tok = stats
+    return msgs < MSG_MIN and tok < TOK_MIN
+
 print(f"Found {len(files)} files" + ("" if FORCE else " (incremental: unchanged md skipped)"))
+print(f"Low-value filter: msgs<{MSG_MIN} AND tok<{TOK_MIN} (known sessions: {len(_session_stats)})")
 
 total_turns = 0
 skipped = 0
+skipped_low = 0
 for i, f in enumerate(files, 1):
     if "_clean" in f.stem or "_debug" in f.stem:
+        continue
+    if _is_low_value(f.stem):
+        skipped_low += 1
         continue
     out = OUTPUT_DIR / f"{f.stem}_clean.md"
     if not FORCE and out.exists() and out.stat().st_mtime >= f.stat().st_mtime:
@@ -124,4 +167,4 @@ for i, f in enumerate(files, 1):
     except Exception as e:
         print(f"[{i}/{len(files)}] {f.stem} ERROR: {e}")
 
-print(f"\nTotal: {total_turns} turns across {len(files)} files (skipped {skipped} unchanged)")
+print(f"\nTotal: {total_turns} turns across {len(files)} files (skipped {skipped} unchanged, {skipped_low} low-value)")

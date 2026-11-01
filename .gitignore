@@ -94,6 +94,7 @@ chat-pool/_shot_*.png
 chat-pool/.wsbridge_state.json
 pre_embedding_filter/map_run.err
 magic-context-mcp/hermes_mc_sync.log
+mcp-reaper.log
 ann/-
 ann/contre
 ann/build_err.txt
@@ -103,6 +104,10 @@ ann/.ann_route_watch_state.json
 # ── secrets / local credentials ──
 .relay_token
 ocvpn/creds.txt
+.env
+.env.local
+.env.*
+!.env.example
 
 # ── ocvpn runtime state ──
 ocvpn/*.lock
@@ -112,4 +117,15 @@ ocvpn/watch_state.json
 ocvpn/cfg/*.log
 
 # ── wrangler build outputs ──
+ai-relay-worker/tmp/
+
+# local VPN / Cloudflare-adjacent runtime (not project source)
+ocvpn/cfg/
+ocvpn/unlock.py
+ocvpn/*.lock
+ocvpn/state.json
+ocvpn/watch_state.json
+ocvpn/watch.log
+ai-relay-worker/.wrangler/
+ai-relay-worker/node_modules/
 ai-relay-worker/tmp/

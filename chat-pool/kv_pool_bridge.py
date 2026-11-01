@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 
 import pool
 
@@ -49,11 +50,50 @@ _ANCHOR = struct.Struct("<i I I Q Q Q i")     # turn, base_n, tk, tv, fnv, off, 
 
 # ── blob side file ────────────────────────────────────────────────────────
 
+class _WriterLock:
+    """The SAME <log>.lock pool.append() uses.
+
+    Two independent races live in this file, and both need this lock:
+      * the blob offset is "size now", so two writers can reserve one region;
+      * a record's {off,len} is only meaningful if the bytes it names are
+        already at that offset when a reader looks — reserve and write inside
+        one lock so a reader never sees the address before the bytes.
+    Windows: msvcrt.locking on the lock file; POSIX: flock. Mirrors pool.append.
+    """
+    def __init__(self):
+        self.path = pool.LOG + ".lock"
+        self.fd = None
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR)
+        if sys.platform == "win32":
+            import msvcrt
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+    def __exit__(self, *exc):
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
 def blob_append(data: bytes) -> tuple[int, int, int]:
     """Append base bytes; return (offset, length, fnv1a)."""
-    off = os.path.getsize(_BLOB_PATH) if os.path.exists(_BLOB_PATH) else 0
-    with open(_BLOB_PATH, "ab") as f:
-        f.write(data)
+    with _WriterLock():
+        with open(_BLOB_PATH, "ab") as f:
+            off = f.tell()
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
     return off, len(data), _fnv1a(data)
 
 

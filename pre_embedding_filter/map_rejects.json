@@ -971,7 +971,11 @@
  ],
  "7445": [
   "ann/HANDOFF-2026-10-08.md",
-  "ann/STRESS-REPORT.md"
+  "ann/STRESS-REPORT.md",
+  "ann/tests/test_anchor_determinism.c",
+  "ann/tests/test_anchor_route.c",
+  "ann/tests/test_anchor_routed.c",
+  "ann/tests/test_wang_latch.c"
  ],
  "7446": [
   "ann/include/geo_id_route_log.h",
@@ -1140,6 +1144,70 @@
  ],
  "7655": [
   "tools/gguf_lazy_serve.c"
+ ],
+ "7667": [
+  "ann/include/anchor_route.h",
+  "ann/tests/test_anchor_determinism.c",
+  "ann/tests/test_anchor_route.c"
+ ],
+ "7678": [
+  "ann/HANDOFF-2026-10-08.md"
+ ],
+ "7679": [
+  "ann/README.md",
+  "ann/WARM-PATH.md",
+  "ann/src/ann_search.c"
+ ],
+ "7680": [
+  "ann/scripts/graft_bias.py",
+  "ann/src/ann_search.c"
+ ],
+ "7681": [
+  "ann/HANDOFF-2026-10-08.md",
+  "cloud_ws/memcore/tray_window.py"
+ ],
+ "7683": [
+  "ann/HANDOFF-2026-10-08.md",
+  "ann/src/ann_search.c"
+ ],
+ "7686": [
+  ".venv/"
+ ],
+ "7687": [
+  "hermes-agent/"
+ ],
+ "7688": [
+  "bin/hermes-agent/.env.example"
+ ],
+ "7692": [
+  ".gitignore",
+  "Makefile"
+ ],
+ "7705": [
+  "chat-pool/pool_server.py"
+ ],
+ "7706": [
+  "pre_embedding_filter/session-ses_f719.md"
+ ],
+ "7707": [
+  "AGENTS.md"
+ ],
+ "7713": [
+  "magic-context-mcp/magic_context_mcp_server.py",
+  "pre_embedding_filter/session-ses_f719.md"
+ ],
+ "7716": [
+  "ocvpn/hunt.py"
+ ],
+ "7717": [
+  "obsidian-memory/obsidian_mem.py",
+  "opencode-export/chat_export_ui.py"
+ ],
+ "7718": [
+  "ocvpn/hunt.py"
+ ],
+ "7725": [
+  "ocvpn/hunt.py"
  ],
  "98": [
   "bin/hermes-agent/gateway/kanban_watchers.py",

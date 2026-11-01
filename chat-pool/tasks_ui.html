@@ -131,6 +131,7 @@
 <span class="muted" id="sync-msg"></span>
 </div>
 
+<div id="pinned"></div>
 <div id="open"></div>
 <div id="fold"></div>
 <div class="err" id="err"></div>
@@ -138,7 +139,7 @@
 
 <script>
 const LABELS = {pending:'todo', in_progress:'ทำกำลัง', done:'done', blocked:'ติดขัด',
-                cancelled:'ยกเลิก'};
+                cancelled:'ยกเลิก', pinned:'ปักหมุด'};
 const CORE = ['pending','in_progress','blocked','done','cancelled'];
 const WORK = ['pending','in_progress','blocked'];
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
@@ -264,6 +265,14 @@ function render(){
   const tops = openT.filter(t => !t.parent || !ids.has(t.parent));
   const openEl = document.getElementById('open');
   const foldEl = document.getElementById('fold');
+
+  // pinned = standing reference cards (index/gate), never work and never done.
+  // A rule nobody scrolls to is a rule nobody reads, so it rides at the top.
+  const pinT = kept.filter(t => t.status === 'pinned');
+  document.getElementById('pinned').innerHTML = pinT.length
+    ? `<div class="sec"><h2>📌 ปักหมุด · ${pinT.length}</h2>` +
+      pinT.map(t => cardHTML(t, true)).join('') + `</div>`
+    : '';
 
   openEl.innerHTML = `<div class="sec"><h2>กำลังทำ · ${openT.length}</h2>`+
     (tops.length ? tops.map(draw).join('')
