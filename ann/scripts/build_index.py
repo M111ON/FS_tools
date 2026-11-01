@@ -127,6 +127,68 @@ def main():
     print(f"dims: {dims}")
     print(f"elapsed {time.time()-t0:.1f}s")
 
+    # ── Seed generation (chain identity layer) ──────────────────
+    # Generate 64-bit seeds for each row using chain_seedgen algorithm.
+    # Space ID = model + version + dim (prevents cross-model collisions).
+    import struct as _struct
+    space_hash = 0
+    for c in "multilingual-e5-small":
+        space_hash = (space_hash * 31 + ord(c)) & 0xFFFFFFFF
+    space_hash = (space_hash ^ (1 * 0x9E3779B9)) & 0xFFFFFFFF
+    space_hash = (space_hash ^ (384 * 0x517CC1B7)) & 0xFFFFFFFF
+
+    FNV_OFF = 1469598103934665603
+    FNV_PRIME = 1099511628211
+    M64 = 0xFFFFFFFFFFFFFFFF
+
+    def _fnv1a(data_bytes):
+        h = FNV_OFF
+        for b in data_bytes:
+            h ^= b
+            h = (h * FNV_PRIME) & M64
+        return h
+
+    def _mix64(x):
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+        x = (x ^ (x >> 27)) * 0x94D049BB133111B9
+        return (x ^ (x >> 31)) & M64
+
+    seeds = []
+    for r in rows:
+        vec = struct.unpack("<%df" % (len(r["vec"]) // 4), r["vec"])
+        vec_bytes = struct.pack("<%df" % len(vec), *vec)
+        h = _fnv1a(vec_bytes)
+        h ^= (space_hash * 0x9E3779B97F4A7C15) & M64
+        h ^= (1 * 0x517CC1B727220A95) & M64
+        h = _mix64(h)
+        major_a = h & 0x17
+        if major_a > 23:
+            major_a = major_a % 24
+        cube_route = (h >> 5) & 0x3F
+        if cube_route > 47:
+            cube_route = cube_route % 48
+        inner_ori = (h >> 11) & 0xFFF
+        outer_ori = (h >> 23) & 0xFFF
+        checksum = (h >> 35) & 0x1FFF
+        seed = 0
+        seed |= (major_a & 0x1F) << 59
+        seed |= (1 & 0xFFFF) << 43
+        seed |= (cube_route & 0x3F) << 37
+        seed |= (inner_ori & 0xFFF) << 25
+        seed |= (outer_ori & 0xFFF) << 13
+        seed |= (checksum & 0x1FFF)
+        seeds.append(seed)
+
+    seed_path = a.out + ".seeds"
+    with open(seed_path, "wb") as f:
+        f.write(b"ANNSEED\x00")  # magic (8 bytes)
+        f.write(_struct.pack("<I", 1))  # version
+        f.write(_struct.pack("<Q", len(seeds)))  # n_rows
+        f.write(_struct.pack("<I", space_hash))  # space_hash
+        for seed in seeds:
+            f.write(_struct.pack("<Q", seed))
+    print(f"seeds: {len(seeds)} written to {seed_path} (space_hash=0x{space_hash:08x})")
+
     # The binary sidecar is written HERE, in the same run, and never by a
     # separate job: two writers would drift and the guard would only tell us
     # after the fact. src_jsonl is the file just swapped in, so the size,
