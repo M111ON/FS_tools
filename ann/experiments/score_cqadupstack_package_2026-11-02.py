@@ -13,9 +13,16 @@ narrow cone (mean pairwise cosine ~0.83 measured locally), all-MiniLM vectors
 are near-isotropic (~0.05). Whatever produced this package is reported rather
 than assumed.
 
-Qrels are needed and are NOT shipped in the package: fetch them once with
+Qrels are needed and are NOT shipped in the package: the twelve files live on
+the Hub at BeIR/cqadupstack-qrels (1.3 MB, identical to <sub>/qrels/test.tsv
+inside the 5.3 GB dataset zip), fetched by
   python experiments/fetch_cqadupstack_qrels.py
 or point --qrels at a directory of <sub>__test.tsv files.
+
+Result 2026-11-02: all 12 sub-forums scored, macro recall@10 0.5412,
+recall@100 0.7842, MRR@10 0.3980. The embedder is inferred as
+all-MiniLM-L6-v2 from vector statistics (mean pairwise cosine 0.047-0.125,
+near-isotropic; e5-small measures 0.826) - the package has no manifest.
 
 Run: python experiments/score_cqadupstack_package_2026-11-02.py
 Writes experiments/cqadupstack_package_check_2026-11-02.json
