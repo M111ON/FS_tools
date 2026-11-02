@@ -8,6 +8,9 @@ data/*.log
 data/memcore/
 # benchmark corpora: downloaded, never committed (BEIR/scifact/fiqa/cqadupstack zips)
 data/beir/
+# embedding packages shipped in from Colab (ids + .npy, hundreds of MB)
+data/beir_embeddings/
+data/sift/*.tar.gz
 # derived graft bias tables (rebuild with scripts/graft_bias.py)
 data/graft/
 # runtime (supervisor)
