@@ -1811,7 +1811,14 @@ def _block_of(rkey0, block=12):
     rkey = ring*144 + wedge, so a 12x12 block is a 2-D square of
     (wedge, ring) pairs. 144 *consecutive* addresses are NOT a square —
     they run diagonally across rows, which is what the heatmap made
-    obvious: L1 must be a square or "zoom out" would not frame the point."""
+    obvious: L1 must be a square or "zoom out" would not frame the point.
+
+    A line can carry no address at all (a KV/machine record has no rkey), and
+    timeline() reports it as None. Arithmetic on that gives TypeError deep in
+    the call; say what is wrong here instead, where the reader can act."""
+    if rkey0 is None:
+        raise ValueError("no address: this line has no rkey, so it has no place on the plane"
+                         " — select it by hash or seq instead")
     wedge, ring = rkey0 % 144, rkey0 // 144
     return (wedge // block) * block, (ring // block) * block
 
@@ -2682,6 +2689,12 @@ def _demo_body():
     assert _pmr["raw"] is True and _pmr["pruned"] == 0, "raw is the unpruned plane, and says so"
     assert len(_pmr["fine_cells"]) >= len(_pm["fine_cells"]), "pruning removes cells, never invents them"
     assert _coarse_map(0, raw=True)["raw"] is True, "L1 follows the same switch as L2 — the levels cannot disagree"
+    try:
+        _coarse_map(None)
+    except ValueError:
+        pass  # address-less lines (KV records) have no cell — say so, don't do arithmetic
+    else:
+        assert False, "a line with no rkey must be refused by name, not placed at wedge 0"
     assert plane_meta(raw=True)["pruned"] == 0 and plane_meta()["raw"] is False, "the who/when layer prunes with the counts it describes"
     # the kind map is a layer like the other two, so it inherits the same
     # obligation: with the prune on it must not describe a cell whose only
