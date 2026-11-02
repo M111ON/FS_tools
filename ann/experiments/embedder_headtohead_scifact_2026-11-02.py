@@ -214,6 +214,11 @@ def main():
                            "embeddinggemma-2-q8": {"doc": "title: {title} | text: {text}",
                                                    "query": "task: search result | query: {q}"}},
         "doc_char_cap": DOC_CHARS,
+        "caveats": [
+            "both servers ran with -np 1 (one slot) so a long doc cannot be split over slots; the absolute embed_sec is therefore ~5x worse than the 4-slot rate (e5 24.8 vs 132 docs/s). Only the RATIO between arms is meaningful: gemma-2 cost 3.1x e5.",
+            "the e5 arm here is q8_0 via llama-server (R@10 0.7136); the recorded 0.7699 baseline is the int8 ONNX path. Different runtimes, so do not read that 0.056 gap as a model difference.",
+            "gemma-2 trunc* arms are Matryoshka truncations of the same 768-d vectors, renormalized by score(); they cost no extra embedding work.",
+        ],
         "arms": arms,
         "router_measured": False,
     }

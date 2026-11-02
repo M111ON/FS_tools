@@ -1,0 +1,69 @@
+{
+  "dataset": "scifact (BEIR), test qrels",
+  "protocol": "recall@10 brute-force cosine, same ids/qrels as the 0.7699 baseline",
+  "baseline_recall_at_10": 0.7699,
+  "baseline_note": "multilingual-e5-small int8 ONNX, recorded in beir_scifact_baseline.json",
+  "server": "llama-server b12032, --embedding, -c 512 (max ~512 tokens per input)",
+  "prompt_formats": {
+    "e5-small-q8": {
+      "doc": "passage: {title} {text}",
+      "query": "query: {q}"
+    },
+    "embeddinggemma-2-q8": {
+      "doc": "title: {title} | text: {text}",
+      "query": "task: search result | query: {q}"
+    }
+  },
+  "doc_char_cap": 1000,
+  "arms": {
+    "e5-small-q8": {
+      "dim": 384,
+      "embed_sec": 253.4,
+      "recall_at_10": 0.7136,
+      "recall_at_100": 0.878,
+      "mrr_at_10": 0.5422,
+      "scored_queries": 300
+    },
+    "e5-small-q8-trunc256": {
+      "dim": 256,
+      "embed_sec": 0.0,
+      "recall_at_10": 0.6342,
+      "recall_at_100": 0.8237,
+      "mrr_at_10": 0.4866,
+      "scored_queries": 300
+    },
+    "embeddinggemma-2-q8": {
+      "dim": 768,
+      "embed_sec": 775.2,
+      "recall_at_10": 0.9297,
+      "recall_at_100": 0.9867,
+      "mrr_at_10": 0.8135,
+      "scored_queries": 300
+    },
+    "embeddinggemma-2-q8-trunc512": {
+      "dim": 512,
+      "embed_sec": 0.0,
+      "recall_at_10": 0.9237,
+      "recall_at_100": 0.9767,
+      "mrr_at_10": 0.8143,
+      "scored_queries": 300
+    },
+    "embeddinggemma-2-q8-trunc384": {
+      "dim": 384,
+      "embed_sec": 0.0,
+      "recall_at_10": 0.9119,
+      "recall_at_100": 0.98,
+      "mrr_at_10": 0.8032,
+      "scored_queries": 300
+    },
+    "embeddinggemma-2-q8-trunc256": {
+      "dim": 256,
+      "embed_sec": 0.0,
+      "recall_at_10": 0.9007,
+      "recall_at_100": 0.9733,
+      "mrr_at_10": 0.8017,
+      "scored_queries": 300
+    }
+  },
+  "router_measured": false
+}
