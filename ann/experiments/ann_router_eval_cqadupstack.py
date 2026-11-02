@@ -143,6 +143,9 @@ def main():
     ap.add_argument("--topk", type=int, default=TOPK)
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--k", type=int, default=56, help="anchor count for the trained routing file")
+    ap.add_argument("--set", action="append", default=[],
+                    help="ENV=value for the server, repeatable (route knobs: ANN_WALK_PRUNE, ANN_WALK_FLOOR, ...)")
+    ap.add_argument("--tag", default="", help="suffix for the receipt file, for sweeps")
     a = ap.parse_args()
 
     idx = to_jsonl(a.sub)
@@ -160,6 +163,11 @@ def main():
         "ANN_ROUTE_LOG": str(Work / "lz_route.log"),
         "ANN_ROSTER_PATH": str(Work / "ann_roster.bin"),
     })
+    for kv in a.set:
+        k, _, v = kv.partition("=")
+        if not k or not _:
+            raise SystemExit("--set needs ENV=value, got %r" % kv)
+        env[k] = v
     log = open(Work / "stdout.log", "w", encoding="utf-8")
     proc = subprocess.Popen([str(EXE), "--serve", str(a.port)], env=env, cwd=str(ROOT),
                             stdout=log, stderr=subprocess.STDOUT)
@@ -217,9 +225,10 @@ def main():
             "route_modes": modes,
             "index_path": str(idx),
             "note": "router fed caller-supplied query vectors; the live e5 embedder was never asked to embed these (different epoch)",
+            "env_overrides": a.set,
         }
         print(json.dumps(out, indent=2))
-        rec = WORK / ("receipt_%s.json" % a.sub)
+        rec = WORK / ("receipt_%s%s.json" % (a.sub, ("__" + a.tag) if a.tag else ""))
         rec.write_text(json.dumps(out, indent=2), encoding="utf-8")
         print("receipt:", rec)
     finally:
