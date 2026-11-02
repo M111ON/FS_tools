@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LetterCube Chain</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--bd:#ccc;--ok:#1a7f37;--bad:#d1242f;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#16181d;--fg:#e8e8e8;--mut:#9aa;--bd:#444;--ok:#3fb950;--bad:#ff6b6b}}
+:root[data-theme="dark"]{--bg:#16181d;--fg:#e8e8e8;--mut:#9aa;--bd:#444;--ok:#3fb950;--bad:#ff6b6b}
+html,body{height:auto;margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+body{padding:10px;max-width:640px;margin:auto}
+canvas{width:100%;aspect-ratio:1;touch-action:none;cursor:grab;border:1px solid var(--bd);border-radius:8px}
+.r{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0}
+button,select,input[type=number]{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font:inherit}
+input[type=number]{width:56px}
+.s{font-weight:600;font-variant-numeric:tabular-nums}small{color:var(--mut)}
+</style></head><body>
+<canvas id="c" width="1000" height="1000"></canvas>
+<div class="s" id="st"></div>
+<div class="r"><select id="md"><option value="row">โหมดบังคับตรง (ต่อแถว)</option><option value="chain">โหมดต่อก้อนก่อนหน้า (ลูปอาจไม่ตรง)</option></select></div>
+<div class="r" id="bt"></div>
+<div class="r"><button id="sh">สุ่ม shuffle ก้อนล่าสุด</button><button id="un">ถอย</button><button id="rs">รีเซ็ต</button>
+<input id="gn" type="number" min="1" max="16" value="3"><button id="fl">เติมกริด N×N×N</button></div>
+<div class="r"><small>แยกชั้น</small><input id="ex" type="range" min="0" max="0.6" step="0.02" value="0.2"><label><input id="shl" type="checkbox" checked> กรอบ 1×1×1 (มี letter)</label></div>
+<small>สไลด์เฉพาะกรอบ · ทุกสไลด์ shuffle ใหม่ · เขียว = คู่ตรง, แดง = ไม่ตรง · กริดใหญ่ (&gt;40 ก้อน) วาดเฉพาะหน้าผิวนอก · ลากเพื่อหมุนมุมมอง</small>
+<script>
+const $=id=>document.getElementById(id),cv=$("c"),g=cv.getContext("2d");
+const mul=(A,B)=>A.map(r=>[0,1,2].map(j=>r[0]*B[0][j]+r[1]*B[1][j]+r[2]*B[2][j]));
+const ap=(M,v)=>M.map(r=>r[0]*v[0]+r[1]*v[1]+r[2]*v[2]);
+const rot=(k,a)=>{const c=Math.cos(a),s=Math.sin(a),i=(k+1)%3,j=(k+2)%3,M=[[1,0,0],[0,1,0],[0,0,1]];M[i][i]=c;M[i][j]=-s;M[j][i]=s;M[j][j]=c;return M};
+const dv=f=>{const d=[0,0,0];d[f>>1]=f&1?1:-1;return d};
+// โครงหน้า 48 อัน (8 mini x 6) ไม่ขึ้นกับ letter
+const P=[];for(const x of[-1,1])for(const y of[-1,1])for(const z of[-1,1])P.push([x,y,z]);
+const mi=p=>P.findIndex(q=>q.every((x,i)=>x===p[i]));
+const T=[];P.forEach((p,m)=>{for(let f=0;f<6;f++)T.push({m,f})});
+let li=0;
+// 12 เส้น (3 แกน x 4): pid 0-11 = inner (กลางเส้น), pid 12-23 = F-f (ปลายเส้น) ; up = ฝั่งลบ
+for(let k=0;k<3;k++)for(const a of[-1,1])for(const b of[-1,1]){
+ const pn=[0,0,0],pp=[0,0,0];pn[k]=-1;pp[k]=1;pn[(k+1)%3]=pp[(k+1)%3]=a;pn[(k+2)%3]=pp[(k+2)%3]=b;
+ const n=mi(pn),q=mi(pp);
+ Object.assign(T[n*6+2*k+1],{pid:li,up:1,inn:1});Object.assign(T[q*6+2*k],{pid:li,up:0,inn:1});
+ Object.assign(T[n*6+2*k],{pid:12+li,up:1,inn:0});Object.assign(T[q*6+2*k+1],{pid:12+li,up:0,inn:0});
+ li++;
+}
+const E={};T.forEach((t,i)=>{if(!t.inn)(E[t.pid]??={})[t.up?"n":"p"]=i});
+const LET=[..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"],GR=[..."ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ"];
+const shuf=a=>{for(let i=a.length-1;i>0;i--){const j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]]}return a};
+let mode="row",cubes,vx=-.5,vy=.6,dirty=1;
+// ก้อน = {pos, L[24] letter ของ mini, S[3] letter กรอบ (ต่อแกน: ฝั่ง − ตัวใหญ่, ฝั่ง + ตัวเล็ก)}
+const ch=(c,t)=>T[t].up?c.L[T[t].pid]:c.L[T[t].pid].toLowerCase();
+const chS=(c,f)=>f&1?c.S[f>>1].toLowerCase():c.S[f>>1];
+// โหมดแถว: ทุกก้อนในแถวตรงเดียวกัน (แกน k + พิกัดอีก 2 แกน) ใช้ชุด F-f และ letter กรอบชุดเดียวกัน → ข้อต่อตรงเสมอ
+// แต่ละแกนสุ่มจากกลุ่มของตัวเอง (กันตัวซ้ำข้ามแกนในก้อนเดียว)
+const rows=new Map(),rk=(k,p)=>k+":"+p[(k+1)%3]+","+p[(k+2)%3];
+const rowOf=(k,p)=>{const key=rk(k,p);if(!rows.has(key))rows.set(key,{m:shuf(LET.slice(8*k,8*k+8)).slice(0,4),s:shuf(GR.slice(8*k,8*k+8))[0]});return rows.get(key)};
+const dropRows=c=>{for(let k=0;k<3;k++)if(!cubes.some(o=>o!==c&&rk(k,o.pos)===rk(k,c.pos)))rows.delete(rk(k,c.pos))};
+// prev,k ใช้เฉพาะโหมดต่อก้อนก่อนหน้า: สืบทอดเฉพาะแกน k จากก้อนก่อนหน้า ที่เหลือสุ่มใหม่
+function gen(pos,prev,k){
+ const L=[],S=[],used=new Set();
+ if(mode==="row")for(let a=0;a<3;a++){const r=rowOf(a,pos);r.m.forEach((c,j)=>{L[12+4*a+j]=c;used.add(c)});S[a]=r.s}
+ else if(prev){for(let j=0;j<4;j++){L[12+4*k+j]=prev.L[12+4*k+j];used.add(L[12+4*k+j])}S[k]=prev.S[k]}
+ const pool=shuf(LET.filter(c=>!used.has(c))),gp=shuf(GR.slice());
+ for(let p=0;p<24;p++)L[p]??=pool.pop();
+ for(let a=0;a<3;a++)S[a]??=gp.pop();
+ return{pos,L,S};
+}
+const axis=(a,b)=>a.pos.findIndex((x,i)=>x!==b.pos[i]);
+const reset=()=>{rows.clear();cubes=[gen([0,0,0])];dirty=1};
+const has=p=>cubes.some(c=>c.pos.every((x,i)=>x===p[i]));
+function slide(k,s){
+ const last=cubes.at(-1),np=last.pos.slice();np[k]+=s;
+ if(has(np))return;cubes.push(gen(np,last,k));dirty=1;
+}
+function reshuffle(){
+ const c=cubes.at(-1),pv=cubes.at(-2);dropRows(c);
+ cubes[cubes.length-1]=pv?gen(c.pos,pv,axis(c,pv)):gen(c.pos);dirty=1;
+}
+// เติมกริด n^3 ด้วยเส้นทางงู (ก้อนที่ต่อกันอยู่ติดกันทุกคู่)
+function fill(n){
+ reset();let dx=1;
+ for(let z=0;z<n;z++)for(let yi=0;yi<n;yi++){const y=z%2?n-1-yi:yi;
+  for(let xi=0;xi<n;xi++){const p=[dx>0?xi:n-1-xi,y,z];if(!(p[0]||p[1]||p[2]))continue;
+   const pv=cubes.at(-1);cubes.push(gen(p,pv,axis({pos:p},pv)))}
+  dx=-dx}
+ dirty=1;
+}
+// ข้อต่อ: ปลาย + ของก้อนล่าง (ตัวเล็ก) แตะปลาย − ของก้อนบน (ตัวใหญ่) ต้องเป็น letter เดียวกัน ทั้ง mini 4 คู่ + กรอบ 1 คู่
+function links(){
+ const idx=new Map(cubes.map((c,i)=>[c.pos.join(),i])),M=new Map();let ok=0,tot=0;
+ cubes.forEach((A,ia)=>{for(let k=0;k<3;k++){
+  const q=A.pos.slice();q[k]++;const ib=idx.get(q.join());if(ib===undefined)continue;const B=cubes[ib];
+  const mk=(ta,tb,ca,cb)=>{const o=ca!==cb&&ca.toLowerCase()===cb.toLowerCase();M.set(ia*64+ta,o);M.set(ib*64+tb,o);tot++;if(o)ok++};
+  for(let j=0;j<4;j++){const e=E[12+4*k+j];mk(e.p,e.n,ch(A,e.p),ch(B,e.n))}
+  mk(48+2*k+1,48+2*k,chS(A,2*k+1),chS(B,2*k));
+ }});
+ return{M,ok,tot};
+}
+function draw(){
+ requestAnimationFrame(draw);if(!dirty)return;dirty=0;
+ const V=mul(rot(0,vx),rot(1,vy)),gp=+$("ex").value,Sp=2*(1+gp)+.3,h=.46,sh=1+gp+.04,showS=$("shl").checked,lod=cubes.length>40;
+ const ps=cubes.map(c=>c.pos),mn=[0,1,2].map(i=>Math.min(...ps.map(p=>p[i]))),mx=[0,1,2].map(i=>Math.max(...ps.map(p=>p[i])));
+ const cen=mn.map((x,i)=>(x+mx[i])/2*Sp),Rw=Math.max(...mn.map((x,i)=>(mx[i]-x)*Sp/2))+sh+.2,S=300/Math.max(Rw,1.6),D=Math.max(9,Rw*5);
+ const pr=v=>{const k=S*D/(D-v[2]);return[500+v[0]*k,500-v[1]*k,k]};
+ g.clearRect(0,0,1000,1000);
+ const L=links(),items=[],dark=matchMedia("(prefers-color-scheme:dark)").matches;
+ const quad=(cw,f,hh,o)=>{const k=f>>1,u=(k+1)%3,w=(k+2)%3,d=dv(f),q=[];
+  for(const[a,b]of[[-1,-1],[1,-1],[1,1],[-1,1]]){const l=[0,0,0];l[k]=d[k]*hh;l[u]=a*hh;l[w]=b*hh;const v=ap(V,l);q.push(pr([cw[0]+v[0],cw[1]+v[1],cw[2]+v[2]]))}
+  const n=ap(V,d);return{q,cc:pr([cw[0]+n[0]*hh,cw[1]+n[1]*hh,cw[2]+n[2]*hh]),z:cw[2]+n[2]*hh,vis:n[2]>0}};
+ cubes.forEach((c,ci)=>{
+  const o=c.pos.map((x,i)=>x*Sp-cen[i]),co=ap(V,o);
+  if(showS)for(let f=0;f<6;f++){const t=48+f,lk=L.M.get(ci*64+t);if(lod&&lk!==undefined)continue;
+   const r=quad(co,f,sh);if(lod&&!r.vis)continue;items.push({s:1,t,c,ci,lk,...r})}
+  P.forEach((p,m)=>{
+   const cw=ap(V,p.map((x,i)=>o[i]+x*(.5+gp)));
+   for(let f=0;f<6;f++){const t=m*6+f,lk=L.M.get(ci*64+t);
+    if(lod&&(T[t].inn||lk!==undefined))continue;
+    const r=quad(cw,f,h);if(lod&&!r.vis)continue;items.push({s:0,t,c,ci,lk,...r});
+   }});
+ });
+ items.sort((a,b)=>a.z-b.z);
+ for(const it of items){
+  g.beginPath();it.q.forEach((p,i)=>i?g.lineTo(p[0],p[1]):g.moveTo(p[0],p[1]));g.closePath();
+  const lk=it.lk,sc=lk===undefined?null:lk?"#1a7f37":"#d1242f";
+  if(it.s){
+   g.globalAlpha=1;g.fillStyle="rgba(59,130,246,.10)";g.fill();g.lineWidth=sc?6:3;g.strokeStyle=sc||"rgba(59,130,246,.8)";g.stroke();
+   if(it.vis){g.fillStyle="rgba(59,130,246,.85)";g.font=`bold ${it.cc[2]*.8}px system-ui`;g.textAlign="center";g.textBaseline="middle";g.fillText(chS(it.c,it.t-48),it.cc[0],it.cc[1])}
+   continue}
+  const T0=T[it.t],c=ch(it.c,it.t),hue=LET.indexOf(c.toUpperCase())*13.8;
+  g.globalAlpha=it.vis?.92:.5;g.fillStyle=`hsl(${hue},${T0.inn?70:30}%,${T0.up?(dark?55:68):(dark?36:48)}%)`;g.fill();
+  g.globalAlpha=1;g.lineWidth=sc?6:2;g.strokeStyle=sc||"rgba(0,0,0,.35)";g.stroke();
+  const fs=it.cc[2]*.34;
+  if(it.vis&&fs>7){g.fillStyle="#111";g.font=`bold ${fs}px system-ui`;g.textAlign="center";g.textBaseline="middle";g.fillText(c,it.cc[0],it.cc[1])}
+ }
+ $("st").textContent=`ก้อน ${cubes.length} · ข้อต่อตรง ${L.ok}/${L.tot}`;
+ $("st").style.color=L.ok===L.tot?"var(--ok)":"var(--bad)";
+}
+[[0,1,"+X"],[0,-1,"−X"],[1,1,"+Y"],[1,-1,"−Y"],[2,1,"+Z"],[2,-1,"−Z"]].forEach(([k,s,n])=>{
+ const b=document.createElement("button");b.textContent="สไลด์ "+n;b.onclick=()=>slide(k,s);$("bt").append(b)});
+$("sh").onclick=reshuffle;$("un").onclick=()=>{if(cubes.length>1){dropRows(cubes.at(-1));cubes.pop();dirty=1}};$("rs").onclick=reset;
+$("fl").onclick=()=>fill(Math.min(16,Math.max(1,+$("gn").value|0)));
+$("md").onchange=e=>{mode=e.target.value;reset()};
+$("ex").oninput=$("shl").onchange=()=>dirty=1;
+let drag=null;
+cv.onpointerdown=e=>{drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId)};
+cv.onpointerup=()=>drag=null;
+cv.onpointermove=e=>{if(!drag)return;vy+=(e.clientX-drag[0])*.01;vx+=(e.clientY-drag[1])*.01;drag=[e.clientX,e.clientY];dirty=1};
+reset();requestAnimationFrame(draw);
+</script></body></html>
