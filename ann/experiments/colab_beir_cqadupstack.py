@@ -18,6 +18,7 @@ ann/experiments/beir_cqadupstack_gpu_2026-11-02.json on the machine.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ import zipfile
 URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/cqadupstack.zip"
 ZIP = "/content/cqadupstack.zip"
 ROOT = "/content/cqadupstack"
+PKG_DIR = "/content/beir_embeddings"
 MODEL = "all-MiniLM-L6-v2"
 TOPK = 10
 MAX_CHARS = 2000
@@ -69,6 +71,20 @@ def load_qrels(path):
     return qrels
 
 
+def dump_package(sub, cids, qids, C, Q, qrels_path):
+    """Same layout the local box reads: <sub>/{corpus,query}_ids.json + .npy,
+    plus the qrels, so the package scores on its own with no external files."""
+    import numpy as np
+    d = os.path.join(PKG_DIR, sub)
+    os.makedirs(d, exist_ok=True)
+    json.dump(cids, open(os.path.join(d, "corpus_ids.json"), "w", encoding="utf-8"))
+    json.dump(qids, open(os.path.join(d, "query_ids.json"), "w", encoding="utf-8"))
+    np.save(os.path.join(d, "corpus_embeddings.npy"), C)
+    np.save(os.path.join(d, "query_embeddings.npy"), Q)
+    if os.path.exists(qrels_path):
+        shutil.copyfile(qrels_path, os.path.join(d, "test.tsv"))
+
+
 def main():
     try:
         import sentence_transformers  # noqa: F401
@@ -80,7 +96,8 @@ def main():
 
     subs = ensure_data()
     model = SentenceTransformer(MODEL, device="cuda")
-    print("subforums:", subs, "| model:", MODEL, flush=True)
+    dim = int(model.get_sentence_embedding_dimension())
+    print("subforums:", subs, "| model:", MODEL, "| dim:", dim, flush=True)
 
     rows = []
     for sub in subs:
@@ -109,7 +126,9 @@ def main():
                "embed_sec": round(dt, 1)}
         rows.append(row)
         print(json.dumps(row), flush=True)
+        dump_package(sub, cid, qid, C, Q, os.path.join(base, "qrels", "test.tsv"))
 
+    macro = round(sum(r["recall_at_10"] for r in rows) / len(rows), 4)
     receipt = {
         "dataset": "cqadupstack (BEIR), 12 sub-forums",
         "embedder": MODEL + " (Colab GPU)",
@@ -117,9 +136,29 @@ def main():
         "metric": "recall@10 brute-force cosine (not BEIR nDCG@10)",
         "protocol": "one number per sub-forum; macro average is a summary only",
         "subforums": rows,
-        "macro_recall_at_10": round(sum(r["recall_at_10"] for r in rows) / len(rows), 4),
+        "macro_recall_at_10": macro,
         "router_measured": False,
     }
+    # The embedding package is what the local box scores and re-uses; without a
+    # manifest nobody can tell which model produced the .npy files, so this run
+    # writes one (the earlier package had none and the embedder had to be
+    # guessed from vector statistics).
+    with open(os.path.join(PKG_DIR, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "produced_by": "colab_beir_cqadupstack.py",
+            "embedder": MODEL,
+            "dim": dim,
+            "doc_char_cap": MAX_CHARS,
+            "pooling": "sentence-transformers default (mean), normalize_embeddings=True",
+            "prompt_format": "doc = title + ' ' + text (no prefix); query = text (no prefix)",
+            "corpus_rows": sum(r["corpus"] for r in rows),
+            "subforums": [r["sub"] for r in rows],
+            "qrels": "copied in-package as <sub>/test.tsv; identical to BeIR/cqadupstack-qrels on the Hub",
+            "macro_recall_at_10": macro,
+        }, f, indent=2)
+
+    sha = shutil.make_archive("/content/beir_embeddings_package", "zip", PKG_DIR)
+    print("\ndownload:", sha)
     path = "/content/beir_cqadupstack_gpu_2026-11-02.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(receipt, f, indent=2)
