@@ -10,6 +10,9 @@ data/memcore/
 data/beir/
 # embedding packages shipped in from Colab (ids + .npy, hundreds of MB)
 data/beir_embeddings/
+# scratch index/anchors built for router evaluation (the receipts are kept)
+data/beir_embeddings_eval/*.jsonl
+data/beir_embeddings_eval/*/
 data/sift/*.tar.gz
 # derived graft bias tables (rebuild with scripts/graft_bias.py)
 data/graft/

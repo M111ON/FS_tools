@@ -1,0 +1,17 @@
+{
+  "sub": "mathematica",
+  "corpus": 16705,
+  "queries_scored": 804,
+  "topk": 10,
+  "router_recall_at_k": 0.4183,
+  "brute_recall_at_k": 0.4248,
+  "router_equals_brute": 0,
+  "items_scored_frac_mean": 0.4079,
+  "items_scored_frac_max": 0.5196,
+  "fallback_frac": 0.0,
+  "route_modes": {
+    "anchor": 804
+  },
+  "index_path": "I:\\tools\\ann\\data\\beir_embeddings_eval\\mathematica.jsonl",
+  "note": "router fed caller-supplied query vectors; the live e5 embedder was never asked to embed these (different epoch)"
+}
