@@ -1,0 +1,15 @@
+{
+  "dataset": "siftsmall",
+  "base_rows": 10000,
+  "index_rows": 10000,
+  "dim": [
+    128,
+    128
+  ],
+  "bytes_bit_identical": true,
+  "queries": 100,
+  "topk": 10,
+  "recall_at_k": 0.9620000000000004,
+  "index_path": "I:\\tools\\ann\\data\\sift\\siftsmall_ann_index.jsonl",
+  "router_measured": false
+}
