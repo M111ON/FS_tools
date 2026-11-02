@@ -28,6 +28,7 @@ Run: python experiments/score_cqadupstack_package_2026-11-02.py
 Writes experiments/cqadupstack_package_check_2026-11-02.json
 """
 import argparse
+import glob
 import json
 import os
 from pathlib import Path
@@ -89,10 +90,16 @@ def main():
         row["pairwise_cos_mean"] = round(float(off.mean()), 4)
         row["mean_vec_norm"] = round(float(np.linalg.norm(C.astype(np.float64).mean(0))), 4)
 
-        qpath = os.path.join(a.qrels, "%s__test.tsv" % sub)
-        if os.path.exists(qpath):
+        qpath = None
+        for cand in sorted(glob.glob(os.path.join(base, "test*.tsv"))):
+            qpath = cand           # shipped inside the package (may be "test (1).tsv")
+            break
+        if qpath is None:
+            ext = os.path.join(a.qrels, "%s__test.tsv" % sub)
+            qpath = ext if os.path.exists(ext) else None
+        if qpath:
             qrels = load_qrels(qpath)
-            pos = {d: i for i, d in enumerate(cids)}
+            row["qrels_file"] = os.path.basename(qpath)
             Cn = C / np.maximum(np.linalg.norm(C, axis=1, keepdims=True), 1e-9)
             Qn = Q / np.maximum(np.linalg.norm(Q, axis=1, keepdims=True), 1e-9)
             r10 = r100 = mrr = 0.0
