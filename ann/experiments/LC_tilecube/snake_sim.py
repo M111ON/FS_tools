@@ -133,7 +133,8 @@ class Snake:
         self.mode = state['mode']
         self.positions = [tuple(p) for p in state['positions']]
         self.visited = set(tuple(p) for p in state['visited'])
-        self.current_domain = state['current_domain']
+        cd_ = state['current_domain']
+        self.current_domain = tuple(cd_) if isinstance(cd_, (list, tuple)) else cd_
         self.growth_count = state['growth_count']
         self.directions = state['directions']
         self.boundary_blocks = state.get('boundary_blocks', 0)

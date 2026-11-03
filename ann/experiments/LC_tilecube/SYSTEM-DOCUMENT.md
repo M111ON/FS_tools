@@ -508,7 +508,48 @@ Letter restoration dominates (69% of total). Optimization target for C implement
 
 ---
 
-## 10. Glossary
+## 10. Data Layer (added 2026-11-03)
+
+### 10.1 Single Ingress & Branch Fingerprinting (`ingest_fingerprint.py`)
+
+Pipeline:
+```
+SINGLE INGRESS (384D embedding)
+  -> INGESTION GATEWAY   (validate . normalize . identify)
+  -> BRANCH TRAVERSAL    (routing rules, deterministic + auditable)
+  -> FINGERPRINT GEN     (per-path signature)
+  -> APPEND / PERSIST    (append to existing branches + relation log)
+```
+
+- Gateway: shape (384,), finite, non-zero; L2-normalize; identify = sha256(normalized bytes)[:16].
+- Routing: branch[s] = sha256(item_id:s) mod N; direction[s] = sha256(item_id:s:dir) mod 6. Auditable + deterministic.
+- Fingerprint: per-step `B{branch}:P{pos}:S{step}:{letters}` (letters via compact_identity string encoding), plus path_fp = sha256("|".join(step_fps))[:16], item_fp = "{item_id}:{path_fp}".
+- Append: grows existing Snake branches via Snake.grow; never rebuilds.
+- Relation store: append-only JSONL (item_id, branches, positions, step_fingerprints, path_fp, item_fp, ok_steps/total_steps, fruit_dims, fruit_ids).
+- Persistence: branches.json + meta.json + relations.jsonl; reload restores identical state; append-after-reload works.
+
+Tests (8/8 PASS): single ingress, branch traversal, fingerprints, relation storage, append-no-rebuild, persistence round-trip, determinism, junctions preserved.
+
+### 10.2 Per-Fruit Embedding Dimension (`fruit_dim.py`)
+
+Geometry layer (v1.0 frozen) is UNTOUCHED. Data Layer sits beside it.
+
+- `FruitConfig`: fruit_id, embedding_dim, schema_id, projection_id, metric_id, common_dim.
+- `DimensionAdapter`: explicit projections (truncate, pad_zero, repeat, random_ortho, pca_like). No random drop. Up-projection (384->768) does NOT create new information (pad_zero -> zeros; repeat -> tiling).
+- `CommonSpace`: maps each Fruit's vector into a shared D_common space for cross-Fruit comparison (random_ortho fruit_dim -> common_dim). Self-distance = 0.
+- `FruitDataStore`: per-fruit storage; persistence to fruit_data.json.
+
+Rules honored:
+1. embedding_dim is a property of the Fruit, not the cluster.
+2. Dimension Adapter is explicit (no random drop; declared projection_id).
+3. Cross-Fruit comparison requires CommonSpace (raw compare across different dims raises ValueError).
+4. Up-projection does not create new information.
+
+Tests (8/8 PASS): per-fruit dim coexist, adapter truncate/pad, random-ortho det, up-proj no new info, common space cross-fruit, raw compare invalid, persistence, geometry untouched.
+
+Integration (`test_ingest_dim.py` PASS): 4 branches with dims [384,128,768,64]; 6 items ingested; relation records carry fruit_dims; fruit store persists per-fruit dims; reload preserves; junctions preserved (4/4,4/4,4/4,6/6); common-space distance finite.
+
+## 11. Glossary
 
 | Term | Definition |
 |---|---|
@@ -557,14 +598,18 @@ I:\tools\ann\experiments\LC_tilecube\
 ├── stress_test.py                  # 6 structural stress tests
 ├── longrun_stress.py               # Long-run stress (randomized, branching, grape)
 └── lettercube_rhombi.h             # C header (rhombi pattern)
+├── ingest_fingerprint.py           # Single ingress + branch fingerprinting (Data Layer on top of v1.0)
+├── test_ingest_fingerprint.py      # 8 tests: ingress, traversal, fingerprints, relations, append, persist, determinism, junctions
+├── fruit_dim.py                    # Per-Fruit embedding dimension + adapter + common space (Data Layer)
+├── test_fruit_dim.py               # 8 tests: per-fruit dim, adapter, up-proj, common space, persistence, geometry untouched
+└── test_ingest_dim.py              # Integration: ingestion with per-branch dims + common space
 ```
 
 ---
 
-*Document generated: 2026-11-03*
-*Baseline version: 1.0 (Frozen)*
-*Total commits: 14*
-*Total test files: 15*
-*Total test cases: 50+*
-*All tests passing: Yes*
+*Document generated: 2026-11-03 (updated)*
+*Baseline version: 1.0 (Frozen) — geometry layer untouched*
+*Data Layer v1: ingest_fingerprint.py + fruit_dim.py (per-Fruit embedding dim)*
+*Total test files: 18 (+3 new)*
+*All tests passing: Yes (ingest 8/8, fruit_dim 8/8, ingest_dim integration PASS)*
 "

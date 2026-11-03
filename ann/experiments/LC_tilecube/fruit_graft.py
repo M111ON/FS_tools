@@ -186,6 +186,18 @@ class GraftEngine:
                 shift = (candidate[0]-src_attach[0], candidate[1]-src_attach[1], candidate[2]-src_attach[2])
                 shifted = [(p[0]+shift[0], p[1]+shift[1], p[2]+shift[2]) for p in right]
                 if all(p not in snake_dst.visited for p in shifted):
+                    # also check connection junction frame match
+                    diff_axis = None
+                    for k in range(3):
+                        if base[k] != candidate[k]:
+                            diff_axis = k
+                            break
+                    if diff_axis is not None and right_letters.get(right[0]) is not None:
+                        la = snake_dst.letters.get(base)
+                        lb = right_letters[right[0]]
+                        if la is not None and lb is not None and diff_axis < len(la) and diff_axis < len(lb):
+                            if la[diff_axis][1] != lb[diff_axis][1]:
+                                continue  # frame mismatch, try next direction
                     placed = True
                     break
             if not placed:
