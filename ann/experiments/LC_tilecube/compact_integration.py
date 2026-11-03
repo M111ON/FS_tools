@@ -19,6 +19,7 @@ def compact_state_dict(snake):
 
 def compact_restore(snake, state):
     """Restore snake from compact (string-encoded) state."""
+    snake.domain_size = state.get('domain_size', snake.domain_size)
     snake.positions = [tuple(p) for p in state['positions']]
     snake.visited = set(snake.positions)
     snake.current_domain = state['current_domain']

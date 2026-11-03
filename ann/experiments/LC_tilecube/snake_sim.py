@@ -117,6 +117,7 @@ class Snake:
         return {
             'seed': self.seed,
             'mode': self.mode,
+            'domain_size': self.domain_size,
             'positions': self.positions,
             'domains': [],
             'letters': letters_ser,
