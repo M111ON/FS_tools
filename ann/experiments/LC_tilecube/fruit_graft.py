@@ -199,16 +199,23 @@ class GraftEngine:
         for p in shifted:
             if p in snake_src.visited and p not in right:
                 return GraftResult(False, "collision_with_src")
+        # connection junction check: dst's last original + first grafted must match
+        if snake_dst.positions and shifted:
+            last_orig = snake_dst.positions[-1] if len(snake_dst.positions) > 0 else None
+            # find last original position (before graft)
+            # We need to check before appending; use the position that was last before graft
+            pass  # will check after placement
         # execute graft
         snake_src.positions = left
         snake_src.visited = set(left)
         snake_src.letters = {p: snake_src.letters[p] for p in left if p in snake_src.letters}
         snake_src.growth_count = len(left)
+        # remember dst's last position before graft for connection check
+        dst_last_before = snake_dst.positions[-1] if snake_dst.positions else None
         for i, p in enumerate(shifted):
             orig = right[i]
             snake_dst.positions.append(p)
             snake_dst.visited.add(p)
-            # preserve original letters from saved right_letters
             if right_letters.get(orig) is not None:
                 snake_dst.letters[p] = right_letters[orig]
             else:
@@ -217,6 +224,36 @@ class GraftEngine:
                 frame = r.choice("abcdefgh")
                 snake_dst.letters[p] = [(tuple(letters), frame)] * 3
             snake_dst.growth_count += 1
+        # verify connection junction
+        if dst_last_before is not None and shifted:
+            conn_ok = False
+            for axis in range(3):
+                if dst_last_before[axis] != shifted[0][axis]:
+                    # this is the diff axis
+                    if (dst_last_before in snake_dst.letters and shifted[0] in snake_dst.letters):
+                        if (dst_last_before[axis] if False else True):
+                            la = snake_dst.letters[dst_last_before]
+                            lb = snake_dst.letters[shifted[0]]
+                            if axis < len(la) and axis < len(lb):
+                                if la[axis][1] == lb[axis][1]:
+                                    conn_ok = True
+                    break
+            if not conn_ok:
+                # rollback
+                # remove grafted positions
+                for p in shifted:
+                    snake_dst.positions.pop()
+                    snake_dst.visited.discard(p)
+                    snake_dst.letters.pop(p, None)
+                    snake_dst.growth_count -= 1
+                # restore src
+                snake_src.positions = left + right
+                snake_src.visited = set(left) | set(right)
+                for p in right:
+                    if right_letters.get(p) is not None:
+                        snake_src.letters[p] = right_letters[p]
+                snake_src.growth_count = len(left) + len(right)
+                return GraftResult(False, "connection_junction_mismatch", [])
         return GraftResult(True, "ok", shifted)
 
     @staticmethod

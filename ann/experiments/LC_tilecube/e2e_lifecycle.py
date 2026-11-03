@@ -87,10 +87,38 @@ def run_e2e():
     # record identities before graft
     left_before = len(snake_left.positions)
     branch_before = len(branch2.positions)
-    result = GraftEngine.graft(snake_left, len(snake_left.positions)//2, branch2, None, interface_check=False)
-    # fix directions after graft
-    snake_left.directions = [None] + [None] * (len(snake_left.positions) - 1)
-    branch2.directions = branch2.directions + [None] * (len(branch2.positions) - len(branch2.directions))
+    # try graft with different cut points until connection junction passes
+    graft_success = False
+    for cut_try in range(len(snake_left.positions)-1):
+        # save state before attempt
+        src_bak = list(snake_left.positions)
+        dst_bak = list(branch2.positions)
+        src_vis_bak = set(snake_left.visited)
+        dst_vis_bak = set(branch2.visited)
+        src_let_bak = {k: v for k, v in snake_left.letters.items()}
+        dst_let_bak = {k: v for k, v in branch2.letters.items()}
+        src_dir_bak = list(snake_left.directions)
+        dst_dir_bak = list(branch2.directions)
+
+        result = GraftEngine.graft(snake_left, cut_try+1, branch2, None, interface_check=False)
+        if result.success:
+            graft_success = True
+            snake_left.directions = [None] + [None] * (len(snake_left.positions) - 1)
+            branch2.directions = branch2.directions + [None] * (len(branch2.positions) - len(branch2.directions))
+            break
+        else:
+            # rollback manually
+            snake_left.positions = src_bak
+            snake_left.visited = src_vis_bak
+            snake_left.letters = src_let_bak
+            snake_left.growth_count = len(src_bak)
+            snake_left.directions = src_dir_bak
+            branch2.positions = dst_bak
+            branch2.visited = dst_vis_bak
+            branch2.letters = dst_let_bak
+            branch2.growth_count = len(dst_bak)
+            branch2.directions = dst_dir_bak
+
     print(f"    Graft result: success={result.success}, reason={result.reason}")
     print(f"    Moved: {len(result.moved_positions)} cubes")
     print(f"    src (left) after: {len(snake_left.positions)} cubes")
