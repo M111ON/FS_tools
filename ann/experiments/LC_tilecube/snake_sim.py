@@ -153,7 +153,7 @@ class Snake:
                 # in chain mode, rb should equal ra (inherited)
                 # in row mode, row_key should be same
                 if self.mode == 'chain':
-                    if ra == rb:
+                    if ra[1] == rb[1]:  # frame match (junction key), not full tuple
                         ok += 1
                 else:
                     rka = row_key(diff_axis, a)
