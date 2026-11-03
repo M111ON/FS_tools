@@ -163,12 +163,24 @@ class Snake:
         return ok, tot
 
     def state_dict(self):
+        # serialize letters as JSON-friendly
+        letters_ser = {}
+        for pos, val in self.letters.items():
+            key = ",".join(str(x) for x in pos)
+            # val is list of (tuple, frame) per axis
+            ser = []
+            for rv in val:
+                if isinstance(rv, tuple) and len(rv) == 2:
+                    ser.append([list(rv[0]), rv[1]])
+                else:
+                    ser.append(str(rv))
+            letters_ser[key] = ser
         return {
             'seed': self.seed,
             'mode': self.mode,
             'positions': self.positions,
             'domains': self.domains,
-            'letters': {},
+            'letters': letters_ser,
             'visited': [list(p) for p in self.visited],
             'current_domain': self.current_domain,
             'growth_count': self.growth_count,
@@ -189,17 +201,30 @@ class Snake:
         # replay growth to regenerate letters with inheritance
         self.letters = {}
         self.rows = {}
-        # first cube
-        if self.positions:
-            self._gen_cube(self.positions[0])
-        for i in range(1, len(self.positions)):
-            prev = self.positions[i-1]
-            pos = self.positions[i]
-            d = self.directions[i]
-            if d is not None:
-                self._gen_cube(pos, prev, d)
-            else:
-                self._gen_cube(pos)
+        # restore letters from state if available
+        if 'letters' in state and state['letters']:
+            for key, val in state['letters'].items():
+                parts = key.split(",")
+                pos = tuple(int(x) for x in parts)
+                restored = []
+                for rv in val:
+                    if isinstance(rv, list) and len(rv) == 2:
+                        restored.append((tuple(rv[0]), rv[1]))
+                    else:
+                        restored.append(rv)
+                self.letters[pos] = restored
+        else:
+            # fallback: regenerate
+            if self.positions:
+                self._gen_cube(self.positions[0])
+            for i in range(1, len(self.positions)):
+                prev = self.positions[i-1]
+                pos = self.positions[i]
+                d = self.directions[i] if i < len(self.directions) else None
+                if d is not None:
+                    self._gen_cube(pos, prev, d)
+                else:
+                    self._gen_cube(pos)
 
 
 def run_snake_tests():

@@ -164,6 +164,8 @@ class GraftEngine:
         left, right = GraftEngine.cut_snake(snake_src, cut_idx)
         if not right:
             return GraftResult(False, "empty_segment")
+        # save letters of right segment before removing
+        right_letters = {p: snake_src.letters.get(p) for p in right}
         src_attach = right[0]
         # determine placement
         if dst_attach_pos is None:
@@ -202,13 +204,18 @@ class GraftEngine:
         snake_src.visited = set(left)
         snake_src.letters = {p: snake_src.letters[p] for p in left if p in snake_src.letters}
         snake_src.growth_count = len(left)
-        for p in shifted:
+        for i, p in enumerate(shifted):
+            orig = right[i]
             snake_dst.positions.append(p)
             snake_dst.visited.add(p)
-            r = seed_rng(snake_src.seed, "graft" + str(p))
-            letters = [r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(4)]
-            frame = r.choice("abcdefgh")
-            snake_dst.letters[p] = [(tuple(letters), frame)] * 3
+            # preserve original letters from saved right_letters
+            if right_letters.get(orig) is not None:
+                snake_dst.letters[p] = right_letters[orig]
+            else:
+                r = seed_rng(snake_src.seed, "graft" + str(p))
+                letters = [r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(4)]
+                frame = r.choice("abcdefgh")
+                snake_dst.letters[p] = [(tuple(letters), frame)] * 3
             snake_dst.growth_count += 1
         return GraftResult(True, "ok", shifted)
 
