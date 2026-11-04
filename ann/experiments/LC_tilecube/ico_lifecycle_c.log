@@ -1,0 +1,24 @@
+
+========================================================================================================
+C) INSERT:QUERY RATIO — steady-state cost, cost terms kept separate
+========================================================================================================
+
+  level 2: topology_build=2.5 ms  index_build=0.12 s  cells=162
+  insert: single 48.6 us/vec   bulk(500) 2.16 us/vec
+  budget  query p50   @0 ins       @1      @10     @100     @1000
+      5%        5.3      5.3      5.3      5.8     10.1      53.9
+     10%       10.0     10.0     10.1     10.5     14.9      58.6
+     20%       18.5     18.5     18.5     19.0     23.3      67.1
+
+  level 3: topology_build=9.1 ms  index_build=0.24 s  cells=642
+  insert: single 48.2 us/vec   bulk(500) 3.02 us/vec
+  budget  query p50   @0 ins       @1      @10     @100     @1000
+      5%        4.7      4.7      4.8      5.2      9.5      52.9
+     10%        9.5      9.5      9.6     10.0     14.3      57.7
+     20%       21.4     21.4     21.5     21.9     26.3      69.7
+
+  columns = total ms/query when each query is accompanied by 0/1/10/100/1000 inserts
+
+  Scope: candidate retrieval cost/quality only.
+
+  PASS

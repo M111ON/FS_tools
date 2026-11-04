@@ -1,0 +1,66 @@
+================================================================================
+MemCore granularity validation (Ico vs SizeRand vs Config)
+================================================================================
+  loaded 54211 x 384 (79 MB)
+  cells: max=2794 min=0 mean=335 median=115
+
+  neighbour-size profile:
+  Graph        edges  meanNbrSize  medNbrSize
+  Ico            960          336         121
+  SizeRand       960          325         109
+  Config         934          336         121
+  seed 0 done (2s)
+  seed 1 done (3s)
+  seed 2 done (5s)
+  seed 3 done (6s)
+  seed 4 done (8s)
+
+================================================================================
+Budget 5.0%  (max candidates 2710)
+Graph       PoolRec  NDCG@10    Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.429    0.428    2710   0.05    0.03    2.85
+SizeRand      0.269    0.283    2710   0.05    0.03    2.98
+Config        0.259    0.276    2710   0.05    0.04    3.09
+
+  paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI  wins  ties  loss       t-p  wilcoxon-p
+  SizeRand      +0.160 [ +0.124, +0.196]    63    32     5   1.2e-13     1.4e-11
+  Config        +0.170 [ +0.131, +0.209]    60    34     6   2.6e-13       2e-11
+
+================================================================================
+Budget 10.0%  (max candidates 5421)
+Graph       PoolRec  NDCG@10    Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.664    0.598    5421   0.00    0.04    6.25
+SizeRand      0.328    0.335    5421   0.00    0.06    5.96
+Config        0.306    0.316    5421   0.00    0.10    5.66
+
+  paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI  wins  ties  loss       t-p  wilcoxon-p
+  SizeRand      +0.336 [ +0.291, +0.381]    90    10     0   1.6e-26     1.6e-16
+  Config        +0.358 [ +0.306, +0.410]    87     9     4     3e-24     4.4e-16
+
+================================================================================
+Budget 20.0%  (max candidates 10842)
+Graph       PoolRec  NDCG@10    Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.837    0.701   10842   0.00    0.09   12.15
+SizeRand      0.414    0.411   10842   0.00    0.06   10.92
+Config        0.386    0.390   10842   0.00    0.08   12.31
+
+  paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI  wins  ties  loss       t-p  wilcoxon-p
+  SizeRand      +0.423 [ +0.377, +0.469]    94     6     0   5.1e-33     3.5e-17
+  Config        +0.451 [ +0.399, +0.503]    90    10     0   3.6e-31     1.6e-16
+
+================================================================================
+VERDICT (MemCore): Ico must still win vs SizeRand after size matching
+================================================================================
+   5.0%: SizeRand +0.160 (CI_lo +0.124), Config +0.170 (CI_lo +0.131)   -> PASS
+  10.0%: SizeRand +0.336 (CI_lo +0.291), Config +0.358 (CI_lo +0.306)   -> PASS
+  20.0%: SizeRand +0.423 (CI_lo +0.377), Config +0.451 (CI_lo +0.399)   -> PASS
+
+  Scope: text-embedding candidate retrieval only.
+
+  PASS

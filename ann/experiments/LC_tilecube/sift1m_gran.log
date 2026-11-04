@@ -1,0 +1,74 @@
+FD(3) elements: 20 (expect 20)
+
+FD(3) Hasse diagram:
+  elements: 20
+  bottom index: 0 (empty antichain)
+  ranks: {0: 1, 1: 1, 2: 3, 3: 3, 4: 4, 5: 3, 6: 3, 7: 1, 8: 1}
+  hasse edges: 32
+  rank 0: [0] (antichains: [[]])
+  rank 1: [1] (antichains: [[0]])
+  rank 2: [2, 3, 5] (antichains: [[1], [2], [4]])
+  rank 3: [9, 10, 12] (antichains: [[1, 2], [1, 4], [2, 4]])
+  rank 4: [4, 6, 7, 18] (antichains: [[3], [5], [6], [1, 2, 4]])
+  rank 5: [11, 13, 14] (antichains: [[1, 6], [2, 5], [3, 4]])
+  rank 6: [15, 16, 17] (antichains: [[3, 5], [3, 6], [5, 6]])
+  rank 7: [19] (antichains: [[3, 5, 6]])
+  rank 8: [8] (antichains: [[7]])
+
+  icosahedron L2: 320 faces, 480 edges
+  face adj edges: 480
+==============================================================================
+SIFT1M granularity control: 162 cells vs 20 cells
+==============================================================================
+  base (1000000, 128) queries (10000, 128) gt (10000, 100)
+  162 cells built 1.8s  sizes top10=[68044, 60890, 52413, 49036, 45297, 42431, 39967, 38024, 37343, 36824] max=68044 min=12
+
+##############################################################################
+# PARTITION: 162 icosphere-vertex cells (avg ~6.2k)
+##############################################################################
+
+-- budget 5.0% (max 50000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Ico        0.548   0.648   0.648   0.745     5.0    2.8    17364   0.22      0.1     51.2
+Config     0.548   0.537   0.537   0.649     5.0    5.5    17364   0.22      0.1     50.3
+ER         0.548   0.528   0.528   0.641     5.0    5.1    17364   0.22      0.1     51.0
+  Jaccard: Ico-Config 0.585 | Ico-ER 0.577 | Config-ER 0.570
+
+-- budget 10.0% (max 100000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Ico        0.548   0.804   0.804   0.860    10.0    5.5    64833   0.00      0.2    110.1
+Config     0.548   0.586   0.586   0.689    10.0   13.9    64833   0.00      0.2    107.8
+ER         0.548   0.568   0.568   0.675    10.0   10.1    64833   0.00      0.2    112.1
+  Jaccard: Ico-Config 0.261 | Ico-ER 0.248 | Config-ER 0.246
+
+-- budget 20.0% (max 200000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Ico        0.548   0.973   0.973   0.982    20.0   12.9   164833   0.00      0.4    212.0
+Config     0.548   0.629   0.629   0.724    20.0   29.6   164833   0.00      0.4    204.6
+ER         0.548   0.605   0.605   0.706    20.0   23.4   164833   0.00      0.3    203.0
+  Jaccard: Ico-Config 0.223 | Ico-ER 0.187 | Config-ER 0.169
+  20 cells built 1.4s
+
+##############################################################################
+# PARTITION: 20 FD cells (avg ~50k, the §489 setup)
+##############################################################################
+
+-- budget 5.0% (max 50000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Hasse      0.835   0.328   0.328   0.454     5.0    1.1      957   0.98      0.0     49.3
+Config     0.835   0.328   0.328   0.454     5.0    1.0      957   0.98      0.0     49.1
+  Jaccard: Hasse-Config 0.986
+
+-- budget 10.0% (max 100000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Hasse      0.835   0.671   0.671   0.759    10.0    1.6     5026   0.62      0.1    102.2
+Config     0.835   0.671   0.671   0.759    10.0    1.8     5026   0.62      0.0    103.0
+  Jaccard: Hasse-Config 0.954
+
+-- budget 20.0% (max 200000) --
+Graph      Start    Pool   Final    NDCG   Scan%  Nodes     Uniq  Trunc   LatCms   LatRms
+Hasse      0.835   0.859   0.858   0.903    20.0    2.5    72882   0.00      0.3    201.5
+Config     0.835   0.851   0.850   0.894    20.0    4.3    72882   0.00      0.2    200.1
+  Jaccard: Hasse-Config 0.702
+
+  PASS

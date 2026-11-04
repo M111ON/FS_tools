@@ -1,0 +1,72 @@
+FD(3) elements: 20 (expect 20)
+
+FD(3) Hasse diagram:
+  elements: 20
+  bottom index: 0 (empty antichain)
+  ranks: {0: 1, 1: 1, 2: 3, 3: 3, 4: 4, 5: 3, 6: 3, 7: 1, 8: 1}
+  hasse edges: 32
+  rank 0: [0] (antichains: [[]])
+  rank 1: [1] (antichains: [[0]])
+  rank 2: [2, 3, 5] (antichains: [[1], [2], [4]])
+  rank 3: [9, 10, 12] (antichains: [[1, 2], [1, 4], [2, 4]])
+  rank 4: [4, 6, 7, 18] (antichains: [[3], [5], [6], [1, 2, 4]])
+  rank 5: [11, 13, 14] (antichains: [[1, 6], [2, 5], [3, 4]])
+  rank 6: [15, 16, 17] (antichains: [[3, 5], [3, 6], [5, 6]])
+  rank 7: [19] (antichains: [[3, 5, 6]])
+  rank 8: [8] (antichains: [[7]])
+
+  icosahedron L2: 320 faces, 480 edges
+  face adj edges: 480
+==============================================================================
+SIFT1M cross-dataset validation (exact L2)
+==============================================================================
+  base (1000000, 128) (122 MB) queries (10000, 128) gt (10000, 100)  load 0.9s
+  PCA(3) from 20k sample 0.1s
+  assigned 1000000 vectors 1.5s
+  node sizes: 0:1195, 1:1077, 2:3174, 3:3427, 4:90402, 5:1222, 6:1063, 7:3247, 8:91470, 9:2316, 10:3504, 11:92451, 12:2352, 13:3411, 14:3388, 15:91759, 16:153375, 17:159333, 18:143676, 19:148158
+  seed 0 done
+  seed 1 done
+  seed 2 done
+  seed 3 done
+  seed 4 done
+
+==============================================================================
+Budget 5.0%  (max candidates 50000)
+Collector      Start    Pool   Final    NDCG   Scan%  Nodes  UniqAdd   LatCms   LatRms
+------------------------------------------------------------------------------
+Random         0.835   0.328   0.328   0.454     5.0    1.0      957      0.0     53.9
+Hasse          0.835   0.328   0.328   0.454     5.0    1.1      957      0.0     53.1
+Pyrochlore     0.835   0.330   0.330   0.455     5.0    1.1      957      0.0     52.3
+  Jaccard: Random vs Hasse 0.980 | Random vs Pyrochlore 0.990 | Hasse vs Pyrochlore 0.981
+  start-node-exceeds-budget fraction: Random=0.98, Hasse=0.98, Pyrochlore=0.98
+
+==============================================================================
+Budget 10.0%  (max candidates 100000)
+Collector      Start    Pool   Final    NDCG   Scan%  Nodes  UniqAdd   LatCms   LatRms
+------------------------------------------------------------------------------
+Random         0.835   0.671   0.671   0.759    10.0    1.8     5026      0.1     98.8
+Hasse          0.835   0.671   0.671   0.759    10.0    1.6     5026      0.0    100.5
+Pyrochlore     0.835   0.673   0.673   0.761    10.0    2.1     5026      0.0    102.5
+  Jaccard: Random vs Hasse 0.931 | Random vs Pyrochlore 0.935 | Hasse vs Pyrochlore 0.924
+  start-node-exceeds-budget fraction: Random=0.62, Hasse=0.62, Pyrochlore=0.62
+
+==============================================================================
+Budget 20.0%  (max candidates 200000)
+Collector      Start    Pool   Final    NDCG   Scan%  Nodes  UniqAdd   LatCms   LatRms
+------------------------------------------------------------------------------
+Random         0.835   0.850   0.849   0.894    20.0    3.4    72882      0.3    200.6
+Hasse          0.835   0.859   0.858   0.903    20.0    2.5    72882      0.3    199.8
+Pyrochlore     0.835   0.847   0.846   0.891    20.0    4.2    72882      0.2    203.1
+  Jaccard: Random vs Hasse 0.587 | Random vs Pyrochlore 0.546 | Hasse vs Pyrochlore 0.488
+  start-node-exceeds-budget fraction: Random=0.00, Hasse=0.00, Pyrochlore=0.00
+
+==============================================================================
+CROSS-DATASET: MemCore (§434) vs SIFT1M
+==============================================================================
+  MemCore 10% pool: Hasse 0.490 / Pyro 0.500 / Random 0.460
+  MemCore 20% pool: Hasse 0.495 / Pyro 0.520 / Random 0.535
+  SIFT1M  5.0% pool: Random 0.328 / Hasse 0.328 / Pyrochlore 0.330   best=Pyrochlore
+  SIFT1M 10.0% pool: Random 0.671 / Hasse 0.671 / Pyrochlore 0.673   best=Pyrochlore
+  SIFT1M 20.0% pool: Random 0.850 / Hasse 0.859 / Pyrochlore 0.847   best=Hasse
+
+  PASS

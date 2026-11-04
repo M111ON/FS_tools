@@ -1,0 +1,11 @@
+# SIFT1M benchmark data (external download, ~541 MB) — rebuild with:
+#   python -c "import urllib.request;urllib.request.urlretrieve('ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz','sift.tar.gz')"
+#   tar -xzf sift.tar.gz
+sift/
+
+# derived LC store built from memcore (rebuildable, source DB moves over time)
+memcore_lc_store/
+
+# python bytecode
+__pycache__/
+*.pyc

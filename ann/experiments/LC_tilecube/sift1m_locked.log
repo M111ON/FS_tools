@@ -1,0 +1,74 @@
+================================================================================
+LOCKED CONTROL: degree-matched AND neighbour-size-matched
+================================================================================
+  base (1000000, 128) queries (10000, 128)
+  cells built 1.2s  max=68044 min=12 mean=6173
+
+  neighbour-size profile (should match between Ico and SizeRand):
+  Graph        edges  meanNbrSize  medNbrSize  degMean
+  Ico            960         6231         540     5.93
+  Config         934         6267         413     5.77
+  ER             960         5841         384     5.93
+  SizeRand       960         6501         549     5.93
+  seed 0 done (37s)
+  seed 1 done (70s)
+  seed 2 done (103s)
+  seed 3 done (136s)
+  seed 4 done (169s)
+
+================================================================================
+Budget 5.0%  (max candidates 50000)
+Graph       PoolRec  Recall@10  NDCG@10   Scan%     Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.648      0.648    0.745     5.0    50000   0.22     0.1    49.0
+Config        0.530      0.530    0.641     5.0    50000   0.22     0.1    49.6
+ER            0.526      0.526    0.638     5.0    49759   0.22     0.1    50.1
+SizeRand      0.542      0.542    0.654     5.0    50000   0.22     0.1    49.4
+
+  Query-level paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI   wins   ties  losses       t-p  wilcoxon-p
+  Config        +0.118 [ +0.077, +0.159]     36     63       1   1.9e-07     1.6e-07
+  ER            +0.122 [ +0.081, +0.163]     38     62       0   8.7e-08     7.4e-08
+  SizeRand      +0.106 [ +0.066, +0.146]     36     61       3   1.4e-06       1e-06
+
+================================================================================
+Budget 10.0%  (max candidates 100000)
+Graph       PoolRec  Recall@10  NDCG@10   Scan%     Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.804      0.804    0.860    10.0   100000   0.00     0.1    98.3
+Config        0.587      0.587    0.687    10.0   100000   0.00     0.1    98.0
+ER            0.575      0.575    0.678     9.9    99259   0.00     0.1    98.1
+SizeRand      0.603      0.603    0.704    10.0   100000   0.00     0.1    98.7
+
+  Query-level paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI   wins   ties  losses       t-p  wilcoxon-p
+  Config        +0.217 [ +0.164, +0.270]     63     35       2   2.8e-12       7e-11
+  ER            +0.229 [ +0.174, +0.284]     67     30       3     1e-12     1.1e-11
+  SizeRand      +0.201 [ +0.149, +0.253]     62     33       5   2.6e-11     2.2e-10
+
+================================================================================
+Budget 20.0%  (max candidates 200000)
+Graph       PoolRec  Recall@10  NDCG@10   Scan%     Uniq  Trunc  LatCms  LatRms
+--------------------------------------------------------------------------------
+Ico           0.973      0.973    0.982    20.0   200000   0.00     0.2   193.1
+Config        0.638      0.638    0.729    20.0   200000   0.00     0.2   194.2
+ER            0.634      0.634    0.730    19.8   198259   0.00     0.2   192.1
+SizeRand      0.689      0.689    0.773    20.0   200000   0.00     0.2   194.8
+
+  Query-level paired difference vs Ico (n=100):
+  vs          meanDiff               95% CI   wins   ties  losses       t-p  wilcoxon-p
+  Config        +0.335 [ +0.278, +0.392]     77     22       1   5.1e-20     4.5e-14
+  ER            +0.339 [ +0.285, +0.393]     80     19       1   9.9e-22       6e-15
+  SizeRand      +0.284 [ +0.233, +0.335]     72     27       1   1.3e-18     1.2e-13
+
+================================================================================
+VERDICT (rule: Ico must still win after degree + neighbour-size matching)
+================================================================================
+   5.0%: Config +0.118 (CI_lo +0.077), ER +0.122 (CI_lo +0.081), SizeRand +0.106 (CI_lo +0.066)   -> PASS
+  10.0%: Config +0.217 (CI_lo +0.164), ER +0.229 (CI_lo +0.174), SizeRand +0.201 (CI_lo +0.149)   -> PASS
+  20.0%: Config +0.335 (CI_lo +0.278), ER +0.339 (CI_lo +0.285), SizeRand +0.284 (CI_lo +0.233)   -> PASS
+
+  Scope: Semantic Candidate Retrieval on SIFT1M only — not LC addressing,
+  memory layout, or storage.
+
+  PASS
