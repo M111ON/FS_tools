@@ -25,7 +25,7 @@ static atomic_uintptr_t current;
 static atomic_int epoch;
 static pthread_mutex_t pub_lock = PTHREAD_MUTEX_INITIALIZER;
 
-typedef struct { atomic_int active; int gen; } ReaderSlot;
+typedef struct { atomic_int active; atomic_int gen; } ReaderSlot;
 static ReaderSlot readers[READERS];
 
 static int violations[5] = {0,0,0,0,0};
@@ -53,7 +53,7 @@ static void reader_fn(void *arg){
         rcu_read_lock(rid);
         Version *v = rcu_dereference();
         if (v) {
-            readers[rid].gen = v->gen;
+            atomic_store(&readers[rid].gen, v->gen);
             unsigned long c = v->checksum;
             volatile int x = 0; for (int i=0;i<1000;i++) x += i;
             (void)x;
@@ -82,7 +82,7 @@ static void publish(Version *v){
 
 static int any_held(int target_gen){
     for (int i=0;i<READERS;i++){
-        if (atomic_load(&readers[i].active) > 0 && readers[i].gen < target_gen)
+        if (atomic_load(&readers[i].active) > 0 && atomic_load(&readers[i].gen) < target_gen)
             return 1;
     }
     return 0;
@@ -91,7 +91,7 @@ static int any_held(int target_gen){
 int main(void){
     atomic_store(&current, 0);
     atomic_store(&epoch, 0);
-    for (int i=0;i<READERS;i++){ atomic_store(&readers[i].active,0); readers[i].gen=0; }
+    for (int i=0;i<READERS;i++){ atomic_store(&readers[i].active,0); atomic_store(&readers[i].gen,0); }
 
     pthread_t ths[READERS];
     int ids[READERS];
