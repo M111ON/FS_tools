@@ -9,3 +9,6 @@ memcore_lc_store/
 # python bytecode
 __pycache__/
 *.pyc
+
+# precomputed order assets (rebuildable: python ico_precompute_order.py)
+order_L*.npz
