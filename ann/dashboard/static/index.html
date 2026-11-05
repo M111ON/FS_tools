@@ -116,6 +116,7 @@
       <section class="panel"><h2>Candidate receipts</h2><div id="candidate-receipts" class="kv"></div></section>
     </div>
     <section class="panel" style="margin-top:14px"><h2>Top-k</h2><div id="candidate-hits"></div></section>
+    <section class="panel" style="margin-top:14px"><h2>Turn log (recall / speed)</h2><div id="turn-log" class="muted"></div></section>
   </div>
 
   <div id="tab-shadow" class="tab" hidden>
@@ -338,6 +339,17 @@ function renderRouteReceipt(route) {
   ]);
 }
 
+async function renderTurnLog() {
+  const target = $("turn-log");
+  if (!target) return;
+  try {
+    const st = await getJSON("/api/search_stats");
+    target.textContent = st.closing_log || "(no queries yet)";
+  } catch (error) {
+    target.textContent = `turn log unavailable — ${error.message}`;
+  }
+}
+
 function renderCandidates(payload) {
   const receipts = payload.candidate_receipts || {};
   const counts = receipts.counts || {};
@@ -448,6 +460,7 @@ async function runQuery() {
     clearBanners();
     renderRouteReceipt((payload.response || {}).route);
     renderCandidates(payload);
+    await renderTurnLog();
   } catch (error) {
     banner(`query failed — ${error.message}`, false);
   }
