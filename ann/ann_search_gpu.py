@@ -76,6 +76,20 @@ class AnnSearchGPU:
         self.V = np.asarray(vecs, dtype=np.float32)
         self.rr = ResidentReranker(self.V)
         self.n = len(self.ids)
+        # Optional: join with memcore fact_store to surface usable text.
+        self._text = {}
+        db_path = os.environ.get("MEMCORE_DB",
+                                 "I:/tools/cloud_ws/memcore/fact_store.v2.sqlite3")
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                c = sqlite3.connect(db_path)
+                for sid, pattern, content in c.execute(
+                        "SELECT id, pattern, content FROM entries"):
+                    self._text[sid] = (pattern or "", content or "")
+                c.close()
+            except Exception:
+                self._text = {}
         # precompute normalized V as torch tensor on device
         if _HAS_TORCH:
             dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,10 +117,14 @@ class AnnSearchGPU:
         idx = idx[np.argsort(-S[idx])]
         out = []
         for i in idx:
-            out.append({"sid": self.ids[i],
+            sid = self.ids[i]
+            pattern, content = self._text.get(sid, ("", ""))
+            out.append({"sid": sid,
                         "file": self.meta[i]["file"],
                         "npast": self.meta[i]["npast"],
-                        "score": float(S[i])})
+                        "score": float(S[i]),
+                        "pattern": pattern,
+                        "content": (content[:240] + ("..." if len(content) > 240 else ""))})
         return out
 
 
@@ -123,4 +141,6 @@ if __name__ == "__main__":
     dt = (time.perf_counter() - t0) * 1000
     print(f"search: {dt:.1f} ms")
     for h in hits:
-        print(f"  {h['score']:.4f}  {h['sid'][:12]}  {h['file'][:60]}")
+        print(f"  {h['score']:.4f}  {h['sid'][:12]}  {h['file'][:40]}")
+        print(f"      pattern: {h.get('pattern','')[:80]}")
+        print(f"      content: {h.get('content','')[:120]}")
