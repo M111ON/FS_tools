@@ -78,18 +78,21 @@ class AnnSearchGPU:
         self.n = len(self.ids)
         # Optional: join with memcore fact_store to surface usable text.
         self._text = {}
+        self._kind = {}
         db_path = os.environ.get("MEMCORE_DB",
                                  "I:/tools/cloud_ws/memcore/fact_store.v2.sqlite3")
         if os.path.exists(db_path):
             try:
                 import sqlite3
                 c = sqlite3.connect(db_path)
-                for sid, pattern, content in c.execute(
-                        "SELECT id, pattern, content FROM entries"):
+                for sid, pattern, content, kind in c.execute(
+                        "SELECT id, pattern, content, kind FROM entries"):
                     self._text[sid] = (pattern or "", content or "")
+                    self._kind[sid] = kind or ""
                 c.close()
             except Exception:
                 self._text = {}
+                self._kind = {}
         # precompute normalized V as torch tensor on device
         if _HAS_TORCH:
             dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -100,7 +103,9 @@ class AnnSearchGPU:
             self._Vt = None
             self._Vu = self.V / (np.linalg.norm(self.V, axis=1, keepdims=True) + 1e-9)
 
-    def search(self, query, topk=5):
+    def search(self, query, topk=5, kinds=None):
+        """Search. kinds: list of kinds to include (e.g. ['embedded_document',
+        'dictionary_entry']); None = all."""
         if isinstance(query, str):
             qv = _embed(query)
         else:
@@ -112,6 +117,13 @@ class AnnSearchGPU:
                 S = (Pt @ self._Vt.T).cpu().numpy()
         else:
             S = qn @ self._Vu.T
+        # kind filter
+        if kinds:
+            kindset = set(kinds)
+            mask = np.array([self._kind.get(self.ids[i], "") in kindset
+                             for i in range(self.n)], dtype=bool)
+            if mask.any():
+                S = np.where(mask, S, -np.inf)
         kk = min(int(topk), self.n)
         idx = np.argpartition(-S, kk - 1)[:kk]
         idx = idx[np.argsort(-S[idx])]
@@ -123,6 +135,7 @@ class AnnSearchGPU:
                         "file": self.meta[i]["file"],
                         "npast": self.meta[i]["npast"],
                         "score": float(S[i]),
+                        "kind": self._kind.get(sid, ""),
                         "pattern": pattern,
                         "content": (content[:240] + ("..." if len(content) > 240 else ""))})
         return out
@@ -133,14 +146,17 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("query")
     ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--kinds", default=None,
+                    help="comma-separated kinds to include (e.g. embedded_document,dictionary_entry)")
     args = ap.parse_args()
     s = AnnSearchGPU()
     print(f"loaded {s.n} entries  device={s._dev}")
     t0 = time.perf_counter()
-    hits = s.search(args.query, topk=args.topk)
+    kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
+    hits = s.search(args.query, topk=args.topk, kinds=kinds)
     dt = (time.perf_counter() - t0) * 1000
     print(f"search: {dt:.1f} ms")
     for h in hits:
-        print(f"  {h['score']:.4f}  {h['sid'][:12]}  {h['file'][:40]}")
+        print(f"  {h['score']:.4f}  [{h.get('kind','')}]  {h['sid'][:12]}  {h['file'][:40]}")
         print(f"      pattern: {h.get('pattern','')[:80]}")
         print(f"      content: {h.get('content','')[:120]}")

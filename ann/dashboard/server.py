@@ -72,15 +72,16 @@ class Config:
     # -- fast (resident) search ------------------------------------------
     _gpu_search = {"inst": None}
 
-    def ann_fast_search(self, vec, topk):
+    def ann_fast_search(self, vec, topk, kinds=None):
         if self._gpu_search["inst"] is None:
             from ann_search_gpu import AnnSearchGPU
             self._gpu_search["inst"] = AnnSearchGPU()
         s = self._gpu_search["inst"]
         started = time.perf_counter()
-        hits = s.search(vec, topk=topk)
+        hits = s.search(vec, topk=topk, kinds=kinds)
         response = {"status": "ok", "hits": hits,
-                    "route": {"fast": True, "device": s._dev, "n": s.n}}
+                    "route": {"fast": True, "device": s._dev, "n": s.n,
+                              "kinds": kinds}}
         return response, round((time.perf_counter() - started) * 1000.0, 2)
 
     # -- read-only local sidecars ----------------------------------------
@@ -340,8 +341,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise core.InputError(f"invalid json: {error}")
             request = core.parse_search_request(body)
             fast = bool(body.get("fast", False)) if isinstance(body, dict) else False
+            kinds = body.get("kinds") if isinstance(body, dict) else None
+            if kinds is not None and not isinstance(kinds, list):
+                kinds = [k.strip() for k in str(kinds).split(",") if k.strip()]
             if fast:
-                response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"])
+                response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"], kinds=kinds)
             else:
                 response, ann_ms = self.config.ann_post("/v1/state/search", request)
             receipt_state = self.config.receipts_state()

@@ -99,16 +99,19 @@ def _get_gpu_search():
 
 
 @mcp.tool()
-def ann_search_fast(query: str, topk: int = 5) -> str:
+def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
     """Fast semantic search using a resident index (GPU/CPU torch).
 
     Same corpus as ann_search (~54k entries) but scans via a resident,
     normalized matrix (torch matmul) instead of the C server's path.
     Measured: ~90 ms vs ~1250 ms for ann_search (14x) on this box.
+    kinds: comma-separated kinds to include, e.g. "embedded_document,dictionary_entry"
+           (omit for all). Useful to filter out chatlog/exchange noise.
     Use this when latency matters; falls back to CPU torch if no GPU."""
     try:
         s = _get_gpu_search()
-        hits = s.search(query, topk=max(1, min(int(topk), 64)))
+        ks = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        hits = s.search(query, topk=max(1, min(int(topk), 64)), kinds=ks)
         return json.dumps({"hits": hits, "n": s.n,
                           "device": s._dev}, ensure_ascii=False, indent=1)
     except Exception as e:
