@@ -29,6 +29,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = pathlib.Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+# allow importing ann_search_gpu from I:/tools/ann
+ANN_DIR = pathlib.Path("I:/tools/ann")
+if str(ANN_DIR) not in sys.path:
+    sys.path.insert(0, str(ANN_DIR))
 
 import core  # noqa: E402
 
@@ -64,6 +68,20 @@ class Config:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
         return payload, round((time.perf_counter() - started) * 1000.0, 2)
+
+    # -- fast (resident) search ------------------------------------------
+    _gpu_search = {"inst": None}
+
+    def ann_fast_search(self, vec, topk):
+        if self._gpu_search["inst"] is None:
+            from ann_search_gpu import AnnSearchGPU
+            self._gpu_search["inst"] = AnnSearchGPU()
+        s = self._gpu_search["inst"]
+        started = time.perf_counter()
+        hits = s.search(vec, topk=topk)
+        response = {"status": "ok", "hits": hits,
+                    "route": {"fast": True, "device": s._dev, "n": s.n}}
+        return response, round((time.perf_counter() - started) * 1000.0, 2)
 
     # -- read-only local sidecars ----------------------------------------
     def read_bytes(self, name):
@@ -321,7 +339,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as error:
                 raise core.InputError(f"invalid json: {error}")
             request = core.parse_search_request(body)
-            response, ann_ms = self.config.ann_post("/v1/state/search", request)
+            fast = bool(body.get("fast", False)) if isinstance(body, dict) else False
+            if fast:
+                response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"])
+            else:
+                response, ann_ms = self.config.ann_post("/v1/state/search", request)
             receipt_state = self.config.receipts_state()
             context = receipt_state.get("_context")
             classification = core.classify_candidates(

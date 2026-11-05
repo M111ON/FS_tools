@@ -442,7 +442,7 @@ async function runQuery() {
     const payload = await getJSON("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vec: vector, topk, scope: $("scope").value || "" }),
+      body: JSON.stringify({ vec: vector, topk, scope: $("scope").value || "", fast: true }),
     });
     clearBanners();
     renderRouteReceipt((payload.response || {}).route);
