@@ -187,10 +187,12 @@ class AnnSearchGPU:
         dev = getattr(self, "_dev", "cpu")
         self._stats["devices"][dev] = self._stats["devices"].get(dev, 0) + 1
 
-    def stats(self):
-        """Aggregate stats for the closing log."""
-        lats = sorted(self._stats["latencies_ms"])
-        emb = self._stats.get("embed_ms_list", [])
+    def stats(self, since=None):
+        """Aggregate stats, optionally only for log entries with ts >= since.
+        Derived from the query log so a per-turn window is exact."""
+        rows = [e for e in self._log if since is None or e["ts"] >= since]
+        lats = sorted(e["latency_ms"] for e in rows)
+        embs = [e["embed_ms"] for e in rows]
         if lats:
             n = len(lats)
             avg = sum(lats) / n
@@ -199,10 +201,16 @@ class AnnSearchGPU:
             p99 = lats[min(int(n * 0.99), n - 1)]
         else:
             avg = p50 = p95 = p99 = 0.0
-        avg_embed = (sum(emb) / len(emb)) if emb else 0.0
+        kinds_usage = {}
+        devices = {}
+        for e in rows:
+            for k in (e["kinds"] if e["kinds"] else ["*"]):
+                kinds_usage[k] = kinds_usage.get(k, 0) + 1
+            devices[e["device"]] = devices.get(e["device"], 0) + 1
+        avg_embed = (sum(embs) / len(embs)) if embs else 0.0
         return {
-            "queries": self._stats["queries"],
-            "hits_total": self._stats["hits_total"],
+            "queries": len(rows),
+            "hits_total": sum(e["hits"] for e in rows),
             "avg_latency_ms": round(avg, 2),
             "avg_embed_ms": round(avg_embed, 2),
             "avg_scan_ms": round(avg - avg_embed, 2),
@@ -210,21 +218,21 @@ class AnnSearchGPU:
             "p95_ms": round(p95, 2),
             "p99_ms": round(p99, 2),
             "max_latency_ms": round(max(lats) if lats else 0.0, 2),
-            "errors": self._stats["errors"],
-            "kinds_usage": dict(self._stats["kinds_usage"]),
-            "devices": dict(self._stats["devices"]),
+            "errors": sum(1 for e in rows if e["error"]),
+            "kinds_usage": kinds_usage,
+            "devices": devices,
             "index_size": self.n,
             "device": getattr(self, "_dev", "cpu"),
-            "recent": self._log[-5:],
+            "recent": rows[-5:],
         }
 
-    def closing_log(self):
-        """One-line-per-turn closing summary (graft-style)."""
-        st = self.stats()
+    def closing_log(self, since=None):
+        """One-line closing summary (graft-style). since=<ts> for a turn window."""
+        st = self.stats(since=since)
         if st["queries"] == 0:
-            return "[ann] no queries this turn"
+            return ""
         kinds = ", ".join(f"{k}={v}" for k, v in st["kinds_usage"].items()) or "none"
-        return (f"[ann] turn: {st['queries']} queries, {st['hits_total']} hits | "
+        return (f"[ann] {st['queries']} queries, {st['hits_total']} hits | "
                 f"p50={st['p50_ms']}ms p95={st['p95_ms']}ms p99={st['p99_ms']}ms "
                 f"(embed {st['avg_embed_ms']}ms / scan {st['avg_scan_ms']}ms) | "
                 f"device={st['device']} index={st['index_size']} | kinds={kinds}")

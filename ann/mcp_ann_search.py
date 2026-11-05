@@ -19,6 +19,7 @@ Check health first: GET /health (see ann/README.md).
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -118,15 +119,30 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False, indent=1)
 
 
+_stats_window = {"since": time.time()}
+
+
 @mcp.tool()
-def ann_search_stats(flush: bool = False) -> str:
+def ann_search_stats(consume: bool = True, all: bool = False,
+                     flush: bool = False) -> str:
     """Per-turn log for the fast search: query count, hits, latency
     (p50/p95/p99, embed vs scan), kinds usage, device. The closing line is a
     graft-style tally: who used the system this turn, and recall/speed.
-    Set flush=true to also append the query log to JSONL and clear it."""
+
+    consume=true (default) reports only queries since the previous call, then
+    advances the window — so one call at the end of each turn is the turn's
+    footer. consume=false reports the cumulative log. all=true ignores the
+    window. flush=true also appends the log to JSONL and clears it."""
     try:
         s = _get_gpu_search()
-        out = {"closing_log": s.closing_log(), "stats": s.stats()}
+        if all or not consume:
+            since = None
+        else:
+            since = _stats_window["since"]
+        out = {"closing_log": s.closing_log(since=since),
+               "stats": s.stats(since=since)}
+        if consume and not all:
+            _stats_window["since"] = time.time()
         if flush:
             out["flushed"] = s.flush_log()
         return json.dumps(out, ensure_ascii=False, indent=1)
