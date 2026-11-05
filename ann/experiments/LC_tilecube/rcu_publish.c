@@ -1,9 +1,11 @@
+#define _DEFAULT_SOURCE
 /* RCU / epoch reclamation - C11 atomic implementation (tfb3b3e89).
  * Mirrors the protocol validated in ico_rcu_stress.py but with real atomics
  * and memory fences. Compile: gcc -std=c11 -O1 -g -fsanitize=thread -pthread
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
