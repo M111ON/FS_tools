@@ -296,36 +296,44 @@ class ReadPath:
             if branch in [int(b) for b in rec.get("branches", [])]:
                 allowed_items.add(rec.get("item_id"))
 
-        results = []
+        # Collect allowed (key, iid, step, vec) entries, then score in one
+        # batched matmul (wires the fast path; bit-identical to the per-item
+        # cosine loop above).
+        keys = []; iids = []; steps = []; vecs = []
         store = self.fruit_store.fruits[fid]["vectors"]
         for key, v in store.items():
             key = str(key)
-            # key format "item_id:step"
             if ":" not in key:
                 continue
             iid, step = key.rsplit(":", 1)
             if iid not in allowed_items:
                 continue
-            # verify this step actually used this branch
             rec = next((r for r in self.relations if r.get("item_id") == iid), None)
             if rec is not None:
                 branches = [int(b) for b in rec.get("branches", [])]
-                # step index
                 try:
                     si = int(step)
                 except ValueError:
                     si = None
                 if si is not None and si < len(branches) and branches[si] != branch:
                     continue
-            vec = np.asarray(v, dtype=np.float64).ravel()
-            # cosine similarity
+            keys.append(key); iids.append(iid); steps.append(step)
+            vecs.append(np.asarray(v, dtype=np.float64).ravel())
+
+        results = []
+        if vecs:
+            M = np.stack(vecs)  # (m, d)
             nq = np.linalg.norm(qvec)
-            nv = np.linalg.norm(vec)
-            if nq <= 0 or nv <= 0:
-                score = 0.0
+            nv = np.linalg.norm(M, axis=1)
+            if nq <= 0:
+                scores = np.zeros(len(vecs), dtype=np.float64)
             else:
-                score = float(np.dot(qvec, vec) / (nq * nv))
-            results.append({"key": key, "item_id": iid, "step": step, "score": score})
+                dots = M @ np.asarray(qvec, dtype=np.float64)
+                denom = nv * nq
+                scores = np.where(denom > 0, dots / np.where(denom > 0, denom, 1.0), 0.0)
+            for k, iid, step, sc in zip(keys, iids, steps, scores):
+                results.append({"key": k, "item_id": iid, "step": step,
+                                "score": float(sc)})
 
         results.sort(key=lambda x: (-x["score"], x["key"]))
         if top_k is not None:
