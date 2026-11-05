@@ -76,6 +76,16 @@ class AnnSearchGPU:
         self.V = np.asarray(vecs, dtype=np.float32)
         self.rr = ResidentReranker(self.V)
         self.n = len(self.ids)
+        # query log (ring buffer) + stats for the per-turn hook / closing log
+        self._log = []
+        self._log_cap = 1000
+        self._stats = {"queries": 0, "hits_total": 0, "latencies_ms": [],
+                       "embed_ms_list": [], "kinds_usage": {}, "devices": {},
+                       "errors": 0}
+        # hook: print the closing log at process exit (ANN_CLOSING_LOG=1)
+        if os.environ.get("ANN_CLOSING_LOG", "") not in ("", "0", "false", "off", "no"):
+            import atexit
+            atexit.register(lambda: print(self.closing_log(), flush=True))
         # Optional: join with memcore fact_store to surface usable text.
         self._text = {}
         self._kind = {}
@@ -105,40 +115,133 @@ class AnnSearchGPU:
 
     def search(self, query, topk=5, kinds=None):
         """Search. kinds: list of kinds to include (e.g. ['embedded_document',
-        'dictionary_entry']); None = all."""
-        if isinstance(query, str):
-            qv = _embed(query)
+        'dictionary_entry']); None = all. Every call is recorded in the query
+        log (stats()/closing_log()/flush_log())."""
+        t0 = time.perf_counter()
+        qstr = query if isinstance(query, str) else "<vector>"
+        embed_ms = 0.0
+        try:
+            if isinstance(query, str):
+                te = time.perf_counter()
+                qv = _embed(query)
+                embed_ms = (time.perf_counter() - te) * 1000.0
+            else:
+                qv = np.asarray(query, dtype=np.float32)
+            qn = qv / (np.linalg.norm(qv) + 1e-9)
+            if _HAS_TORCH:
+                with torch.no_grad():
+                    Pt = torch.from_numpy(qn.astype(np.float32)).to(self._dev)
+                    S = (Pt @ self._Vt.T).cpu().numpy()
+            else:
+                S = qn @ self._Vu.T
+            if kinds:
+                kindset = set(kinds)
+                mask = np.array([self._kind.get(self.ids[i], "") in kindset
+                                 for i in range(self.n)], dtype=bool)
+                if mask.any():
+                    S = np.where(mask, S, -np.inf)
+            kk = min(int(topk), self.n)
+            idx = np.argpartition(-S, kk - 1)[:kk]
+            idx = idx[np.argsort(-S[idx])]
+            out = []
+            for i in idx:
+                sid = self.ids[i]
+                pattern, content = self._text.get(sid, ("", ""))
+                out.append({"sid": sid,
+                            "file": self.meta[i]["file"],
+                            "npast": self.meta[i]["npast"],
+                            "score": float(S[i]),
+                            "kind": self._kind.get(sid, ""),
+                            "pattern": pattern,
+                            "content": (content[:240] + ("..." if len(content) > 240 else ""))})
+            self._record(qstr, topk, kinds, (time.perf_counter() - t0) * 1000.0,
+                         len(out), embed_ms=embed_ms)
+            return out
+        except Exception as e:
+            self._record(qstr, topk, kinds, (time.perf_counter() - t0) * 1000.0, 0,
+                         error=str(e), embed_ms=embed_ms)
+            self._stats["errors"] += 1
+            raise
+
+    def _record(self, query, topk, kinds, latency_ms, hits, error=None, embed_ms=0.0):
+        entry = {"ts": time.time(),
+                 "query": (query[:80] if isinstance(query, str) else "<vector>"),
+                 "topk": int(topk), "kinds": kinds,
+                 "latency_ms": round(latency_ms, 2),
+                 "embed_ms": round(embed_ms, 2),
+                 "scan_ms": round(latency_ms - embed_ms, 2),
+                 "hits": int(hits),
+                 "device": getattr(self, "_dev", "cpu"),
+                 "error": error}
+        self._log.append(entry)
+        if len(self._log) > self._log_cap:
+            self._log = self._log[-self._log_cap:]
+        self._stats["queries"] += 1
+        self._stats["hits_total"] += int(hits)
+        self._stats["latencies_ms"].append(latency_ms)
+        self._stats.setdefault("embed_ms_list", []).append(embed_ms)
+        if len(self._stats["latencies_ms"]) > self._log_cap:
+            self._stats["latencies_ms"] = self._stats["latencies_ms"][-self._log_cap:]
+        for k in (kinds if kinds else ["*"]):
+            self._stats["kinds_usage"][k] = self._stats["kinds_usage"].get(k, 0) + 1
+        dev = getattr(self, "_dev", "cpu")
+        self._stats["devices"][dev] = self._stats["devices"].get(dev, 0) + 1
+
+    def stats(self):
+        """Aggregate stats for the closing log."""
+        lats = sorted(self._stats["latencies_ms"])
+        emb = self._stats.get("embed_ms_list", [])
+        if lats:
+            n = len(lats)
+            avg = sum(lats) / n
+            p50 = lats[n // 2]
+            p95 = lats[min(int(n * 0.95), n - 1)]
+            p99 = lats[min(int(n * 0.99), n - 1)]
         else:
-            qv = np.asarray(query, dtype=np.float32)
-        qn = qv / (np.linalg.norm(qv) + 1e-9)
-        if _HAS_TORCH:
-            with torch.no_grad():
-                Pt = torch.from_numpy(qn.astype(np.float32)).to(self._dev)
-                S = (Pt @ self._Vt.T).cpu().numpy()
-        else:
-            S = qn @ self._Vu.T
-        # kind filter
-        if kinds:
-            kindset = set(kinds)
-            mask = np.array([self._kind.get(self.ids[i], "") in kindset
-                             for i in range(self.n)], dtype=bool)
-            if mask.any():
-                S = np.where(mask, S, -np.inf)
-        kk = min(int(topk), self.n)
-        idx = np.argpartition(-S, kk - 1)[:kk]
-        idx = idx[np.argsort(-S[idx])]
-        out = []
-        for i in idx:
-            sid = self.ids[i]
-            pattern, content = self._text.get(sid, ("", ""))
-            out.append({"sid": sid,
-                        "file": self.meta[i]["file"],
-                        "npast": self.meta[i]["npast"],
-                        "score": float(S[i]),
-                        "kind": self._kind.get(sid, ""),
-                        "pattern": pattern,
-                        "content": (content[:240] + ("..." if len(content) > 240 else ""))})
-        return out
+            avg = p50 = p95 = p99 = 0.0
+        avg_embed = (sum(emb) / len(emb)) if emb else 0.0
+        return {
+            "queries": self._stats["queries"],
+            "hits_total": self._stats["hits_total"],
+            "avg_latency_ms": round(avg, 2),
+            "avg_embed_ms": round(avg_embed, 2),
+            "avg_scan_ms": round(avg - avg_embed, 2),
+            "p50_ms": round(p50, 2),
+            "p95_ms": round(p95, 2),
+            "p99_ms": round(p99, 2),
+            "max_latency_ms": round(max(lats) if lats else 0.0, 2),
+            "errors": self._stats["errors"],
+            "kinds_usage": dict(self._stats["kinds_usage"]),
+            "devices": dict(self._stats["devices"]),
+            "index_size": self.n,
+            "device": getattr(self, "_dev", "cpu"),
+            "recent": self._log[-5:],
+        }
+
+    def closing_log(self):
+        """One-line-per-turn closing summary (graft-style)."""
+        st = self.stats()
+        if st["queries"] == 0:
+            return "[ann] no queries this turn"
+        kinds = ", ".join(f"{k}={v}" for k, v in st["kinds_usage"].items()) or "none"
+        return (f"[ann] turn: {st['queries']} queries, {st['hits_total']} hits | "
+                f"p50={st['p50_ms']}ms p95={st['p95_ms']}ms p99={st['p99_ms']}ms "
+                f"(embed {st['avg_embed_ms']}ms / scan {st['avg_scan_ms']}ms) | "
+                f"device={st['device']} index={st['index_size']} | kinds={kinds}")
+
+    def flush_log(self, path=None):
+        """Append the query log to JSONL (qlog-style) and clear it. Returns count."""
+        import json as _json
+        if path is None:
+            path = os.environ.get("ANN_QUERY_LOG",
+                                  "I:/tools/ann/data/query_log/fast_search.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for e in self._log:
+                f.write(_json.dumps(e, ensure_ascii=False) + "\n")
+        n = len(self._log)
+        self._log = []
+        return n
 
 
 if __name__ == "__main__":

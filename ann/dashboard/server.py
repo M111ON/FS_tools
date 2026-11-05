@@ -318,6 +318,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, build_shadow_view(self.config))
             if path == "/api/receipts":
                 return self._send(200, self.config.receipts_public())
+            if path == "/api/search_stats":
+                inst = self.config._gpu_search.get("inst")
+                if inst is None:
+                    return self._send(200, {"closing_log": "[ann] no queries yet",
+                                            "stats": {}})
+                return self._send(200, {"closing_log": inst.closing_log(),
+                                        "stats": inst.stats()})
             return self._error(404, "not_found", f"no route {path}")
         except core.InputError as error:
             return self._error(400, "bad_request", error)

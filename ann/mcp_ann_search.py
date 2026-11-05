@@ -119,6 +119,22 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
 
 
 @mcp.tool()
+def ann_search_stats(flush: bool = False) -> str:
+    """Per-turn log for the fast search: query count, hits, latency
+    (p50/p95/p99, embed vs scan), kinds usage, device. The closing line is a
+    graft-style tally: who used the system this turn, and recall/speed.
+    Set flush=true to also append the query log to JSONL and clear it."""
+    try:
+        s = _get_gpu_search()
+        out = {"closing_log": s.closing_log(), "stats": s.stats()}
+        if flush:
+            out["flushed"] = s.flush_log()
+        return json.dumps(out, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False, indent=1)
+
+
+@mcp.tool()
 def ann_health() -> str:
     """Health of the ANN index server: entry count, index age, embedder status.
     Check this when ann_search fails — the embed sidecar (:18095) can be down
