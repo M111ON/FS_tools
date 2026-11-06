@@ -19,6 +19,17 @@ ANN_INDEX = os.environ.get("ANN_INDEX",
 EMBED_HOST = os.environ.get("LZ_EMBED_HOST", "127.0.0.1")
 EMBED_PORT = os.environ.get("LZ_EMBED_PORT", "18095")
 
+# Query embedding cache (residency-style: keep hot queries in memory).
+# For "few queries" (often repeated), this makes repeat calls instant and
+# avoids the HTTP round-trip + sidecar forward pass entirely.
+_EMBED_CACHE = {}
+_EMBED_CACHE_MAX = int(os.environ.get("ANN_EMBED_CACHE_MAX", "512"))
+try:
+    import threading as _t
+    _EMBED_CACHE_LOCK = _t.Lock()
+except Exception:
+    _EMBED_CACHE_LOCK = None
+
 try:
     import torch
     _HAS_TORCH = True
@@ -96,10 +107,21 @@ def _embed(text):
     with {"content": text} (same as ann_search.c lz_embed)."""
     try:
         import unicodedata
-        text = unicodedata.normalize("NFKD", text)
-        text = text.encode("ascii", "ignore").decode("ascii")
+        norm = unicodedata.normalize("NFKD", text)
+        norm = norm.encode("ascii", "ignore").decode("ascii")
     except Exception:
-        pass
+        norm = text
+    # Cache hit -> instant (no HTTP, no forward pass).
+    if _EMBED_CACHE_LOCK is not None:
+        _EMBED_CACHE_LOCK.acquire()
+    try:
+        cached = _EMBED_CACHE.get(norm)
+    finally:
+        if _EMBED_CACHE_LOCK is not None:
+            _EMBED_CACHE_LOCK.release()
+    if cached is not None:
+        return cached.copy()
+    text = norm
     url = f"http://{EMBED_HOST}:{EMBED_PORT}/embedding"
     body = json.dumps({"content": text}).encode()
     req = urllib.request.Request(url, data=body,
@@ -116,7 +138,22 @@ def _embed(text):
         emb = emb[0]
     if isinstance(emb, list) and emb and isinstance(emb[0], list):
         emb = emb[0]
-    return np.asarray(emb, dtype=np.float32)
+    arr = np.asarray(emb, dtype=np.float32)
+    # Store in cache (evict oldest if full).
+    try:
+        if _EMBED_CACHE_LOCK is not None:
+            _EMBED_CACHE_LOCK.acquire()
+        if len(_EMBED_CACHE) >= _EMBED_CACHE_MAX:
+            # evict first inserted (dict preserves insertion order in py3.7+)
+            try:
+                del _EMBED_CACHE[next(iter(_EMBED_CACHE))]
+            except StopIteration:
+                pass
+        _EMBED_CACHE[norm] = arr.copy()
+    finally:
+        if _EMBED_CACHE_LOCK is not None:
+            _EMBED_CACHE_LOCK.release()
+    return arr
 
 
 class AnnSearchGPU:
