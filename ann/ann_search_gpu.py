@@ -59,10 +59,27 @@ def _embed(text):
 
 class AnnSearchGPU:
     def __init__(self, index_path=ANN_INDEX):
+        self._index_path = index_path
+        self._loaded = False
+        # query log (ring buffer) + stats for the per-turn hook / closing log
+        self._log = []
+        self._log_cap = 1000
+        self._last = None  # last call summary for MCP footer
+        self._stats = {"queries": 0, "hits_total": 0, "latencies_ms": [],
+                       "embed_ms_list": [], "kinds_usage": {}, "devices": {},
+                       "errors": 0}
+        # hook: print the closing log at process exit (ANN_CLOSING_LOG=1)
+        if os.environ.get("ANN_CLOSING_LOG", "") not in ("", "0", "false", "off", "no"):
+            import atexit
+            atexit.register(lambda: print(self.closing_log(), flush=True))
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
         self.ids = []
         self.meta = []
         vecs = []
-        with open(index_path, encoding="utf-8") as f:
+        with open(self._index_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -76,16 +93,6 @@ class AnnSearchGPU:
         self.V = np.asarray(vecs, dtype=np.float32)
         self.rr = ResidentReranker(self.V)
         self.n = len(self.ids)
-        # query log (ring buffer) + stats for the per-turn hook / closing log
-        self._log = []
-        self._log_cap = 1000
-        self._stats = {"queries": 0, "hits_total": 0, "latencies_ms": [],
-                       "embed_ms_list": [], "kinds_usage": {}, "devices": {},
-                       "errors": 0}
-        # hook: print the closing log at process exit (ANN_CLOSING_LOG=1)
-        if os.environ.get("ANN_CLOSING_LOG", "") not in ("", "0", "false", "off", "no"):
-            import atexit
-            atexit.register(lambda: print(self.closing_log(), flush=True))
         # Optional: join with memcore fact_store to surface usable text.
         self._text = {}
         self._kind = {}
@@ -112,11 +119,13 @@ class AnnSearchGPU:
             self._dev = "cpu"
             self._Vt = None
             self._Vu = self.V / (np.linalg.norm(self.V, axis=1, keepdims=True) + 1e-9)
+        self._loaded = True
 
     def search(self, query, topk=5, kinds=None):
         """Search. kinds: list of kinds to include (e.g. ['embedded_document',
         'dictionary_entry']); None = all. Every call is recorded in the query
         log (stats()/closing_log()/flush_log())."""
+        self._ensure_loaded()
         t0 = time.perf_counter()
         qstr = query if isinstance(query, str) else "<vector>"
         embed_ms = 0.0
@@ -154,8 +163,12 @@ class AnnSearchGPU:
                             "kind": self._kind.get(sid, ""),
                             "pattern": pattern,
                             "content": (content[:240] + ("..." if len(content) > 240 else ""))})
-            self._record(qstr, topk, kinds, (time.perf_counter() - t0) * 1000.0,
-                         len(out), embed_ms=embed_ms)
+            _lat = (time.perf_counter() - t0) * 1000.0
+            self._record(qstr, topk, kinds, _lat, len(out), embed_ms=embed_ms)
+            self._last = {"latency_ms": round(_lat, 2),
+                          "embed_ms": round(embed_ms, 2),
+                          "scan_ms": round(_lat - embed_ms, 2),
+                          "hits": len(out), "device": getattr(self, "_dev", "cpu")}
             return out
         except Exception as e:
             self._record(qstr, topk, kinds, (time.perf_counter() - t0) * 1000.0, 0,
@@ -190,6 +203,12 @@ class AnnSearchGPU:
     def stats(self, since=None):
         """Aggregate stats, optionally only for log entries with ts >= since.
         Derived from the query log so a per-turn window is exact."""
+        if not getattr(self, "_loaded", False):
+            return {"queries": 0, "hits_total": 0, "avg_latency_ms": 0.0,
+                    "avg_embed_ms": 0.0, "avg_scan_ms": 0.0, "p50_ms": 0.0,
+                    "p95_ms": 0.0, "p99_ms": 0.0, "max_latency_ms": 0.0,
+                    "errors": 0, "kinds_usage": {}, "devices": {},
+                    "index_size": 0, "device": "cpu", "recent": []}
         rows = [e for e in self._log if since is None or e["ts"] >= since]
         lats = sorted(e["latency_ms"] for e in rows)
         embs = [e["embed_ms"] for e in rows]
