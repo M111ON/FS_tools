@@ -372,7 +372,7 @@ class AnnSearchGPU:
                     "score": float(self.V[idx] @ qvec / (np.linalg.norm(self.V[idx]) * np.linalg.norm(qvec) + 1e-9)),
                     "kind": kind,
                     "pattern": pattern,
-                    "content": (content or "")[:240],
+                    "content": (content or "")[:5000],
                 })
 
             embed_ms = (time.perf_counter() - t0) * 1000.0  # approximate
