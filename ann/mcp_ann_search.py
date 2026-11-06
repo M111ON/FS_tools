@@ -118,7 +118,8 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
     try:
         s = _get_gpu_search()
         ks = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
-        hits = s.search(query, topk=max(1, min(int(topk), 64)), kinds=ks)
+        result = s.search(query, topk=max(1, min(int(topk), 64)), kinds=ks)
+        hits = result.get("hits", []) if isinstance(result, dict) else result
         last = getattr(s, "_last", None) or {}
         footer = ("[ann] {q} query, {h} hits | {lat}ms "
                   "(embed {emb}ms / scan {scn}ms) | device={dev} index={idx}").format(
@@ -127,7 +128,9 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
             emb=last.get("embed_ms", 0), scn=last.get("scan_ms", 0),
             dev=last.get("device", s._dev), idx=s.n)
         return json.dumps({"hits": hits, "n": s.n,
-                          "device": s._dev, "footer": footer},
+                          "device": s._dev, "footer": footer,
+                          "budget_pct": result.get("budget_pct") if isinstance(result, dict) else None,
+                          "scan_actual_pct": result.get("scan_actual_pct") if isinstance(result, dict) else None},
                          ensure_ascii=False, indent=1)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False, indent=1)
