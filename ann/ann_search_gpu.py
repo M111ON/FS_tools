@@ -270,6 +270,12 @@ class AnnSearchGPU:
                         self._ivf_centroids = pblob["ivf_centroids"]
                     else:
                         self._build_partitions()
+                    # Set device (needed by MCP wrapper)
+                    try:
+                        import torch
+                        self._dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    except Exception:
+                        self._dev = "cpu"
                     self._loaded = True
                     return
                 except Exception:
@@ -293,6 +299,12 @@ class AnnSearchGPU:
             self.V = np.asarray(vecs, dtype=np.float32)
             self.n = len(self.ids)
             self._build_partitions()
+            # Set device (needed by MCP wrapper)
+            try:
+                import torch
+                self._dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                self._dev = "cpu"
             self._loaded = True
             # Write caches
             try:
@@ -484,8 +496,8 @@ class AnnSearchGPU:
             "recent": rows[-20:],
         }
 
-    def closing_log(self):
-        rows = self._log
+    def closing_log(self, since=None):
+        rows = [e for e in self._log if since is None or e.get("ts", 0) >= since]
         if not rows:
             return "[ann] no queries this turn"
         lats = sorted(e.get("latency_ms", 0) for e in rows)

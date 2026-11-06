@@ -100,7 +100,7 @@ def _get_gpu_search():
 
 
 @mcp.tool()
-def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
+def ann_search_fast(query: str, topk: int = 5, kinds: str = "", budget: float = 5.0) -> str:
     """Fast semantic search using a resident index (GPU/CPU torch).
 
     Same corpus as ann_search (~54k entries) but scans via a resident,
