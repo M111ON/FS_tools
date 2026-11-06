@@ -108,13 +108,25 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
     Measured: ~90 ms vs ~1250 ms for ann_search (14x) on this box.
     kinds: comma-separated kinds to include, e.g. "embedded_document,dictionary_entry"
            (omit for all). Useful to filter out chatlog/exchange noise.
-    Use this when latency matters; falls back to CPU torch if no GPU."""
-    try:
+    Use this when latency matters; falls back to CPU torch if no GPU.
+
+    IMPORTANT: the result contains a 'footer' field. Print it verbatim as the
+    LAST line of your reply whenever you call this tool, e.g.
+    [ann] 1 query, 2 hits | 142.0ms (embed 130.58ms / scan 11.43ms) | device=cpu index=54255
+    This is the per-call recall/speed receipt; do not paraphrase or omit it."""    try:
         s = _get_gpu_search()
         ks = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
         hits = s.search(query, topk=max(1, min(int(topk), 64)), kinds=ks)
+        last = getattr(s, "_last", None) or {}
+        footer = ("[ann] {q} query, {h} hits | {lat}ms "
+                  "(embed {emb}ms / scan {scn}ms) | device={dev} index={idx}").format(
+            q=1, h=last.get("hits", len(hits)),
+            lat=last.get("latency_ms", 0),
+            emb=last.get("embed_ms", 0), scn=last.get("scan_ms", 0),
+            dev=last.get("device", s._dev), idx=s.n)
         return json.dumps({"hits": hits, "n": s.n,
-                          "device": s._dev}, ensure_ascii=False, indent=1)
+                          "device": s._dev, "footer": footer},
+                         ensure_ascii=False, indent=1)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False, indent=1)
 
@@ -128,6 +140,9 @@ def ann_search_stats(consume: bool = True, all: bool = False,
     """Per-turn log for the fast search: query count, hits, latency
     (p50/p95/p99, embed vs scan), kinds usage, device. The closing line is a
     graft-style tally: who used the system this turn, and recall/speed.
+
+    IMPORTANT: print the 'closing_log' field verbatim as the LAST line of your
+    reply whenever you call this tool.
 
     consume=true (default) reports only queries since the previous call, then
     advances the window — so one call at the end of each turn is the turn's
