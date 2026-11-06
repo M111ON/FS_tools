@@ -176,4 +176,38 @@ def ann_health() -> str:
 
 
 if __name__ == "__main__":
-    mcp.run("stdio")
+    import argparse as _ap
+    _parser = _ap.ArgumentParser()
+    _parser.add_argument("--http", action="store_true",
+                        help="Run as a persistent HTTP MCP service (streamable-http).")
+    _parser.add_argument("--host", default="127.0.0.1")
+    _parser.add_argument("--port", type=int, default=8205)
+    _args = _parser.parse_args()
+    if _args.http:
+        # Persistent service: load index synchronously at startup (once).
+        try:
+            _get_gpu_search()._ensure_loaded()
+            sys.stderr.write("[ann-mcp] index loaded (http mode)\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[ann-mcp] load failed: {e}\n")
+            sys.stderr.flush()
+        mcp.settings.host = _args.host
+        mcp.settings.port = _args.port
+        mcp.run("streamable-http")
+    else:
+        # stdio mode (per-session): pre-warm in background.
+        try:
+            import threading as _th
+            def _warm():
+                try:
+                    _get_gpu_search()._ensure_loaded()
+                    sys.stderr.write("[ann-mcp] index pre-warmed\n")
+                    sys.stderr.flush()
+                except Exception as e:
+                    sys.stderr.write(f"[ann-mcp] pre-warm failed: {e}\n")
+                    sys.stderr.flush()
+            _th.Thread(target=_warm, daemon=True).start()
+        except Exception:
+            pass
+        mcp.run("stdio")
