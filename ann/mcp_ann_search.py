@@ -130,6 +130,8 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "", budget: float = 
         return json.dumps({"hits": hits, "n": s.n,
                           "device": s._dev, "footer": footer,
                           "budget_pct": result.get("budget_pct") if isinstance(result, dict) else None,
+                          "budget_requested": result.get("budget_requested") if isinstance(result, dict) else None,
+                          "auto_adjusted": result.get("auto_adjusted") if isinstance(result, dict) else None,
                           "scan_actual_pct": result.get("scan_actual_pct") if isinstance(result, dict) else None},
                          ensure_ascii=False, indent=1)
     except Exception as e:
