@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import threading
@@ -325,6 +326,14 @@ class Handler(BaseHTTPRequestHandler):
                                             "stats": {}})
                 return self._send(200, {"closing_log": inst.closing_log(),
                                         "stats": inst.stats()})
+            if path == "/api/usage":
+                try:
+                    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    from ann_search_gpu import shared_stats, read_shared_log
+                    st = shared_stats()
+                    return self._send(200, {"ok": True, "stats": st})
+                except Exception as e:
+                    return self._send(500, {"ok": False, "error": str(e)})
             return self._error(404, "not_found", f"no route {path}")
         except core.InputError as error:
             return self._error(400, "bad_request", error)

@@ -29,6 +29,68 @@ except Exception:
 from rerank_gpu import ResidentReranker
 
 
+def read_shared_log(limit=200):
+    """Read the shared append-only query log (all processes). Returns list of
+    entries (newest last), capped at `limit`."""
+    import json as _j
+    path = os.environ.get("ANN_SHARED_LOG",
+                          "I:/tools/ann/data/query_log/all_queries.jsonl")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(_j.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        return []
+    if limit and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def shared_stats(limit=10000):
+    """Aggregate stats over the shared query log (all processes)."""
+    rows = read_shared_log(limit=limit)
+    lats = sorted(e.get("latency_ms", 0) for e in rows)
+    if lats:
+        n = len(lats)
+        avg = sum(lats) / n
+        p50 = lats[n // 2]
+        p95 = lats[min(int(n * 0.95), n - 1)]
+        p99 = lats[min(int(n * 0.99), n - 1)]
+    else:
+        avg = p50 = p95 = p99 = 0.0
+    succ = sum(1 for e in rows if e.get("hits", 0) > 0 and not e.get("error"))
+    kinds = {}
+    devices = {}
+    for e in rows:
+        for k in (e.get("kinds") or ["*"]):
+            kinds[k] = kinds.get(k, 0) + 1
+        d = e.get("device", "cpu")
+        devices[d] = devices.get(d, 0) + 1
+    return {
+        "total": len(rows),
+        "successful": succ,
+        "success_rate": round(100.0 * succ / len(rows), 1) if rows else 0.0,
+        "hits_total": sum(e.get("hits", 0) for e in rows),
+        "avg_latency_ms": round(avg, 2),
+        "p50_ms": round(p50, 2),
+        "p95_ms": round(p95, 2),
+        "p99_ms": round(p99, 2),
+        "max_latency_ms": round(max(lats) if lats else 0.0, 2),
+        "errors": sum(1 for e in rows if e.get("error")),
+        "kinds_usage": kinds,
+        "devices": devices,
+        "distinct_queries": len(set(e.get("query", "") for e in rows)),
+        "recent": rows[-20:],
+    }
+
+
 def _embed(text):
     """Embed text via the sidecar (e5-small on :18095). Uses /embedding
     with {"content": text} (same as ann_search.c lz_embed)."""
@@ -76,6 +138,42 @@ class AnnSearchGPU:
     def _ensure_loaded(self):
         if self._loaded:
             return
+        import pickle
+        v_cache = self._index_path + ".V.npy"
+        m_cache = self._index_path + ".meta.pkl"
+        try:
+            import os as _os
+            src_mtime = _os.path.getmtime(self._index_path)
+            cache_ok = (_os.path.exists(v_cache) and _os.path.exists(m_cache)
+                        and _os.path.getmtime(v_cache) >= src_mtime
+                        and _os.path.getmtime(m_cache) >= src_mtime)
+        except Exception:
+            cache_ok = False
+        if cache_ok:
+            try:
+                self.V = np.load(v_cache, allow_pickle=False)
+                with open(m_cache, "rb") as f:
+                    blob = pickle.load(f)
+                self.ids = blob["ids"]
+                self.meta = blob["meta"]
+                self._text = blob["text"]
+                self._kind = blob["kind"]
+                self.n = len(self.ids)
+                self.rr = ResidentReranker(self.V)
+                # precompute normalized V as torch tensor on device
+                if _HAS_TORCH:
+                    dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    self._dev = dev
+                    self._Vt = self.rr.Vt
+                else:
+                    self._dev = "cpu"
+                    self._Vt = None
+                    self._Vu = self.V / (np.linalg.norm(self.V, axis=1, keepdims=True) + 1e-9)
+                self._loaded = True
+                return
+            except Exception:
+                cache_ok = False
+        # Cold build from JSONL
         self.ids = []
         self.meta = []
         vecs = []
@@ -120,6 +218,14 @@ class AnnSearchGPU:
             self._Vt = None
             self._Vu = self.V / (np.linalg.norm(self.V, axis=1, keepdims=True) + 1e-9)
         self._loaded = True
+        # Write cache for next (cold) process
+        try:
+            np.save(v_cache, self.V)
+            with open(m_cache, "wb") as f:
+                pickle.dump({"ids": self.ids, "meta": self.meta,
+                             "text": self._text, "kind": self._kind}, f)
+        except Exception:
+            pass
 
     def search(self, query, topk=5, kinds=None):
         """Search. kinds: list of kinds to include (e.g. ['embedded_document',
@@ -189,6 +295,18 @@ class AnnSearchGPU:
         self._log.append(entry)
         if len(self._log) > self._log_cap:
             self._log = self._log[-self._log_cap:]
+        # Persist to a shared append-only log so every process (MCP, dashboard,
+        # CLI) contributes to one history. Best-effort; never blocks search.
+        try:
+            import json as _j
+            log_path = os.environ.get("ANN_SHARED_LOG",
+                                      "I:/tools/ann/data/query_log/all_queries.jsonl")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as _f:
+                _f.write(_j.dumps(entry, ensure_ascii=False) + "\n")
+                _f.flush()
+        except Exception:
+            pass
         self._stats["queries"] += 1
         self._stats["hits_total"] += int(hits)
         self._stats["latencies_ms"].append(latency_ms)

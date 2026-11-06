@@ -113,7 +113,9 @@ def ann_search_fast(query: str, topk: int = 5, kinds: str = "") -> str:
     IMPORTANT: the result contains a 'footer' field. Print it verbatim as the
     LAST line of your reply whenever you call this tool, e.g.
     [ann] 1 query, 2 hits | 142.0ms (embed 130.58ms / scan 11.43ms) | device=cpu index=54255
-    This is the per-call recall/speed receipt; do not paraphrase or omit it."""    try:
+    This is the per-call recall/speed receipt; do not paraphrase or omit it."""
+
+    try:
         s = _get_gpu_search()
         ks = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
         hits = s.search(query, topk=max(1, min(int(topk), 64)), kinds=ks)

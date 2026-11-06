@@ -117,6 +117,12 @@
     </div>
     <section class="panel" style="margin-top:14px"><h2>Top-k</h2><div id="candidate-hits"></div></section>
     <section class="panel" style="margin-top:14px"><h2>Turn log (recall / speed)</h2><div id="turn-log" class="muted"></div></section>
+    <section class="panel" style="margin-top:14px">
+      <h2>Usage &amp; value — ANN search history (all processes)</h2>
+      <div id="usage-kv" class="kv"></div>
+      <div style="margin-top:8px"><button id="refresh-usage">Refresh</button></div>
+      <div style="margin-top:8px" id="usage-table"></div>
+    </section>
   </div>
 
   <div id="tab-shadow" class="tab" hidden>
@@ -350,6 +356,47 @@ async function renderTurnLog() {
   }
 }
 
+async function renderUsage() {
+  const kvEl = $("usage-kv");
+  const tableEl = $("usage-table");
+  if (!kvEl || !tableEl) return;
+  try {
+    const payload = await getJSON("/api/usage");
+    const st = payload.stats || {};
+    const succ = st.successful || 0;
+    const total = st.total || 0;
+    const rate = st.success_rate || 0;
+    kv(kvEl, [
+      ["total queries", total],
+      ["successful (hits>0, no error)", `${succ}  (${rate}%)`],
+      ["total hits", st.hits_total || 0],
+      ["distinct queries", st.distinct_queries || 0],
+      ["avg latency", `${st.avg_latency_ms || 0} ms`],
+      ["p50 / p95 / p99", `${st.p50_ms || 0} / ${st.p95_ms || 0} / ${st.p99_ms || 0} ms`],
+      ["max latency", `${st.max_latency_ms || 0} ms`],
+      ["errors", st.errors || 0],
+    ]);
+    const rows = (st.recent || []).slice().reverse().map((e) => {
+      const ok = e.hits > 0 && !e.error;
+      const pillCls = ok ? "ok" : "warnp";
+      const pillTxt = ok ? "ok" : (e.error ? "err" : "miss");
+      return [
+        { html: `<span class="pill ${pillCls}">${pillTxt}</span>`, cls: "" },
+        esc((e.query || "").slice(0, 60)),
+        e.hits,
+        `${e.latency_ms} ms`,
+        (e.kinds || []).join(",") || "*",
+        e.device || "",
+      ];
+    });
+    tableEl.innerHTML = table(["status", "query", "hits", "latency", "kinds", "device"], rows,
+                             "no queries recorded yet");
+  } catch (error) {
+    kvEl.innerHTML = `<div class="empty">usage unavailable — ${esc(error.message)}</div>`;
+    tableEl.innerHTML = "";
+  }
+}
+
 function renderCandidates(payload) {
   const receipts = payload.candidate_receipts || {};
   const counts = receipts.counts || {};
@@ -435,6 +482,7 @@ async function loadAll() {
   else banner(`index view failed — ${index.reason.message}`, true);
   if (shadow.status === "fulfilled") renderShadow(shadow.value);
   else banner(`shadow view failed — ${shadow.reason.message}`, true);
+  await renderUsage();
   $("foot-fetched").textContent = `fetched: ${nowStamp()}`;
 }
 
@@ -461,6 +509,7 @@ async function runQuery() {
     renderRouteReceipt((payload.response || {}).route);
     renderCandidates(payload);
     await renderTurnLog();
+    await renderUsage();
   } catch (error) {
     banner(`query failed — ${error.message}`, false);
   }
@@ -477,6 +526,8 @@ document.querySelectorAll("nav.tabs button").forEach((button) =>
   button.addEventListener("click", () => setTab(button.dataset.tab)));
 $("refresh").addEventListener("click", loadAll);
 $("run").addEventListener("click", runQuery);
+const ru = $("refresh-usage");
+if (ru) ru.addEventListener("click", renderUsage);
 $("poll").addEventListener("click", () => {
   if (state.poll) {
     clearInterval(state.poll);
