@@ -149,6 +149,7 @@
   <span id="foot-health">health: —</span>
   <span id="foot-index">index: —</span>
   <span id="foot-fetched">fetched: —</span>
+  <span id="foot-usage">usage: —</span>
 </footer>
 
 <script>
@@ -388,6 +389,8 @@ async function renderUsage() {
       ["max latency", `${st.max_latency_ms || 0} ms`],
       ["errors", st.errors || 0],
     ]);
+    const dev = Object.keys(st.devices || {})[0] || "cpu";
+    $("foot-usage").textContent = "usage: " + (st.total || 0) + " q · avg " + (st.avg_latency_ms || 0) + "ms · recall " + (st.success_rate || 0) + "% · " + dev;
     const rows = (st.recent || []).slice().reverse().map((e) => {
       const ok = e.hits > 0 && !e.error;
       const pillCls = ok ? "ok" : "warnp";
