@@ -156,6 +156,8 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { poll: null };
+let usageRows = [];
+let usageSort = { key: 'ts', dir: 'desc' };
 
 function esc(value) {
   if (value === null || value === undefined) return "—";
@@ -368,6 +370,58 @@ async function renderTurnLog() {
   }
 }
 
+function sortUsageRows() {
+  const { key, dir } = usageSort;
+  const cmp = (a, b) => {
+    let va = a[key], vb = b[key];
+    if (typeof va === "string") { va = va.toLowerCase(); vb = (vb||"").toLowerCase(); }
+    if (va < vb) return dir === "asc" ? -1 : 1;
+    if (va > vb) return dir === "asc" ? 1 : -1;
+    return 0;
+  };
+  usageRows.slice().sort(cmp);
+  // sort in place
+  usageRows.sort(cmp);
+}
+function renderUsageTable() {
+  const tableEl = $("usage-table");
+  if (!tableEl) return;
+  if (!usageRows.length) { tableEl.innerHTML = `<div class="empty">no queries recorded yet</div>`; return; }
+  sortUsageRows();
+  const arrow = (k) => usageSort.key === k ? (usageSort.dir === "asc" ? " ▲" : " ▼") : "";
+  const headers = [
+    { key: "status", label: "status" },
+    { key: "query", label: "query" },
+    { key: "hits", label: "hits" },
+    { key: "latency", label: "latency" },
+    { key: "kinds", label: "kinds" },
+    { key: "device", label: "device" },
+  ];
+  const headHtml = headers.map((h) =>
+    `<th style="cursor:pointer; user-select:none;" onclick="toggleUsageSort('${h.key}')">${esc(h.label)}${arrow(h.key)}</th>`).join("");
+  const bodyHtml = usageRows.map((r) => {
+    const ok = r.status === "ok";
+    const pillCls = ok ? "ok" : "warnp";
+    return `<tr>
+      <td><span class="pill ${pillCls}">${esc(r.status)}</span></td>
+      <td class="trunc">${esc(r.query)}</td>
+      <td class="num">${r.hits}</td>
+      <td class="num">${r.latency} ms</td>
+      <td>${esc(r.kinds)}</td>
+      <td>${esc(r.device)}</td>
+    </tr>`;
+  }).join("");
+  tableEl.innerHTML = `<table><thead><tr>${headHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+}
+function toggleUsageSort(key) {
+  if (usageSort.key === key) {
+    usageSort.dir = usageSort.dir === "asc" ? "desc" : "asc";
+  } else {
+    usageSort.key = key;
+    usageSort.dir = (key === "query" || key === "status" || key === "kinds" || key === "device") ? "asc" : "desc";
+  }
+  renderUsageTable();
+}
 let usageRange = "24h";
 async function renderUsage() {
   const kvEl = $("usage-kv");
@@ -391,21 +445,22 @@ async function renderUsage() {
     ]);
     const dev = Object.keys(st.devices || {})[0] || "cpu";
     $("foot-usage").textContent = "usage: " + (st.total || 0) + " q · avg " + (st.avg_latency_ms || 0) + "ms · recall " + (st.success_rate || 0) + "% · " + dev;
-    const rows = (st.recent || []).slice().reverse().map((e) => {
+    usageRows = (st.recent || []).map((e) => {
       const ok = e.hits > 0 && !e.error;
       const pillCls = ok ? "ok" : "warnp";
       const pillTxt = ok ? "ok" : (e.error ? "err" : "miss");
-      return [
-        { html: `<span class="pill ${pillCls}">${pillTxt}</span>`, cls: "" },
-        esc((e.query || "").slice(0, 60)),
-        e.hits,
-        `${e.latency_ms} ms`,
-        (e.kinds || []).join(",") || "*",
-        e.device || "",
-      ];
+      return {
+        status: pillTxt, statusCls: pillCls,
+        query: (e.query === null || e.query === undefined) ? "" : String(e.query).slice(0, 60),
+        hits: e.hits || 0,
+        latency: e.latency_ms || 0,
+        kinds: (e.kinds || []).join(",") || "*",
+        device: e.device || "",
+        ts: e.ts || 0,
+        raw: e,
+      };
     });
-    tableEl.innerHTML = table(["status", "query", "hits", "latency", "kinds", "device"], rows,
-                             "no queries recorded yet");
+    renderUsageTable();
   } catch (error) {
     kvEl.innerHTML = `<div class="empty">usage unavailable — ${esc(error.message)}</div>`;
     tableEl.innerHTML = "";
