@@ -344,7 +344,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     from ann_search_gpu import shared_stats, read_shared_log
-                    st = shared_stats()
+                    rng = (query.get("range") or ["all"])[0]
+                    now = time.time()
+                    windows = {"24h": 86400, "week": 7*86400, "month": 30*86400, "all": None}
+                    secs = windows.get(rng, None)
+                    since = (now - secs) if secs else None
+                    st = shared_stats(since=since)
+                    st["range"] = rng
                     return self._send(200, {"ok": True, "stats": st})
                 except Exception as e:
                     return self._send(500, {"ok": False, "error": str(e)})

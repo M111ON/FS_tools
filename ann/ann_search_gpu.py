@@ -652,7 +652,7 @@ class AnnSearchGPU:
         except Exception:
             return False
 
-def read_shared_log(limit=200):
+def read_shared_log(limit=200, since=None):
     path = os.environ.get("ANN_SHARED_LOG",
                           "I:/tools/ann/data/query_log/all_queries.jsonl")
     out = []
@@ -663,17 +663,20 @@ def read_shared_log(limit=200):
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    row = json.loads(line)
                 except Exception:
                     continue
+                if since is not None and (row.get("ts") or 0) < since:
+                    continue
+                out.append(row)
     except FileNotFoundError:
         return []
     if limit and len(out) > limit:
         out = out[-limit:]
     return out
 
-def shared_stats(limit=10000):
-    rows = read_shared_log(limit=limit)
+def shared_stats(limit=10000, since=None):
+    rows = read_shared_log(limit=limit, since=since)
     lats = sorted(e.get("latency_ms", 0) for e in rows)
     if lats:
         n = len(lats)

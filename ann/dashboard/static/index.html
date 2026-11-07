@@ -22,6 +22,7 @@
     border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.on { border-color: var(--good); color: var(--good); }
+  .range-btn.on { border-color: var(--accent); color: var(--accent); }
   main { padding: 16px 20px 60px; }
   nav.tabs { display: flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
   nav.tabs button.active { background: #24313f; border-color: var(--accent); color: var(--accent); }
@@ -121,8 +122,16 @@
     <section class="panel" style="margin-top:14px"><h2>Turn log (recall / speed)</h2><div id="turn-log" class="muted"></div></section>
     <section class="panel" style="margin-top:14px">
       <h2>Usage &amp; value — ANN search history (all processes)</h2>
+      <div style="margin-bottom:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+        <span class="muted" style="font-size:12px;">range:</span>
+        <button class="range-btn on" data-range="24h">24h</button>
+        <button class="range-btn" data-range="week">week</button>
+        <button class="range-btn" data-range="month">month</button>
+        <button class="range-btn" data-range="all">all</button>
+        <span style="flex:1"></span>
+        <button id="refresh-usage">Refresh</button>
+      </div>
       <div id="usage-kv" class="kv"></div>
-      <div style="margin-top:8px"><button id="refresh-usage">Refresh</button></div>
       <div style="margin-top:8px; max-height:320px; overflow-y:auto; border:1px solid var(--line); border-radius:6px;" id="usage-table"></div>
     </section>
   </div>
@@ -358,12 +367,13 @@ async function renderTurnLog() {
   }
 }
 
+let usageRange = "24h";
 async function renderUsage() {
   const kvEl = $("usage-kv");
   const tableEl = $("usage-table");
   if (!kvEl || !tableEl) return;
   try {
-    const payload = await getJSON("/api/usage");
+    const payload = await getJSON("/api/usage?range=" + encodeURIComponent(usageRange));
     const st = payload.stats || {};
     const succ = st.successful || 0;
     const total = st.total || 0;
@@ -538,6 +548,13 @@ $("refresh").addEventListener("click", loadAll);
 $("run").addEventListener("click", runQuery);
 const ru = $("refresh-usage");
 if (ru) ru.addEventListener("click", renderUsage);
+document.querySelectorAll(".range-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    usageRange = btn.dataset.range;
+    document.querySelectorAll(".range-btn").forEach((b) => b.classList.toggle("on", b === btn));
+    renderUsage();
+  });
+});
 $("poll").addEventListener("click", () => {
   if (state.poll) {
     clearInterval(state.poll);
