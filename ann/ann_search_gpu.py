@@ -407,9 +407,15 @@ class AnnSearchGPU:
         self._ensure_loaded()
         t0 = time.perf_counter()
         try:
-            _embed_t0 = time.perf_counter()
-            qvec = _embed(query)
-            embed_ms = (time.perf_counter() - _embed_t0) * 1000.0
+            if isinstance(query, str):
+                _embed_t0 = time.perf_counter()
+                qvec = _embed(query)
+                embed_ms = (time.perf_counter() - _embed_t0) * 1000.0
+                _record_query = query
+            else:
+                qvec = np.asarray(query, dtype=np.float32).reshape(-1)
+                embed_ms = 0.0
+                _record_query = "<vec>"
             qvec_n = qvec / (np.linalg.norm(qvec) + 1e-9)
             N = self.n
             auto_budget = True
@@ -506,7 +512,7 @@ class AnnSearchGPU:
             scan_ms = 0.0  # placeholder
             scan_ms = (time.perf_counter() - _scan_t0) * 1000.0
             lat = embed_ms + scan_ms
-            self._record(query, topk, kinds, lat, len(hits), embed_ms=embed_ms)
+            self._record(_record_query, topk, kinds, lat, len(hits), embed_ms=embed_ms)
             self._last = {
                 "latency_ms": round(lat, 2),
                 "embed_ms": round(embed_ms, 2),

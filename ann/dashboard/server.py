@@ -79,10 +79,24 @@ class Config:
             self._gpu_search["inst"] = AnnSearchGPU()
         s = self._gpu_search["inst"]
         started = time.perf_counter()
-        hits = s.search(vec, topk=topk, kinds=kinds)
+        raw = s.search(vec, topk=topk, kinds=kinds)
+        hits = raw.get("hits", []) if isinstance(raw, dict) else (raw or [])
         response = {"status": "ok", "hits": hits,
                     "route": {"fast": True, "device": s._dev, "n": s.n,
-                              "kinds": kinds}}
+                              "kinds": kinds, "footer": raw.get("footer") if isinstance(raw, dict) else None}}
+        return response, round((time.perf_counter() - started) * 1000.0, 2)
+
+    def ann_fast_search_text(self, query, topk, kinds=None):
+        if self._gpu_search["inst"] is None:
+            from ann_search_gpu import AnnSearchGPU
+            self._gpu_search["inst"] = AnnSearchGPU()
+        s = self._gpu_search["inst"]
+        started = time.perf_counter()
+        raw = s.search(query, topk=topk, kinds=kinds)
+        hits = raw.get("hits", []) if isinstance(raw, dict) else (raw or [])
+        response = {"status": "ok", "hits": hits,
+                    "route": {"fast": True, "device": s._dev, "n": s.n,
+                              "kinds": kinds, "query": query, "footer": raw.get("footer") if isinstance(raw, dict) else None}}
         return response, round((time.perf_counter() - started) * 1000.0, 2)
 
     # -- read-only local sidecars ----------------------------------------
@@ -355,15 +369,24 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw)
             except ValueError as error:
                 raise core.InputError(f"invalid json: {error}")
-            request = core.parse_search_request(body)
             fast = bool(body.get("fast", False)) if isinstance(body, dict) else False
             kinds = body.get("kinds") if isinstance(body, dict) else None
             if kinds is not None and not isinstance(kinds, list):
                 kinds = [k.strip() for k in str(kinds).split(",") if k.strip()]
-            if fast:
-                response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"], kinds=kinds)
+            text_query = body.get("query") if isinstance(body, dict) else None
+            if isinstance(text_query, str) and text_query.strip():
+                # manual text query: embed + search server-side
+                if fast or True:
+                    response, ann_ms = self.config.ann_fast_search_text(text_query.strip(), body.get("topk", 5), kinds=kinds)
+                else:
+                    response, ann_ms = self.config.ann_fast_search_text(text_query.strip(), body.get("topk", 5), kinds=kinds)
+                request = {"topk": body.get("topk", 5), "scope": body.get("scope", ""), "vec": []}
             else:
-                response, ann_ms = self.config.ann_post("/v1/state/search", request)
+                request = core.parse_search_request(body)
+                if fast:
+                    response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"], kinds=kinds)
+                else:
+                    response, ann_ms = self.config.ann_post("/v1/state/search", request)
             receipt_state = self.config.receipts_state()
             context = receipt_state.get("_context")
             classification = core.classify_candidates(

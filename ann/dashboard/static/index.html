@@ -107,6 +107,8 @@
         <label>row <input id="row" type="number" min="0" value="0"></label>
         <label>top-k <input id="topk" type="number" min="1" max="64" value="5"></label>
         <label>scope <input id="scope" placeholder="zone:0 / tag:naming / empty"></label>
+        <label style="min-width:260px">query text (manual)
+          <input id="qtext" placeholder="type a query, leave empty to use vector source above"></label>
         <button id="run">Run query</button>
       </div>
       <div id="candidate-note" class="muted"></div>
@@ -121,7 +123,7 @@
       <h2>Usage &amp; value — ANN search history (all processes)</h2>
       <div id="usage-kv" class="kv"></div>
       <div style="margin-top:8px"><button id="refresh-usage">Refresh</button></div>
-      <div style="margin-top:8px" id="usage-table"></div>
+      <div style="margin-top:8px; max-height:320px; overflow-y:auto; border:1px solid var(--line); border-radius:6px;" id="usage-table"></div>
     </section>
   </div>
 
@@ -488,22 +490,30 @@ async function loadAll() {
 
 async function runQuery() {
   try {
-    const source = $("src").value;
-    let vector;
-    if (source === "index") {
-      const row = Number($("row").value || 0);
-      const payload = await getJSON(`/api/vector?row=${encodeURIComponent(row)}`);
-      vector = payload.vec;
-    } else {
-      vector = (await getJSON(`/api/vector?fixture=${source}`)).vec;
-    }
+    const text = ($("qtext").value || "").trim();
     const topk = Number($("topk").value || 5);
     if (!Number.isInteger(topk) || topk < 1 || topk > 64) throw new Error("top-k must be an integer in 1..64");
+    let body;
+    if (text) {
+      body = { query: text, topk, scope: $("scope").value || "", fast: true,
+        kinds: ["embedded_document", "dictionary_entry", "external_ref"] };
+    } else {
+      const source = $("src").value;
+      let vector;
+      if (source === "index") {
+        const row = Number($("row").value || 0);
+        const payload = await getJSON(`/api/vector?row=${encodeURIComponent(row)}`);
+        vector = payload.vec;
+      } else {
+        vector = (await getJSON(`/api/vector?fixture=${source}`)).vec;
+      }
+      body = { vec: vector, topk, scope: $("scope").value || "", fast: true,
+        kinds: ["embedded_document", "dictionary_entry", "external_ref"] };
+    }
     const payload = await getJSON("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vec: vector, topk, scope: $("scope").value || "", fast: true,
-        kinds: ["embedded_document", "dictionary_entry", "external_ref"] }),
+      body: JSON.stringify(body),
     });
     clearBanners();
     renderRouteReceipt((payload.response || {}).route);
