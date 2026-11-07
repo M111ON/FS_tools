@@ -615,7 +615,7 @@ class AnnSearchGPU:
             "devices": devices,
             "index_size": self.n if hasattr(self, "n") else 0,
             "device": self._dev,
-            "recent": rows[-20:],
+            "recent": rows[-100:],
         }
 
     def closing_log(self, since=None):
@@ -705,5 +705,5 @@ def shared_stats(limit=10000):
         "kinds_usage": kinds,
         "devices": devices,
         "distinct_queries": len(set(e.get("query", "") for e in rows)),
-        "recent": rows[-20:],
+        "recent": rows[-100:],
     }
