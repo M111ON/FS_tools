@@ -704,6 +704,6 @@ def shared_stats(limit=10000):
         "errors": sum(1 for e in rows if e.get("error")),
         "kinds_usage": kinds,
         "devices": devices,
-        "distinct_queries": len(set(e.get("query", "") for e in rows)),
+        "distinct_queries": len(set(str(e.get("query", "")) for e in rows)),
         "recent": rows[-100:],
     }
