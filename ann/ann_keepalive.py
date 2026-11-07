@@ -80,6 +80,20 @@ def _log(msg):
         pass
 
 
+def _warm_embed():
+    """Send one probe to the embed sidecar so its first real query is fast."""
+    try:
+        import urllib.request, json
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/embedding" % EMBED_PORT,
+            data=json.dumps({"content": "warmup"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+    except Exception:
+        pass
+
+
 def _healthy(url=HEALTH, key="status", want="ok", timeout=3):
     """True iff the endpoint answers with {key: want}. ann_search /health uses
     {"status":"ok"}; llama-server uses the same shape."""
@@ -266,6 +280,8 @@ def once():
         return False
     if not _healthy(EMBED_HEALTH, timeout=2):
         _start_embed()
+    else:
+        _warm_embed()
     _log("ann DOWN -> starting")
     try:
         _start_ann()

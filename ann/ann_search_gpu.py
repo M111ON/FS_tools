@@ -5,18 +5,24 @@ if "CUDA_PATH" not in os.environ and os.path.isdir(r"I:\\cuda_temp\\bin"):
     os.environ["CUDA_PATH"] = r"I:\\cuda_temp"
     os.environ["PATH"] = r"I:\\cuda_temp\\bin;" + os.environ.get("PATH", "")
 
-try:
-    import cupy as _cp
-    _HAS_CUPY = _cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    _cp = None
-    _HAS_CUPY = False
+# cupy is only imported when ANN_USE_GPU is explicitly opted in.
+# Importing it costs ~3s even when unused, so keep it lazy.
+_USE_GPU_REQUESTED = os.environ.get("ANN_USE_GPU", "0").lower() in ("1", "true", "yes", "on")
+_HAS_CUPY = False
+_cp = None
+if _USE_GPU_REQUESTED:
+    try:
+        import cupy as _cp
+        _HAS_CUPY = _cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        _cp = None
+        _HAS_CUPY = False
 
 # GPU is WIRED but OFF by default on this box: WDDM single-query matmuls are
 # ~3.6x SLOWER than CPU numpy here (measured 2026-11-07: cupy 29.6ms avg vs
 # numpy 8.2ms avg on 54261x384). GPU only wins resident multi-pass/batch.
 # Set ANN_USE_GPU=1 to force the cupy path (experiments/batch).
-_USE_GPU = _HAS_CUPY and os.environ.get("ANN_USE_GPU", "0").lower() in ("1", "true", "yes", "on")
+_USE_GPU = _HAS_CUPY and _USE_GPU_REQUESTED
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "experiments", "LC_tilecube"))
@@ -277,11 +283,19 @@ class AnnSearchGPU:
             self._load_lock = _t.Lock()
         except Exception:
             pass
-        # shared text/kind lookup
+        # shared text/kind lookup (cached to disk to avoid re-reading the
+        # 489MB fact_store on every cold start)
         self._text = {}
         self._kind = {}
-        if os.path.exists(MEMCORE_DB):
-            try:
+        _tc = self._index_path + ".textcache.pkl"
+        try:
+            _db_mtime = os.path.getmtime(MEMCORE_DB) if os.path.exists(MEMCORE_DB) else 0
+            if os.path.exists(_tc) and os.path.getmtime(_tc) >= _db_mtime:
+                with open(_tc, "rb") as _f:
+                    _blob = pickle.load(_f)
+                self._text = _blob.get("text", {})
+                self._kind = _blob.get("kind", {})
+            elif os.path.exists(MEMCORE_DB):
                 import sqlite3
                 c = sqlite3.connect(MEMCORE_DB)
                 for sid, pattern, content, kind in c.execute(
@@ -289,8 +303,13 @@ class AnnSearchGPU:
                     self._text[sid] = (pattern or "", content or "")
                     self._kind[sid] = kind or ""
                 c.close()
-            except Exception:
-                pass
+                try:
+                    with open(_tc, "wb") as _f:
+                        pickle.dump({"text": self._text, "kind": self._kind}, _f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # shared log
         self._shared_log = os.environ.get("ANN_SHARED_LOG",
                                           "I:/tools/ann/data/query_log/all_queries.jsonl")
@@ -337,15 +356,12 @@ class AnnSearchGPU:
                         self._ivf_centroids = pblob["ivf_centroids"]
                     else:
                         self._build_partitions()
-                    # Set device (needed by MCP wrapper): prefer cupy/CUDA, then torch
+                    # Set device (needed by MCP wrapper): cupy/CUDA if opted in, else cpu.
+                    # Avoid importing torch here — it costs ~5-6s on cold load.
                     if _USE_GPU:
                         self._dev = "cuda"
                     else:
-                        try:
-                            import torch
-                            self._dev = "cuda" if torch.cuda.is_available() else "cpu"
-                        except Exception:
-                            self._dev = "cpu"
+                        self._dev = "cpu"
                     self._loaded = True
                     return
                 except Exception:
@@ -369,15 +385,11 @@ class AnnSearchGPU:
             self.V = np.asarray(vecs, dtype=np.float32)
             self.n = len(self.ids)
             self._build_partitions()
-            # Set device (needed by MCP wrapper): prefer cupy/CUDA, then torch
+            # Set device (needed by MCP wrapper): cupy/CUDA if opted in, else cpu.
             if _USE_GPU:
                 self._dev = "cuda"
             else:
-                try:
-                    import torch
-                    self._dev = "cuda" if torch.cuda.is_available() else "cpu"
-                except Exception:
-                    self._dev = "cpu"
+                self._dev = "cpu"
             self._loaded = True
             # Write caches
             try:
