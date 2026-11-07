@@ -1,4 +1,22 @@
-import os, sys, json, time, urllib.request, pickle, numpy as np
+import os, sys, json, time, urllib.request, pickle, numpy as np, threading as _t
+
+# Make the bundled CUDA 12.6 toolkit discoverable for cupy on this box.
+if "CUDA_PATH" not in os.environ and os.path.isdir(r"I:\\cuda_temp\\bin"):
+    os.environ["CUDA_PATH"] = r"I:\\cuda_temp"
+    os.environ["PATH"] = r"I:\\cuda_temp\\bin;" + os.environ.get("PATH", "")
+
+try:
+    import cupy as _cp
+    _HAS_CUPY = _cp.cuda.runtime.getDeviceCount() > 0
+except Exception:
+    _cp = None
+    _HAS_CUPY = False
+
+# GPU is WIRED but OFF by default on this box: WDDM single-query matmuls are
+# ~3.6x SLOWER than CPU numpy here (measured 2026-11-07: cupy 29.6ms avg vs
+# numpy 8.2ms avg on 54261x384). GPU only wins resident multi-pass/batch.
+# Set ANN_USE_GPU=1 to force the cupy path (experiments/batch).
+_USE_GPU = _HAS_CUPY and os.environ.get("ANN_USE_GPU", "0").lower() in ("1", "true", "yes", "on")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "experiments", "LC_tilecube"))
@@ -7,6 +25,13 @@ ANN_INDEX = os.environ.get("ANN_INDEX",
                            "I:/tools/ann/data/memcore/ann_index.jsonl")
 EMBED_HOST = os.environ.get("LZ_EMBED_HOST", "127.0.0.1")
 EMBED_PORT = os.environ.get("LZ_EMBED_PORT", "18095")
+
+# Persistent keep-alive connection to the embed sidecar (Phase 1 hot path).
+# urllib.request.urlopen opens a fresh TCP connection per call (~80-190ms
+# overhead); a kept-alive http.client connection drops that to ~15ms.
+import http.client as _hc
+_EMBED_CONN = {"c": None}
+_EMBED_CONN_LOCK = _t.Lock()
 MEMCORE_DB = os.environ.get("MEMCORE_DB",
                            "I:/tools/cloud_ws/memcore/fact_store.v2.sqlite3")
 
@@ -129,7 +154,10 @@ def collect_ico(cells, graph, start, max_c, exclude=None):
     return pool, visited, False
 
 def ivf_query(cells, centroids, qvec, nprobe, N, exclude=None):
-    sims = centroids @ qvec
+    if _USE_GPU:
+        sims = (_cp.asarray(centroids) @ _cp.asarray(qvec)).get()
+    else:
+        sims = centroids @ qvec
     probe_ids = np.argsort(-sims)[:nprobe]
     pool = np.concatenate([cells[c] for c in probe_ids if len(cells[c]) > 0])
     if exclude is not None:
@@ -145,6 +173,28 @@ try:
     _EMBED_CACHE_LOCK = _t.Lock()
 except Exception:
     _EMBED_CACHE_LOCK = None
+
+def _get_embed_conn():
+    """Return a live keep-alive connection to the embed sidecar, reconnecting
+    on failure. Thread-safe."""
+    global _EMBED_CONN
+    with _EMBED_CONN_LOCK:
+        c = _EMBED_CONN.get("c")
+        if c is not None:
+            try:
+                # cheap liveness probe
+                c.sock and c.sock.fileno() >= 0
+                return c
+            except Exception:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                _EMBED_CONN["c"] = None
+        c = _hc.HTTPConnection(EMBED_HOST, int(EMBED_PORT), timeout=30)
+        _EMBED_CONN["c"] = c
+        return c
+
 
 def _embed(text):
     try:
@@ -162,12 +212,29 @@ def _embed(text):
             _EMBED_CACHE_LOCK.release()
     if cached is not None:
         return cached.copy()
-    url = f"http://{EMBED_HOST}:{EMBED_PORT}/embedding"
     body = json.dumps({"content": norm}).encode()
-    req = urllib.request.Request(url, data=body,
-                                headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
+    for _attempt in (0, 1):
+        try:
+            conn = _get_embed_conn()
+            conn.request("POST", "/embedding", body=body,
+                        headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                raise RuntimeError("embed HTTP %d: %s" % (resp.status, raw[:200]))
+            d = json.loads(raw)
+            break
+        except Exception:
+            with _EMBED_CONN_LOCK:
+                c = _EMBED_CONN.get("c")
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                _EMBED_CONN["c"] = None
+            if _attempt == 1:
+                raise
     if isinstance(d, list):
         emb = d[0].get("embedding", d[0])
     elif isinstance(d, dict):
@@ -270,12 +337,15 @@ class AnnSearchGPU:
                         self._ivf_centroids = pblob["ivf_centroids"]
                     else:
                         self._build_partitions()
-                    # Set device (needed by MCP wrapper)
-                    try:
-                        import torch
-                        self._dev = "cuda" if torch.cuda.is_available() else "cpu"
-                    except Exception:
-                        self._dev = "cpu"
+                    # Set device (needed by MCP wrapper): prefer cupy/CUDA, then torch
+                    if _USE_GPU:
+                        self._dev = "cuda"
+                    else:
+                        try:
+                            import torch
+                            self._dev = "cuda" if torch.cuda.is_available() else "cpu"
+                        except Exception:
+                            self._dev = "cpu"
                     self._loaded = True
                     return
                 except Exception:
@@ -299,12 +369,15 @@ class AnnSearchGPU:
             self.V = np.asarray(vecs, dtype=np.float32)
             self.n = len(self.ids)
             self._build_partitions()
-            # Set device (needed by MCP wrapper)
-            try:
-                import torch
-                self._dev = "cuda" if torch.cuda.is_available() else "cpu"
-            except Exception:
-                self._dev = "cpu"
+            # Set device (needed by MCP wrapper): prefer cupy/CUDA, then torch
+            if _USE_GPU:
+                self._dev = "cuda"
+            else:
+                try:
+                    import torch
+                    self._dev = "cuda" if torch.cuda.is_available() else "cpu"
+                except Exception:
+                    self._dev = "cpu"
             self._loaded = True
             # Write caches
             try:
@@ -339,7 +412,14 @@ class AnnSearchGPU:
             embed_ms = (time.perf_counter() - _embed_t0) * 1000.0
             qvec_n = qvec / (np.linalg.norm(qvec) + 1e-9)
             N = self.n
-            budget = budget_pct if budget_pct is not None else DEFAULT_BUDGET_PCT
+            auto_budget = True
+            auto_adjusted = False
+            if budget_pct is not None:
+                budget = budget_pct
+                auto_budget = False
+            else:
+                budget = DEFAULT_BUDGET_PCT
+            budget_used = budget
 
             _scan_t0 = time.perf_counter()
             # IVF pool (fast, low scan)
@@ -349,7 +429,10 @@ class AnnSearchGPU:
             remaining = budget - ivf_scan
             if remaining > 0:
                 max_c = int(N * remaining / 100.0)
-                start = int(np.argmax(self._ico_centroids @ qvec_n))
+                if _USE_GPU:
+                    start = int(_cp.argmax(_cp.asarray(self._ico_centroids) @ _cp.asarray(qvec_n)).get())
+                else:
+                    start = int(np.argmax(self._ico_centroids @ qvec_n))
                 lc_pool, _, _ = collect_ico(self._ico_cells, self._ico_adj,
                                             start, max_c, exclude=None)
             else:
@@ -363,9 +446,39 @@ class AnnSearchGPU:
             # (query may not be in index, but exclude if present)
             # Rerank by exact cosine
             if len(pool) > 0:
-                cos = self.V[pool] @ qvec
+                if _USE_GPU:
+                    cos = (_cp.asarray(self.V[pool]) @ _cp.asarray(qvec)).get()
+                else:
+                    cos = self.V[pool] @ qvec
                 order = np.argsort(-cos)[:topk]
                 top_indices = pool[order]
+                # Auto-budget: if cosine gap between #1 and #2 is small (near-duplicate)
+                # and we have budget headroom, re-search with higher budget
+                if auto_budget and len(cos) >= 2:
+                    sorted_cos = np.sort(cos)[::-1]
+                    gap = float(sorted_cos[0] - sorted_cos[1])
+                    if gap < 0.01 and budget < 20.0:
+                        new_budget = min(budget * 2, 20.0)
+                        if new_budget > budget:
+                            budget_used = new_budget
+                            auto_adjusted = True
+                            remaining2 = new_budget - ivf_scan
+                            if remaining2 > 0:
+                                max_c2 = int(N * remaining2 / 100.0)
+                                if _USE_GPU:
+                                    start2 = int(_cp.argmax(_cp.asarray(self._ico_centroids) @ _cp.asarray(qvec_n)).get())
+                                else:
+                                    start2 = int(np.argmax(self._ico_centroids @ qvec_n))
+                                lc_pool2, _, _ = collect_ico(
+                                    self._ico_cells, self._ico_adj, start2, max_c2)
+                                if len(lc_pool2) > 0:
+                                    pool = np.unique(np.concatenate([ivf_pool, lc_pool2]))
+                            if _USE_GPU:
+                                cos = (_cp.asarray(self.V[pool]) @ _cp.asarray(qvec)).get()
+                            else:
+                                cos = self.V[pool] @ qvec
+                            order = np.argsort(-cos)[:topk]
+                            top_indices = pool[order]
             else:
                 top_indices = np.array([], dtype=np.int32)
 
@@ -399,25 +512,28 @@ class AnnSearchGPU:
                 "embed_ms": round(embed_ms, 2),
                 "scan_ms": round(scan_ms, 2),
                 "hits": len(hits),
-                "device": "cpu",
-                "budget_pct": budget,
+                "device": self._dev,
+                "budget_pct": budget_used,
+                "budget_requested": budget,
+                "auto_adjusted": auto_adjusted,
                 "scan_actual_pct": round(100.0 * len(pool) / N, 2),
                 "ivf_scan_pct": round(ivf_scan, 2),
                 "lc_added": len(lc_pool) if len(lc_pool) > 0 else 0,
             }
             footer = (f"[ann] 1 query, {len(hits)} hits | {lat:.2f}ms "
-                      f"(budget {budget}% scan {100.0*len(pool)/N:.2f}%) | "
-                      f"device=cpu index={self.n}")
-            return {"hits": hits, "n": self.n, "device": "cpu",
-                    "footer": footer, "budget_pct": budget,
+                      f"(budget {budget_used}% scan {100.0*len(pool)/N:.2f}%) | "
+                      f"device={self._dev} index={self.n}")
+            return {"hits": hits, "n": self.n, "device": self._dev,
+                    "footer": footer, "budget_pct": budget_used,
+                    "budget_requested": budget, "auto_adjusted": auto_adjusted,
                     "scan_actual_pct": round(100.0 * len(pool) / N, 2)}
         except Exception as e:
             self._stats["errors"] += 1
             lat = (time.perf_counter() - t0) * 1000.0
             self._record(query, topk, kinds, lat, 0, error=str(e))
             self._last = {"latency_ms": round(lat, 2), "embed_ms": 0.0,
-                          "scan_ms": 0.0, "hits": 0, "device": "cpu", "error": str(e)}
-            return {"hits": [], "n": self.n, "device": "cpu",
+                          "scan_ms": 0.0, "hits": 0, "device": self._dev, "error": str(e)}
+            return {"hits": [], "n": self.n, "device": self._dev,
                     "footer": f"[ann] 1 query, 0 hits | error: {e}", "error": str(e)}
 
     def _record(self, qstr, topk, kinds, latency_ms, hits, embed_ms=0.0, error=None):
@@ -431,7 +547,7 @@ class AnnSearchGPU:
             "embed_ms": round(embed_ms, 2),
             "scan_ms": round(latency_ms - embed_ms, 2),
             "hits": hits,
-            "device": "cpu",
+            "device": self._dev,
             "error": error,
         }
         self._log.append(entry)
@@ -492,7 +608,7 @@ class AnnSearchGPU:
             "kinds_usage": kinds,
             "devices": devices,
             "index_size": self.n if hasattr(self, "n") else 0,
-            "device": "cpu",
+            "device": self._dev,
             "recent": rows[-20:],
         }
 
@@ -512,7 +628,7 @@ class AnnSearchGPU:
             for k in (e.get("kinds") or ["*"]):
                 kinds[k] = kinds.get(k, 0) + 1
         kinds_str = ", ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
-        dev = "cpu"
+        dev = self._dev
         return (f"[ann] {n} queries, {sum(e.get('hits',0) for e in rows)} hits | "
                 f"p50={p50:.2f}ms p95={p95:.2f}ms p99={p99:.2f}ms "
                 f"(embed {avg_embed:.2f}ms / scan {avg_scan:.2f}ms) | "
