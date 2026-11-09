@@ -49,6 +49,15 @@ Implementation: lc_seed_snake_fruit.py.
 - rewind: seen(face) O(1) across dims; letter_embed(face) for cross-modal bridge
 - Verified: 384D hybrid 0.800, 128D hybrid 0.905; cross-dim collisions 0
 
+## Memory-Efficient sift1m (breathing_fs principle)
+- union_sift1m_mem.py: memmap corpus + sequential query + float32 + chunked distance
+- Peak RAM: ~634 MB (was 3 GB+, 5x reduction) — embodies breathing_fs: data stays
+  on disk (memmap), only active view moves into RAM
+- Verified on 1M sift: recall@10=0.949, cand%=6.72%, 95.7 ms/query (100 queries)
+- IVF fit on 50k subsample (25 MB) instead of 1M; labels stored as memmap (1 MB)
+- DRamTile/breathing_fs are spec-only (not implemented as code); memmap is the
+  practical embodiment of "data stays, pointers move" for this use case
+
 ## Live Bridge (4-Layer wired to ann search)
 - lc_live_bridge.py: LiveBridge (load_index/search/ivf_only_search)
 - wires Seed -> IVF -> Bridge (receipt) -> Rewind onto live ann_search (8096)
