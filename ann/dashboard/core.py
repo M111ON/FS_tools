@@ -459,3 +459,58 @@ def shadow_summary(lines, max_timeline=50):
 def deterministic_json(payload):
     """Stable serialization used by the tests to prove rendering is stable."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def lc_seed(vec):
+    """Deterministic LC seed (centered, integer-only) for a vector."""
+    q = [int(x * (1 << 20)) for x in vec]
+    if not q:
+        return 0
+    m = sum(q) // len(q)
+    qc = [x - m for x in q]
+    per = len(qc) // 3
+    if per < 1:
+        per = 1
+    sums = [sum(qc[g * per:(g + 1) * per]) for g in range(3)]
+    trit = 0
+    for s in sums:
+        d = 0 if s < 0 else (2 if s > 0 else 1)
+        trit = trit * 3 + d
+    trit %= 27
+    groups = 5
+    per2 = len(qc) // groups
+    if per2 < 1:
+        per2 = 1
+    bits = 0
+    for g in range(groups):
+        s = sum(qc[g * per2:(g + 1) * per2])
+        if s >= 0:
+            bits |= (1 << g)
+    return (trit << 5) | (bits % 32)
+
+
+def build_seed_index(index_path, max_rows=200000):
+    """Read-only: scan the jsonl index and group row numbers by LC seed."""
+    result = {}
+    with open(index_path, "r", encoding="utf-8") as stream:
+        for number, line in enumerate(stream):
+            if number >= max_rows:
+                break
+            if not line.strip():
+                continue
+            try:
+                found = json.loads(line)
+            except ValueError:
+                continue
+            vec = found.get("vec")
+            if not isinstance(vec, list) or not vec:
+                continue
+            seed = lc_seed(vec)
+            result.setdefault(seed, []).append({
+                "row": number,
+                "sid": found.get("sid"),
+                "file": found.get("file"),
+                "npast": found.get("npast"),
+                "dim": len(vec),
+            })
+    return result

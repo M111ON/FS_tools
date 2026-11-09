@@ -122,6 +122,15 @@ class Config:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def build_seed_index_cached(self):
+        with self._lock:
+            if getattr(self, "_seed_index", None) is not None:
+                return self._seed_index
+        index = core.build_seed_index(str(self.index))
+        with self._lock:
+            self._seed_index = index
+            return self._seed_index
+
     def read_index_row(self, row):
         """Read one row vector out of the jsonl index, read-only.
 
@@ -329,6 +338,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._index()
             if path == "/api/vector":
                 return self._vector(query)
+            if path == "/api/search_by_seed":
+                return self._search_by_seed(query)
             if path == "/api/shadow":
                 return self._send(200, build_shadow_view(self.config))
             if path == "/api/receipts":
@@ -464,6 +475,28 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise core.InputError("row must be an integer")
         return self._send(200, self.config.read_index_row(row_number))
+
+    def _search_by_seed(self, query):
+        seed_raw = (query.get("seed") or [""])[0]
+        try:
+            seed_value = int(seed_raw)
+        except ValueError:
+            raise core.InputError("seed must be an integer")
+        limit = (query.get("limit") or ["50"])[0]
+        try:
+            limit = int(limit)
+        except ValueError:
+            raise core.InputError("limit must be an integer")
+        if limit < 1 or limit > 500:
+            raise core.InputError("limit must be between 1 and 500")
+        index = self.config.build_seed_index_cached()
+        matches = index.get(seed_value, [])
+        return self._send(200, {
+            "seed": seed_value,
+            "count": len(matches),
+            "matches": matches[:limit],
+            "note": "read-only filter: entries whose LC seed == seed (client-derived)",
+        })
 
 
 def main(argv=None):

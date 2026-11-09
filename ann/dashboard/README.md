@@ -39,6 +39,16 @@ I:\python3.14.4\python.exe run_tests.py                            # full suite 
 | **Candidate** | `POST :8096/v1/state/search` | route receipt and top-k, with per-candidate receipt status |
 | **Shadow** | `totem_shadow.jsonl` | route violations, receipt coverage, missing receipts, malformed rows, append-only timeline |
 
+## Search by seed (read-only, new)
+
+`GET /api/search_by_seed?seed=N&limit=K` returns the index rows whose
+deterministic LC seed equals `N` (client-derived, read-only filter). This
+mirrors the 4-layer `Seed` step in `I:/tools/ann/experiments/LC_tilecube`
+(`lc_seed_gen.c`, centered mapper) and lets the dashboard group entries by
+their deterministic routing identity. Receipts for those entries still come
+from the live server / bridge (`lc_live_bridge.py`); the dashboard never
+infers a receipt from vector values, bucket IDs, `term_hint` or geometry.
+
 ## Data contracts (read from the live server, not assumed)
 
 `GET /health` (observed 2026-10-27):
