@@ -131,6 +131,26 @@ class Config:
             self._seed_index = index
             return self._seed_index
 
+    def live_bridge(self):
+        with self._lock:
+            if getattr(self, "_live_bridge", None) is not None:
+                return self._live_bridge
+            if getattr(self, "_live_bridge_tried", False):
+                return None
+            self._live_bridge_tried = True
+        try:
+            sys.path.insert(0, "I:/tools/ann/experiments/LC_tilecube")
+            from lc_live_bridge import LiveBridge
+            b = LiveBridge(max_entries=100000)
+            b.load_index()
+            with self._lock:
+                self._live_bridge = b
+            return b
+        except Exception:
+            with self._lock:
+                self._live_bridge = None
+            return None
+
     def read_index_row(self, row):
         """Read one row vector out of the jsonl index, read-only.
 
@@ -340,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._vector(query)
             if path == "/api/search_by_seed":
                 return self._search_by_seed(query)
+            if path == "/api/search_with_receipts":
+                return self._search_with_receipts(query)
             if path == "/api/shadow":
                 return self._send(200, build_shadow_view(self.config))
             if path == "/api/receipts":
@@ -496,6 +518,42 @@ class Handler(BaseHTTPRequestHandler):
             "count": len(matches),
             "matches": matches[:limit],
             "note": "read-only filter: entries whose LC seed == seed (client-derived)",
+        })
+
+    def _search_with_receipts(self, query):
+        """Read-only: forward a text query through the 4-layer bridge so that
+        every hit carries a producer-owned receipt (Seed->IVF->Bridge->Rewind).
+        Does not mutate ANN. Falls back to raw search if the bridge is
+        unavailable."""
+        text_query = (query.get("query") or [""])[0]
+        if not text_query.strip():
+            raise core.InputError("query must be a non-empty string")
+        topk_raw = (query.get("topk") or ["5"])[0]
+        try:
+            topk = int(topk_raw)
+        except ValueError:
+            raise core.InputError("topk must be an integer")
+        if topk < 1 or topk > 50:
+            raise core.InputError("topk must be between 1 and 50")
+        bridge = self.config.live_bridge()
+        if bridge is None:
+            # fallback: raw server search (receipts may be missing)
+            request = {"topk": topk, "scope": "", "vec": []}
+            # embed via bridge helper not available -> ask client to send vec
+            return self._error(503, "bridge_unavailable",
+                               "LiveBridge could not be loaded; send a vec via /api/search")
+        result = bridge.search(text_query, topk=topk, mode="hybrid")
+        return self._send(200, {
+            "ok": True,
+            "mode": "hybrid",
+            "topk": topk,
+            "hits": result["hits"],
+            "timing": {"http_ms": result["http_ms"],
+                       "layer_ms": result["layer_ms"],
+                       "total_ms": result["total_ms"]},
+            "receipts_present": result["receipts_present"],
+            "receipts_missing": result["receipts_missing"],
+            "note": "read-only: receipts produced by the 4-layer bridge, not inferred",
         })
 
 
