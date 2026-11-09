@@ -49,6 +49,13 @@ Implementation: lc_seed_snake_fruit.py.
 - rewind: seen(face) O(1) across dims; letter_embed(face) for cross-modal bridge
 - Verified: 384D hybrid 0.800, 128D hybrid 0.905; cross-dim collisions 0
 
+## Live Bridge (4-Layer wired to ann search)
+- lc_live_bridge.py: LiveBridge (load_index/search/ivf_only_search)
+- wires Seed -> IVF -> Bridge (receipt) -> Rewind onto live ann_search (8096)
+- fixes 'receipt missing': receipts_present=5/5, receipts_missing=0
+- E2E wall-clock: 4-layer 74.44 ms/query (http 1684 first, ~74 steady)
+  vs IVF-only 1.94 ms/query; layer overhead ~15.76 ms
+
 ## Files
 - lc_seed_gen.c / lc_seed_gen.exe (C, selftest/bench/multidim/gen/hamming)
 - lc_hybrid_router.py (HybridRouter)
