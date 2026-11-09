@@ -119,6 +119,7 @@
       <section class="panel"><h2>Candidate receipts</h2><div id="candidate-receipts" class="kv"></div></section>
     </div>
     <section class="panel" style="margin-top:14px"><h2>Top-k</h2><div id="candidate-hits"></div></section>
+<section class="panel" style="margin-top:14px"><h2>4-layer receipts (Seed &rarr; IVF &rarr; Bridge &rarr; Rewind)</h2><div id="bridge-receipts" class="kv"></div><div id="bridge-receipt-list" class="muted" style="margin-top:6px"></div></section>
     <section class="panel" style="margin-top:14px"><h2>Turn log (recall / speed)</h2><div id="turn-log" class="muted"></div></section>
     <section class="panel" style="margin-top:14px">
       <h2>Usage &amp; value — ANN search history (all processes)</h2>
@@ -491,6 +492,17 @@ function renderCandidates(payload) {
   ]);
   $("candidate-hits").innerHTML = table(
     ["sid", "file", "score", "receipt", "violations"], rows, "no hits");
+  // 4-layer receipts (bridge, producer-owned)
+  const br = payload.bridge_receipts || [];
+  const brPresent = payload.bridge_receipts_present || 0;
+  kv($("bridge-receipts"), [
+    ["hits", num((payload.response || {}).hits ? (payload.response.hits.length || 0) : 0)],
+    ["4-layer receipts present", pill(num(brPresent), brPresent ? "ok" : "warnp")],
+    ["missing", pill(num(((payload.response || {}).hits || []).length - brPresent), brPresent === ((payload.response || {}).hits || []).length ? "ok" : "warnp")],
+  ]);
+  $("bridge-receipt-list").innerHTML = br.length
+    ? br.map((b) => `<div style="font-size:12px;margin:2px 0"><code>${esc(b.sid)}</code> &rarr; seed ${num((b.receipt||{}).seed)} · face ${esc(JSON.stringify((b.receipt||{}).face||[]))} · frame ${esc((b.receipt||{}).frame||"?")} · rewind ${ (b.receipt||{}).rewind_seen ? "revisit" : "new"}</div>`).join("")
+    : `<span class="muted">(no bridge receipts — bridge unavailable)</span>`;
   $("candidate-note").textContent =
     `request: ${nowStamp()} · ann ${num((payload.timing || {}).ann_ms)} ms · top-k ${num((payload.request || {}).topk)} · ` +
     `scope ${esc((payload.request || {}).scope) || "(global)"} · dim ${num((payload.request || {}).dim)}`;

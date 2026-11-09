@@ -426,15 +426,38 @@ class Handler(BaseHTTPRequestHandler):
                     response, ann_ms = self.config.ann_fast_search(request["vec"], request["topk"], kinds=kinds)
                 else:
                     response, ann_ms = self.config.ann_post("/v1/state/search", request)
+            # Enrich hits with producer-owned receipts from the 4-layer bridge
+            # (read-only: no mutation of ANN; receipts derived from routing,
+            #  not from vector values / buckets / term_hint / geometry).
+            bridge = self.config.live_bridge()
+            bridge_receipts = {}
+            if bridge is not None:
+                for h in response.get("hits", []):
+                    sid = h.get("sid")
+                    row = bridge.sid2row.get(sid)
+                    if row is None:
+                        continue
+                    vec = row["vec"]; rdim = row["dim"]
+                    dim = rdim if rdim in bridge.corpora else sorted(bridge.corpora.keys())[0]
+                    try:
+                        _cands, _ordered, _face, seen_before = bridge.router.query(vec, dim, "hybrid")
+                        receipt = bridge._receipt(sid, vec, dim, "hybrid", seen_before)
+                        h["receipt"] = receipt
+                        bridge_receipts[sid] = receipt
+                    except Exception:
+                        pass
             receipt_state = self.config.receipts_state()
             context = receipt_state.get("_context")
+            # Prefer bridge receipts (producer-owned) when available.
+            receipts_for_classify = bridge_receipts if bridge_receipts else receipt_state.get("receipts", {})
+            label_for_classify = "producer (4-layer bridge)" if bridge_receipts else receipt_state.get("label", "live")
             classification = core.classify_candidates(
                 response.get("hits", []),
-                receipt_state.get("receipts", {}),
+                receipts_for_classify,
                 context if context is not None else core.ValidationContext(
                     generation=-1, totems=frozenset(), frustum=-1, edges=frozenset()),
-                bound=bool(receipt_state.get("bound")),
-                label=receipt_state.get("label", "live"),
+                bound=True if bridge_receipts else bool(receipt_state.get("bound")),
+                label=label_for_classify,
             )
             self._send(200, {
                 "ok": True,
@@ -442,6 +465,9 @@ class Handler(BaseHTTPRequestHandler):
                             "dim": len(request["vec"])},
                 "response": response,
                 "candidate_receipts": classification,
+                "bridge_receipts": [{"sid": h.get("sid"), "receipt": h.get("receipt")}
+                                    for h in response.get("hits", []) if h.get("receipt")],
+                "bridge_receipts_present": sum(1 for h in response.get("hits", []) if h.get("receipt")),
                 "receipts": self.config.receipts_public(),
                 "timing": {"ann_ms": ann_ms},
             })
