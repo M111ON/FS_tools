@@ -42,6 +42,13 @@ Implementation: lc_seed_snake_fruit.py.
 - modes: lc (cheap/deterministic), ivf (recall), hybrid (union, best recall)
 - Verified: hybrid recall 0.913 vs lc 0.270 vs ivf 0.887; LC identity stable across rebuild
 
+## Multi-dim Hybrid + Rewind
+- lc_multidim_hybrid.py: MultiDimHybridRouter (per-dim LC seeds with dim tag + per-dim IVF
+  + shared face grid + rewind buffer + letter-embedding)
+- dim tag: base | (dim_id << 10) -> zero cross-dim collisions (verified)
+- rewind: seen(face) O(1) across dims; letter_embed(face) for cross-modal bridge
+- Verified: 384D hybrid 0.800, 128D hybrid 0.905; cross-dim collisions 0
+
 ## Files
 - lc_seed_gen.c / lc_seed_gen.exe (C, selftest/bench/multidim/gen/hamming)
 - lc_hybrid_router.py (HybridRouter)
