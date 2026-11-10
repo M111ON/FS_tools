@@ -129,3 +129,28 @@ ocvpn/watch.log
 ai-relay-worker/.wrangler/
 ai-relay-worker/node_modules/
 ai-relay-worker/tmp/
+
+# ── large binary data / reproducible cache (2026-11-10) ──
+*.zip
+*.npy
+*.fvecs
+*.ivecs
+*.npz
+*.pkl
+*.pickle
+*.bin
+*.dat
+*.parquet
+*.feather
+*.arrow
+# screenshots
+screenshot_*.png
+*_home.png
+freebuff_home.png
+# log files (global)
+*.log
+# build artifacts
+build_cpu/
+build_cuda/
+*.tar.gz
+*.err
