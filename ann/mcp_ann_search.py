@@ -199,6 +199,10 @@ if __name__ == "__main__":
             sys.stderr.flush()
         mcp.settings.host = _args.host
         mcp.settings.port = _args.port
+        try:
+            mcp.settings.stateless_http = True
+        except Exception:
+            pass
         mcp.run("streamable-http")
     else:
         # stdio mode (per-session): pre-warm in background.
