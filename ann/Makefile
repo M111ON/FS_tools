@@ -68,6 +68,12 @@ latency-split:
 latch-ab: $(BUILD)/ann_search.exe | $(BUILD)
 	$(PY) bench_latch_ab.py --runs 5 --queries 40 --exe $(BUILD)/ann_search.exe
 
+$(BUILD)/test_entropy_xray.exe: tests/test_entropy_xray.c src/entropy_xray.c $(wildcard include/*.h) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_entropy_xray.c src/entropy_xray.c $(LDFLAGS)
+
+entropy-xray: $(BUILD)/test_entropy_xray.exe
+	./$(BUILD)/test_entropy_xray.exe
+
 clean:
 	rm -f $(BUILD)/ann_search.exe $(BUILD)/test_*.exe $(BUILD)/p3_*.exe
 

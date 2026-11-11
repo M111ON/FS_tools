@@ -5327,10 +5327,37 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
     /* the client sends this one too — unescaped it could carry a quote, a backslash or a
      * raw newline into the line and split one search into two unparsable records */
     if (sid_filter && sid_filter[0]) lz_json_escape(esc_sidf, sizeof(esc_sidf), sid_filter);
+    char esc_qtext[560] = "";
+    {
+        const char *e = getenv("ANN_QUERY_LOG_TEXT");
+        int qlog_text = 1;
+        if (e && e[0]) {
+            if (e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' ||
+                e[0] == 'o' || e[0] == 'O') qlog_text = 0;
+        }
+        if (qlog_text && qtext && qtext[0]) {
+            char tmp[257];
+            size_t ql = strlen(qtext);
+            if (ql > 256) ql = 256;
+            memcpy(tmp, qtext, ql);
+            tmp[ql] = '\0';
+            lz_json_escape(esc_qtext, sizeof(esc_qtext), tmp);
+        }
+    }
     unsigned qh = 0;
     const char *in_kind = "text";
+    int qlog_hash = 1;
+    {
+        const char *e = getenv("ANN_QUERY_LOG_HASH");
+        if (e && e[0]) {
+            if (e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' ||
+                e[0] == 'o' || e[0] == 'O') qlog_hash = 0;
+        } else {
+            qlog_hash = 0; /* disabled by default until stable */
+        }
+    }
     if (qtext && qtext[0]) {
-        qh = _fnv(qtext);
+        if (qlog_hash) qh = _fnv(qtext);
     } else if (qv && qd > 0) {
         /* a caller-supplied vector has no text: hash the bytes, never report 0 */
         const unsigned char *b = (const unsigned char *)qv;
@@ -5351,10 +5378,17 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
                        "%s{\"sid\":\"%s\",\"score\":%.4f,\"rank\":%d}",
                        i ? "," : "", esid, top_sc[i], i + 1);
     }
+    char hash_field[48];
+    if (qlog_hash) snprintf(hash_field, sizeof(hash_field), "\"fnv:%08x\"", qh);
+    else strcpy(hash_field, "null");
+    char text_field[600];
+    if (esc_qtext[0]) snprintf(text_field, sizeof(text_field), "\"%s\"", esc_qtext);
+    else strcpy(text_field, "null");
     char line[QLOG_LINE];
     int n = snprintf(line, sizeof(line),
         "{\"v\":1,\"ts_ms\":%lld,\"coord\":%s%s%s,\"input_kind\":\"%s\","
-        "\"input_hash\":\"fnv:%08x\","
+        "\"input_hash\":%s,"
+        "\"input_text\":%s,"
         "\"input_chars\":%d,\"dim\":%d,\"topk\":%d,\"K\":%d,"
         "\"index_fp\":\"%ld-%ld\",\"n_cand\":%d,\"items_scored\":%d,\"budget\":%d,"
         "\"truncated\":%d,\"fallback\":%d,\"roster\":%d,\"walk_hash\":%u,"
@@ -5364,7 +5398,7 @@ static void qlog_search(const char *coord, const char *qtext, const float *qv, i
          * line was stamped late by exactly latency_us (measured 12-180 ms in the first day). */
         qlog_ms() - (long long)(lat_us / 1000.0),
         esc_coord[0] ? "\"" : "", esc_coord[0] ? esc_coord : "null", esc_coord[0] ? "\"" : "",
-        in_kind, qh, qtext ? (int)strlen(qtext) : 0, qd, topk, K,
+        in_kind, hash_field, text_field, qtext ? (int)strlen(qtext) : 0, qd, topk, K,
         idx_mtime, idx_size, nent, items_scored, budget,
         truncated, fallback, roster_used, walk_hash,
         tops, lat_us,

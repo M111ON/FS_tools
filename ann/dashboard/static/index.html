@@ -73,6 +73,8 @@
     <button data-tab="index">Index</button>
     <button data-tab="candidate">Candidate</button>
     <button data-tab="shadow">Shadow</button>
+    <button data-tab="audit">JEV Audit</button>
+    <button data-tab="xray">X-ray Audit</button>
   </nav>
 
   <div id="tab-health" class="tab">
@@ -143,6 +145,16 @@
       <section class="panel"><h2>Route violations / malformed</h2><div id="shadow-findings"></div></section>
     </div>
     <section class="panel" style="margin-top:14px"><h2>Append-only timeline (last 50)</h2><div id="shadow-timeline"></div></section>
+  </div>
+
+  <div id="tab-audit" class="tab" hidden>
+    <section class="panel"><h2>JEV audit summary</h2><div id="audit-kv" class="kv"></div></section>
+    <section class="panel" style="margin-top:14px"><h2>Queries (click to unfold candidates)</h2><div id="audit-list"></div></section>
+  </div>
+
+  <div id="tab-xray" class="tab" hidden>
+    <section class="panel"><h2>X-ray audit summary</h2><div id="xray-kv" class="kv"></div></section>
+    <section class="panel" style="margin-top:14px"><h2>Queries (click to unfold candidates)</h2><div id="xray-list"></div></section>
   </div>
 </main>
 
@@ -391,6 +403,7 @@ function renderUsageTable() {
   sortUsageRows();
   const arrow = (k) => usageSort.key === k ? (usageSort.dir === "asc" ? " ▲" : " ▼") : "";
   const headers = [
+    { key: "ts", label: "time" },
     { key: "status", label: "status" },
     { key: "query", label: "query" },
     { key: "hits", label: "hits" },
@@ -403,7 +416,9 @@ function renderUsageTable() {
   const bodyHtml = usageRows.map((r) => {
     const ok = r.status === "ok";
     const pillCls = ok ? "ok" : "warnp";
+    const tsLabel = r.ts ? new Date(r.ts).toLocaleTimeString() : "";
     return `<tr>
+      <td class="num">${esc(tsLabel)}</td>
       <td><span class="pill ${pillCls}">${esc(r.status)}</span></td>
       <td class="trunc">${esc(r.query)}</td>
       <td class="num">${r.hits}</td>
@@ -546,13 +561,59 @@ function renderShadow(payload) {
     rows, "no reports yet");
 }
 
+// ---------------------------------------------------------------- audit
+function renderAudit(payload) {
+  const rows = payload.rows || [];
+  kv($("audit-kv"), [
+    ["queries audited", num((payload.summary || {}).queries || rows.length)],
+    ["avg best jev", num(((payload.summary || {}).best_avg || 0).toFixed(3))],
+  ]);
+  $("audit-list").innerHTML = rows.length
+    ? rows.map((r, idx) => {
+        const cands = (r.results || []).map((c) => [
+          esc(c.sid), { cls: "num", html: num(c.rank) },
+          { cls: "num", html: num(c.ann_score) },
+          { cls: "num", html: num(c.jev) },
+        ]);
+        const tbl = table(["sid", "rank", "ann", "jev"], cands, "");
+        return `<details style="margin:6px 0;border:1px solid var(--line);border-radius:6px;padding:6px">
+          <summary>query ${esc(r.query_id)} · k=${num(r.k)} · best ${esc(r.best_sid)} (${num(r.best_jev)})</summary>
+          <div style="margin-top:6px">${tbl}</div></details>`;
+      }).join("")
+    : `<div class="empty">no audit rows yet</div>`;
+}
+
+// ---------------------------------------------------------------- xray
+function renderXray(payload) {
+  const rows = payload.rows || [];
+  kv($("xray-kv"), [
+    ["queries audited", num((payload.summary || {}).queries || rows.length)],
+    ["avg variance", num((((payload.summary || {}).avg_variance) || 0).toFixed(1))],
+    ["total pruned", num((payload.summary || {}).total_pruned || 0)],
+  ]);
+  $("xray-list").innerHTML = rows.length
+    ? rows.map((r) => {
+        const cands = (r.candidates || []).map((c) => [
+          esc(c.sid), { cls: "num", html: num(c.xray.cell_id) },
+          { cls: "num", html: num(c.xray.variance) },
+          { cls: "num", html: num(c.xray.density) },
+          { cls: "num", html: num(c.xray.flags) },
+        ]);
+        const tbl = table(["sid", "cell", "variance", "density", "flags"], cands, "");
+        return `<details style="margin:6px 0;border:1px solid var(--line);border-radius:6px;padding:6px">
+          <summary>query ${esc(r.query_id)} · k=${num(r.k)} · pruned ${num(r.pruned_count)} · avg var ${num((r.avg_variance||0).toFixed(1))}</summary>
+          <div style="margin-top:6px">${tbl}</div></details>`;
+      }).join("")
+    : `<div class="empty">no x-ray audit rows yet</div>`;
+}
+
 // ------------------------------------------------------------------ load
 async function loadAll() {
   clearBanners();
   const results = await Promise.allSettled([
-    getJSON("/api/health"), getJSON("/api/index"), getJSON("/api/shadow"),
+    getJSON("/api/health"), getJSON("/api/index"), getJSON("/api/shadow"), getJSON("/api/jev_audit"), getJSON("/api/xray_audit"),
   ]);
-  const [health, index, shadow] = results;
+  const [health, index, shadow, audit, xray] = results;
   if (health.status === "fulfilled") {
     renderHealth(health.value);
     renderReceipts(health.value.receipts || {});
@@ -564,6 +625,10 @@ async function loadAll() {
   else banner(`index view failed — ${index.reason.message}`, true);
   if (shadow.status === "fulfilled") renderShadow(shadow.value);
   else banner(`shadow view failed — ${shadow.reason.message}`, true);
+  if (audit.status === "fulfilled") renderAudit(audit.value);
+  else banner(`audit view failed — ${audit.reason.message}`, true);
+  if (xray.status === "fulfilled") renderXray(xray.value);
+  else banner(`xray view failed — ${xray.reason.message}`, true);
   await renderUsage();
   $("foot-fetched").textContent = `fetched: ${nowStamp()}`;
 }

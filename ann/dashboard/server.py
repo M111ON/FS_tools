@@ -37,9 +37,16 @@ if str(ANN_DIR) not in sys.path:
 
 import core  # noqa: E402
 
+try:
+    import jev_audit  # noqa: E402
+    import xray_audit  # noqa: E402
+except Exception:  # keep dashboard usable even if audit deps missing
+    jev_audit = None
+    xray_audit = None
+
 
 class Config:
-    def __init__(self, host, port, ann, index, report, receipts):
+    def __init__(self, host, port, ann, index, report, receipts, jev_audit="", xray_audit=""):
         self.host = host
         self.port = port
         self.ann = ann.rstrip("/")
@@ -47,6 +54,8 @@ class Config:
         self.data_dir = self.index.parent
         self.report = pathlib.Path(report) if report else None
         self.receipts = pathlib.Path(receipts) if receipts else None
+        self.jev_audit = pathlib.Path(jev_audit) if jev_audit else None
+        self.xray_audit = pathlib.Path(xray_audit) if xray_audit else None
         self._lock = threading.Lock()
         self._receipts_cache = None
         self._vector_cache = OrderedDict()
@@ -364,6 +373,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._search_with_receipts(query)
             if path == "/api/shadow":
                 return self._send(200, build_shadow_view(self.config))
+            if path == "/api/jev_audit":
+                return self._jev_audit()
+            if path == "/api/xray_audit":
+                return self._xray_audit()
             if path == "/api/receipts":
                 return self._send(200, self.config.receipts_public())
             if path == "/api/search_stats":
@@ -451,6 +464,17 @@ class Handler(BaseHTTPRequestHandler):
             # Prefer bridge receipts (producer-owned) when available.
             receipts_for_classify = bridge_receipts if bridge_receipts else receipt_state.get("receipts", {})
             label_for_classify = "producer (4-layer bridge)" if bridge_receipts else receipt_state.get("label", "live")
+            if bridge_receipts:
+                receipts_list = [r for r in bridge_receipts.values() if isinstance(r, dict)]
+                totems = frozenset(r.get("totem_id") for r in receipts_list
+                                   if isinstance(r.get("totem_id"), int))
+                frustums = {r.get("frustum_id") for r in receipts_list
+                            if isinstance(r.get("frustum_id"), int)}
+                frustum = next(iter(frustums)) if len(frustums) == 1 else (next(iter(frustums)) if frustums else -1)
+                edges = frozenset(str(r.get("wang_edge")) for r in receipts_list
+                                  if r.get("wang_edge") is not None)
+                context = core.ValidationContext(
+                    generation=1, totems=totems, frustum=frustum, edges=edges, intent="unknown")
             classification = core.classify_candidates(
                 response.get("hits", []),
                 receipts_for_classify,
@@ -480,6 +504,47 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "upstream_unavailable", error)
         except Exception as error:
             return self._error(500, "internal_error", error)
+
+    def _jev_audit(self):
+        path = self.config.jev_audit
+        rows = []
+        if path is not None and path.exists():
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rows.append(json.loads(raw))
+                except ValueError:
+                    continue
+        # newest first
+        rows = list(reversed(rows))
+        # compact summary for the UI
+        summary = {
+            "queries": len(rows),
+            "best_avg": (sum((r.get("best_jev") or 0) for r in rows) / len(rows)) if rows else 0.0,
+        }
+        return self._send(200, {"ok": True, "summary": summary, "rows": rows})
+
+    def _xray_audit(self):
+        path = self.config.xray_audit
+        rows = []
+        if path is not None and path.exists():
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rows.append(json.loads(raw))
+                except ValueError:
+                    continue
+        rows = list(reversed(rows))
+        summary = {
+            "queries": len(rows),
+            "avg_variance": (sum((r.get("avg_variance") or 0) for r in rows) / len(rows)) if rows else 0.0,
+            "total_pruned": sum((r.get("pruned_count") or 0) for r in rows),
+        }
+        return self._send(200, {"ok": True, "summary": summary, "rows": rows})
 
     # -- handlers ---------------------------------------------------------
     def _asset(self, name):
@@ -592,6 +657,14 @@ def main(argv=None):
     parser.add_argument("--report", default=r"I:\tools\ann\data\memcore\totem_shadow.jsonl")
     parser.add_argument("--receipts", default="",
                         help="optional sid -> totem_receipt jsonl sidecar")
+    parser.add_argument("--jev-audit", default=r"I:\tools\ann\data\jev_audit.jsonl",
+                        help="JEV audit jsonl (post-query)")
+    parser.add_argument("--xray-audit", default=r"I:\tools\ann\data\xray_audit.jsonl",
+                        help="X-ray audit jsonl (post-query)")
+    parser.add_argument("--log", default=r"I:\tools\ann\data\query_log\ann_query-20261111.jsonl",
+                        help="query log to audit")
+    parser.add_argument("--disable-auto-audit", action="store_true",
+                        help="disable background JEV/X-ray audit thread")
     args = parser.parse_args(argv)
 
     Handler.config = Config(
@@ -601,6 +674,8 @@ def main(argv=None):
         index=args.index,
         report=args.report,
         receipts=args.receipts,
+        jev_audit=args.jev_audit,
+        xray_audit=args.xray_audit,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"ANN dashboard (read-only) on http://{args.host}:{args.port}")
@@ -608,11 +683,40 @@ def main(argv=None):
     print(f"  index   : {args.index}")
     print(f"  report  : {args.report}")
     print(f"  receipts: {args.receipts or '(none — candidate receipts report missing)'}")
+
+    stop_event = threading.Event()
+    auto = (not args.disable_auto_audit) and (jev_audit is not None or xray_audit is not None)
+    if auto:
+        def _audit_loop():
+            jev_state = pathlib.Path(args.jev_audit).with_name("jev_audit_state.json")
+            xray_state = pathlib.Path(args.xray_audit).with_name("xray_audit_state.json")
+            while not stop_event.is_set():
+                 try:
+                     if xray_audit is not None and args.xray_audit:
+                         xray_audit.process_log(
+                             pathlib.Path(args.log),
+                             pathlib.Path(args.xray_audit), xray_state,
+                             pathlib.Path(args.index), limit=1)
+                 except Exception as exc:
+                     print("xray audit loop:", exc)
+                 try:
+                     if jev_audit is not None and args.jev_audit:
+                         jev_audit.process_log(
+                             pathlib.Path(args.log),
+                             pathlib.Path(args.jev_audit), jev_state, limit=1,
+                             xray_audit_path=pathlib.Path(args.xray_audit))
+                 except Exception as exc:
+                     print("jev audit loop:", exc)
+                 stop_event.wait(15)
+        threading.Thread(target=_audit_loop, daemon=True).start()
+        print("  auto-audit: on (JEV + X-ray, 15s loop)")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
         server.server_close()
 
 

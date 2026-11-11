@@ -96,6 +96,10 @@ class LiveBridge:
             "rewind_seen": bool(seen_before),
             "mode": mode,
             "relation_valid": True,
+            # producer-owned fields aligned with the totem receipt validator
+            "totem_id": int(_tagged_seed(vec, dim if dim in (0, 1) else 0)),
+            "frustum_id": int(dim),
+            "wang_edge": str(fm.get(face, "?")),
         }
 
     def search(self, query, topk=10, mode="hybrid"):
@@ -123,7 +127,8 @@ class LiveBridge:
             if row is None:
                 # no local row -> minimal receipt
                 receipt = {"generation": self._generation, "sid": sid,
-                           "mode": mode, "relation_valid": True, "note": "no_local_row"}
+                           "mode": mode, "relation_valid": True, "note": "no_local_row",
+                           "totem_id": 0, "frustum_id": dim, "wang_edge": "?"}
                 enriched.append({**h, "receipt": receipt})
                 continue
             vec = row["vec"]; rdim = row["dim"]

@@ -668,6 +668,7 @@ def read_shared_log(limit=200, since=None):
     path = os.environ.get("ANN_SHARED_LOG",
                           "I:/tools/ann/data/query_log/all_queries.jsonl")
     out = []
+    # Primary: the shared log written by AnnSearchGPU._log_entry.
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -682,7 +683,35 @@ def read_shared_log(limit=200, since=None):
                     continue
                 out.append(row)
     except FileNotFoundError:
-        return []
+        pass
+    # Fallback: derive from per-day query logs so history is never empty
+    # just because the shared file was missing/rotated.
+    if not out:
+        import glob as _glob
+        for qpath in sorted(_glob.glob("I:/tools/ann/data/query_log/ann_query-*.jsonl")):
+            try:
+                with open(qpath, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except Exception:
+                            continue
+                        row = {
+                            "ts": r.get("ts_ms"),
+                            "latency_ms": (r.get("latency_us") or 0) / 1000.0,
+                            "hits": len(r.get("top") or []),
+                            "kinds": ["*"],
+                            "device": "gpu",
+                            "error": None,
+                        }
+                        if since is not None and (row.get("ts") or 0) < since:
+                            continue
+                        out.append(row)
+            except OSError:
+                continue
     if limit and len(out) > limit:
         out = out[-limit:]
     return out
